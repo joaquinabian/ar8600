@@ -81,6 +81,12 @@ class AorCtrl(AorCtrlFrame):
         self.background_vfo = None
         if self.thread is not None:
             self.alive.clear()          # clear alive event for thread
+            cancel_read = getattr(self.serial, 'cancel_read', None)
+            if self.serial.is_open and callable(cancel_read):
+                try:
+                    cancel_read()
+                except (serial.SerialException, OSError, NotImplementedError) as error:
+                    print('Serial read cancellation error: %s' % error, file=sys.stderr)
             self.thread.join()          # wait until thread has finished
             self.thread = None
 
@@ -125,7 +131,7 @@ class AorCtrl(AorCtrlFrame):
         menu = wx.Menu()
         for (id_, title) in menu_title_by_id.items():
             menu.Append(id_, title)
-            wx.EVT_MENU(menu, id_, self.menu_selection_cb)
+            menu.Bind(wx.EVT_MENU, self.menu_selection_cb, id=id_)
         self.edit_list.list.PopupMenu(menu, (x+10, y))
         menu.Destroy()
 
@@ -555,6 +561,8 @@ class AorCtrl(AorCtrlFrame):
             except serial.SerialException as error:
                 self.alive.clear()
                 print('Serial read error: %s' % error, file=sys.stderr)
+                return
+            if not self.alive.is_set():
                 return
             if not textline.strip():
                 continue

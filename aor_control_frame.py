@@ -34,11 +34,11 @@ class AorCtrlFrame(wx.Frame):
         self.aor_toolbar = wx.ToolBar(self, -1)
         self.SetToolBar(self.aor_toolbar)
         icon_dir = Path(__file__).resolve().parent / "icons"
-        self.aor_toolbar.AddLabelTool(wx.ID_ANY, "newlog", wx.Bitmap(str(icon_dir / "new3.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
-        self.aor_toolbar.AddLabelTool(wx.ID_ANY, "open", wx.Bitmap(str(icon_dir / "load3.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
-        self.aor_toolbar.AddLabelTool(wx.ID_ANY, "upload", wx.Bitmap(str(icon_dir / "arrow-up_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
-        self.aor_toolbar.AddLabelTool(wx.ID_ANY, "connect", wx.Bitmap(str(icon_dir / "redo_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
-        self.aor_toolbar.AddLabelTool(wx.ID_ANY, "config", wx.Bitmap(str(icon_dir / "applications_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
+        self.aor_toolbar.AddTool(wx.ID_ANY, "newlog", wx.Bitmap(str(icon_dir / "new3.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
+        self.aor_toolbar.AddTool(wx.ID_ANY, "open", wx.Bitmap(str(icon_dir / "load3.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
+        self.aor_toolbar.AddTool(wx.ID_ANY, "upload", wx.Bitmap(str(icon_dir / "arrow-up_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
+        self.aor_toolbar.AddTool(wx.ID_ANY, "connect", wx.Bitmap(str(icon_dir / "redo_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
+        self.aor_toolbar.AddTool(wx.ID_ANY, "config", wx.Bitmap(str(icon_dir / "applications_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
         # Tool Bar end
         self.panel_1 = wx.Panel(self, wx.ID_ANY)
         self.rb_vfos = wx.RadioBox(self.panel_1, wx.ID_ANY, "", choices=["VFO-A", "VFO-B", "VFO"], majorDimension=1, style=wx.RA_SPECIFY_COLS)

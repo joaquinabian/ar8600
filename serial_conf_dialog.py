@@ -149,9 +149,9 @@ class SerialConfigDialog(wx.Dialog):
         self.Layout()
 
     def __attach_events(self):
-        wx.EVT_BUTTON(self, self.button_ok.GetId(), self.OnOK)
-        wx.EVT_BUTTON(self, self.button_cancel.GetId(), self.OnCancel)
-        wx.EVT_CHECKBOX(self, self.checkbox_timeout.GetId(), self.OnTimeout)
+        self.Bind(wx.EVT_BUTTON, self.OnOK, id=self.button_ok.GetId())
+        self.Bind(wx.EVT_BUTTON, self.OnCancel, id=self.button_cancel.GetId())
+        self.Bind(wx.EVT_CHECKBOX, self.OnTimeout, id=self.checkbox_timeout.GetId())
 
     def OnOK(self, events):
         try:

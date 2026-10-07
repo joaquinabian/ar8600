@@ -21,13 +21,13 @@ class EditListCtrl(wx.ListCtrl,
         for row in range(5):
             newrow = self.InsertItem(self.GetItemCount(), '.')
             for column in range(8):
-                self.SetStringItem(newrow, column, '.')
+                self.SetItem(newrow, column, '.')
 
         # self.SetColumnWidth(0, wx.LIST_AUTOSIZE)
 
     def fill_line(self, row, data):
         for column, item in enumerate(data):
-            self.SetStringItem(row, column, item)
+            self.SetItem(row, column, item)
 
 
 class EditListCtrlPanel(wx.Panel):
