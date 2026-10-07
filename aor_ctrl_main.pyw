@@ -29,7 +29,7 @@ class SerialRxEvent(wx.PyCommandEvent):
 
     # noinspection PyMethodOverriding
     def Clone(self):
-        self.__class__(self.GetId(), self.data)
+        return self.__class__(self.GetId(), self.data)
 
 
 # noinspection PyUnusedLocal
