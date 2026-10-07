@@ -8,7 +8,9 @@ import time
 from collections import deque
 from datetime import datetime
 from aor_control_frame import AorCtrlFrame
-from aor_functions import do_nothing, format_frequency, parse_lm_response, parse_lc_response
+from aor_functions import (do_nothing, format_frequency, parse_lm_response, parse_lc_response,
+                           parse_select_scan_response, parse_pass_frequency_response,
+                           make_pass_frequency_command, format_activity_row)
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -71,6 +73,9 @@ class AorCtrl(AorCtrlFrame):
         self.squelch_open = None
         self.activity_events = deque(maxlen=200)
         self.active_transmission = None
+        self.select_scan_rows = {}
+        self.pass_frequency_rows = {}
+        self.pass_context = 'V'
         AorCtrlFrame.__init__(self, *args, **kwds)
 
         self.create_monitor_controls()
@@ -200,6 +205,8 @@ class AorCtrl(AorCtrlFrame):
         for column, value in enumerate(values, 1):
             self.activity_list.SetItem(row, column, value)
         self.activity_list.EnsureVisible(row)
+        if self.cbx_lists.GetStringSelection() == 'LOG VIEW':
+            self.show_log_view()
 
     def __set_properties(self):
         self.SetTitle("Serial Terminal")
@@ -221,6 +228,8 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_RADIOBOX, self.on_select_vfo, self.rb_vfos)
         self.Bind(wx.EVT_BUTTON, self.on_vfo_start, self.bt_vfostart)
         self.Bind(wx.EVT_BUTTON, self.on_vfo_stop, self.bt_vfostop)
+        self.Bind(wx.EVT_BUTTON, self.on_select_scan_start, self.bt_start)
+        self.Bind(wx.EVT_BUTTON, self.on_add_pass_frequency, self.bt_mkpassfreq)
         self.Bind(EVT_SERIALRX, self.on_serial_read)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
@@ -236,6 +245,24 @@ class AorCtrl(AorCtrlFrame):
 
     def open_menu(self, event):
         """"""
+        view = self.cbx_lists.GetStringSelection()
+        if view in ('LOG VIEW', 'SELECT SCAN'):
+            return
+        if view == 'PASS FREQS':
+            row = event.GetIndex()
+            slot = self.edit_list.list.GetItemText(row)
+            entry = self.pass_frequency_rows.get(slot)
+            menu = wx.Menu()
+            choose = menu.Append(wx.ID_ANY, 'Choose pass-frequency bank / VFO...')
+            menu.Bind(wx.EVT_MENU, self.on_choose_pass_context, id=choose.GetId())
+            remove = menu.Append(wx.ID_ANY, 'Remove pass frequency')
+            remove.Enable(entry is not None and entry['frequency_hz'] is not None
+                          and entry['context'] != 'V')
+            menu.Bind(wx.EVT_MENU, lambda evt: self.remove_pass_frequency(slot),
+                      id=remove.GetId())
+            self.edit_list.list.PopupMenu(menu)
+            menu.Destroy()
+            return
         self.list_item_clicked = event.GetText()
         x, y = event.GetPoint()
 
@@ -317,6 +344,11 @@ class AorCtrl(AorCtrlFrame):
     def on_vfo_stop(self, evt):
         self.write_serial('VV0\r\n'.encode("ascii"))
 
+    def on_select_scan_start(self, evt):
+        if self.cbx_lists.GetStringSelection() == 'SELECT SCAN' and self.connected and self.serial.is_open:
+            self.write_serial(b'SM\r\n')
+            self.aor_status.SetStatusText('Select Scan start requested')
+
     def on_select_mode(self, evt):
         """Set mode on RX
         """
@@ -350,11 +382,14 @@ class AorCtrl(AorCtrlFrame):
         if selection == 'SEARCH BANKS':
             self.get_search_banks()
         elif selection == 'SELECT SCAN':
-            pass
+            self.get_select_scan()
         elif selection == 'PASS FREQS':
-            pass
+            if evt is not None and evt.GetEventObject() == self.bt_refresh:
+                self.on_choose_pass_context(evt)
+            else:
+                self.get_pass_frequencies()
         elif selection == 'LOG VIEW':
-            pass
+            self.show_log_view()
         elif selection == 'DATABASE':
             pass
         else:
@@ -387,7 +422,17 @@ class AorCtrl(AorCtrlFrame):
                         command = 'VA\r\nRX\r\nVB\r\n' if vfx == 1 else 'VB\r\nRX\r\nVA\r\n'
                         self.write_serial(command.encode("ascii"))
                 elif first.startswith('SR'):
-                    self.set_search_banks(first)
+                    if self.cbx_lists.GetStringSelection() not in ('SELECT SCAN', 'PASS FREQS', 'LOG VIEW'):
+                        self.set_search_banks(first)
+                elif first.startswith('GR'):
+                    self.set_select_scan(first)
+                elif first.startswith('PR'):
+                    self.set_pass_frequency(first)
+                elif first.startswith('SM '):
+                    fields = first.split(None, 8)[1:]
+                    self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
+                    self.aor_status.SetStatusText('Select Scan: %s, %s MHz' %
+                                                (fields[0][2:], format_frequency(fields[2][2:])))
                 elif first.startswith('MW'):
                     self.set_memory_banks_list(first)
                 elif first.startswith('MX'):
@@ -525,6 +570,107 @@ class AorCtrl(AorCtrlFrame):
         if blocks:
             towrite = 'MA%s\r\n' % bank + 'MA\r\n' * (blocks - 1)
             self.write_serial(towrite.encode("ascii"))
+
+    def prepare_list(self, columns):
+        self.edit_list.list.ClearAll()
+        for index, (label, width) in enumerate(columns):
+            self.edit_list.list.InsertColumn(index, label, width=width)
+
+    def get_select_scan(self):
+        self.select_scan_rows.clear()
+        self.prepare_list((('Slot', 45), ('Channel', 65), ('Frequency MHz', 115),
+                           ('Step kHz', 70), ('Auto', 45), ('Mode', 55),
+                           ('ATT', 40), ('Name', 130)))
+        self.aor_status.SetStatusText('Select Scan: Refresh reads entries; Scan Start starts Select Scan')
+        if self.serial.is_open:
+            self.write_serial(b'GR\r\n')
+
+    def set_select_scan(self, text):
+        entry = parse_select_scan_response(text)
+        if self.cbx_lists.GetStringSelection() != 'SELECT SCAN':
+            return
+        if entry['channel'] is None:
+            self.aor_status.SetStatusText('Select Scan: %d tagged channels' % len(self.select_scan_rows))
+            return
+        slot = entry['slot']
+        if slot not in self.select_scan_rows:
+            self.select_scan_rows[slot] = self.edit_list.list.InsertItem(
+                self.edit_list.list.GetItemCount(), slot)
+        values = (slot, entry['channel'], format(entry['frequency_hz'] / 1000000, '.6f'),
+                  format(entry['step_khz'].normalize(), 'f'), entry['auto'],
+                  self.cbx_mode.GetString(MD_TO_GUI_MODE[entry['mode']]),
+                  entry['attenuation'], entry['name'])
+        self.edit_list.list.fill_line(self.select_scan_rows[slot], values)
+
+    def get_pass_frequencies(self):
+        self.pass_frequency_rows.clear()
+        self.prepare_list((('Slot', 55), ('Context', 115), ('Frequency MHz', 140), ('State', 80)))
+        self.aor_status.SetStatusText('Pass frequencies: %s. Refresh chooses bank / VFO; right-click removes bank entries' %
+                                     self.pass_context)
+        if self.serial.is_open:
+            self.write_serial(('PR%s\r\n' % self.pass_context).encode('ascii'))
+
+    def set_pass_frequency(self, text):
+        entry = parse_pass_frequency_response(text)
+        if self.cbx_lists.GetStringSelection() != 'PASS FREQS' or entry['context'] != self.pass_context:
+            return
+        slot = entry['slot']
+        previous = self.pass_frequency_rows.get(slot)
+        row = previous['row'] if previous is not None else self.edit_list.list.InsertItem(
+            self.edit_list.list.GetItemCount(), slot)
+        entry['row'] = row
+        self.pass_frequency_rows[slot] = entry
+        frequency = entry['frequency_hz']
+        self.edit_list.list.fill_line(row, (slot, 'VFO' if self.pass_context == 'V' else 'Bank %s' % self.pass_context,
+                                           '---' if frequency is None else format(frequency / 1000000, '.6f'),
+                                           'Empty' if frequency is None else 'Pass'))
+
+    def on_choose_pass_context(self, evt):
+        contexts = ['V'] + list('ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst')
+        labels = ['VFO (V)'] + ['Search bank %s' % context for context in contexts[1:]]
+        dialog = wx.SingleChoiceDialog(self, 'Read pass frequencies for:', 'Pass frequencies', labels)
+        dialog.SetSelection(contexts.index(self.pass_context))
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                self.pass_context = contexts[dialog.GetSelection()]
+                self.get_pass_frequencies()
+        finally:
+            dialog.Destroy()
+
+    def on_add_pass_frequency(self, evt):
+        if self.cbx_lists.GetStringSelection() != 'PASS FREQS' or not self.connected or not self.serial.is_open:
+            return
+        dialog = wx.TextEntryDialog(self, 'Add frequency in MHz to pass list %s:' % self.pass_context,
+                                    'Add pass frequency')
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            try:
+                command = make_pass_frequency_command(self.pass_context, dialog.GetValue().strip())
+            except ValueError as error:
+                wx.MessageBox(str(error), 'Invalid pass frequency', wx.OK | wx.ICON_ERROR, self)
+                return
+            if self.write_serial(command) == len(command):
+                self.get_pass_frequencies()
+        finally:
+            dialog.Destroy()
+
+    def remove_pass_frequency(self, slot):
+        entry = self.pass_frequency_rows.get(slot)
+        if (self.cbx_lists.GetStringSelection() != 'PASS FREQS' or not self.connected or not self.serial.is_open
+                or entry is None or entry['frequency_hz'] is None or entry['context'] == 'V'):
+            return
+        command = ('PD%s%s\r\n' % (entry['context'], slot)).encode('ascii')
+        if self.write_serial(command) == len(command):
+            self.get_pass_frequencies()
+
+    def show_log_view(self):
+        self.prepare_list((('Time', 180), ('Frequency MHz', 120), ('Source', 100),
+                           ('Level', 50), ('State', 70), ('Duration', 80)))
+        for activity in self.activity_events:
+            row = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
+            self.edit_list.list.fill_line(row, format_activity_row(activity))
+        self.aor_status.SetStatusText('Activity log: %d / 200 events (read-only)' % len(self.activity_events))
 
     def get_search_banks(self):
         """
