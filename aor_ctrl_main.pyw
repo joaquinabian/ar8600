@@ -3,6 +3,7 @@ import sys
 import serial_conf_dialog
 import serial
 import threading
+import re
 from aor_control_frame import AorCtrlFrame
 from aor_functions import do_nothing, format_frequency
 
@@ -67,6 +68,7 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        self.filling_banks = False
         if self.thread is not None:
             self.alive.clear()          # clear alive event for thread
             self.thread.join()          # wait until thread has finished
@@ -138,20 +140,20 @@ class AorCtrl(AorCtrlFrame):
         else:
             return
 
-        self.serial.write(func.encode("ascii"))
-        self.serial.write('RX\r\n'.encode("ascii"))
+        self.write_serial(func.encode("ascii"))
+        self.write_serial('RX\r\n'.encode("ascii"))
 
     def on_auto(self, evt):
         if self.ckbx_auto.IsChecked():
-            self.serial.write('AU1\r\nRX\r\n'.encode("ascii"))
+            self.write_serial('AU1\r\nRX\r\n'.encode("ascii"))
         else:
-            self.serial.write('AU0\r\n'.encode("ascii"))
+            self.write_serial('AU0\r\n'.encode("ascii"))
 
     def on_enter_att(self, evt):
         """Changes Attenuation ON/OFF
         """
         att = 1 if self.ckbx_att.IsChecked() else 0
-        self.serial.write(('AT%s\r\n' % att).encode("ascii"))
+        self.write_serial(('AT%s\r\n' % att).encode("ascii"))
 
     def on_select_vfo(self, evt):
         """Select working vfo"""
@@ -176,19 +178,19 @@ class AorCtrl(AorCtrlFrame):
 
         towrite = ''.join(comm)
         # print 'towrite ', towrite
-        self.serial.write(towrite.encode("ascii"))
+        self.write_serial(towrite.encode("ascii"))
 
     def on_vfo_start(self, evt):
-        self.serial.write('VS\r\n'.encode("ascii"))
+        self.write_serial('VS\r\n'.encode("ascii"))
 
     def on_vfo_stop(self, evt):
-        self.serial.write('VV0\r\n'.encode("ascii"))
+        self.write_serial('VV0\r\n'.encode("ascii"))
 
     def on_select_mode(self, evt):
         """Set mode on RX
         """
         mode = self.cbx_mode.GetSelection()
-        self.serial.write(('MD%s\r\n' % mode).encode("ascii"))
+        self.write_serial(('MD%s\r\n' % mode).encode("ascii"))
 
     def on_select_step(self, evt):
         """Set step on RX
@@ -196,7 +198,7 @@ class AorCtrl(AorCtrlFrame):
         STnnn.nm<CR> Set the tuning step size in kHz
         """
         step = float(self.cbx_step.GetStringSelection())
-        self.serial.write(('ST%06.2f\r\n' % step).encode("ascii"))
+        self.write_serial(('ST%06.2f\r\n' % step).encode("ascii"))
 
     def on_enter_freq(self, evt):
         """Writes command RF to serial
@@ -205,10 +207,11 @@ class AorCtrl(AorCtrlFrame):
         if not 0.1 < freq < 3000:
             return
         comm = 'RF%010.5f\r\n' % freq
-        self.serial.write(comm.encode("ascii"))
+        self.write_serial(comm.encode("ascii"))
 
     def on_select_list(self, evt):
         selection = self.cbx_lists.GetStringSelection()
+        self.filling_banks = False
         print(selection)
         if selection == 'SEARCH BANKS':
             self.get_search_banks()
@@ -226,32 +229,76 @@ class AorCtrl(AorCtrlFrame):
 
     def on_serial_read(self, event):
         """Handle input from the serial port."""
+        received_valid = False
         for first in event.data:
-            # print 'event text ', text
-            if first.startswith('VF '):
-                self.set_vfo_text(first, 2)
-            elif first.startswith('VB '):
-                self.set_vfo_text(first, 1)
-                if not self.connected:
-                    self.serial.write('VA\r\nRX\r\nVB\r\n'.encode("ascii"))
-                    self.rb_vfos.SetSelection(1)
-            elif first.startswith('VA '):
-                self.set_vfo_text(first, 0)
-                if not self.connected:
-                    self.serial.write('VB\r\nRX\r\nVA\r\n'.encode("ascii"))
-                    self.rb_vfos.SetSelection(0)
-            elif first.startswith('SR'):
-                self.set_search_banks(first)
-            elif first.startswith('MW'):
-                self.set_memory_banks_list(first)
-            elif first.startswith('MR '):
-                if self.connected and self.filling_banks:
-                    self.set_memory_banks(first)
-            else:
-                print('nothing')
+            try:
+                if not isinstance(first, str):
+                    raise ValueError('Response must be text')
+                # print 'event text ', text
+                if first.startswith('VF '):
+                    self.set_vfo_text(first, 2)
+                elif first.startswith('VB '):
+                    self.set_vfo_text(first, 1)
+                    if not self.connected:
+                        self.write_serial('VA\r\nRX\r\nVB\r\n'.encode("ascii"))
+                        self.rb_vfos.SetSelection(1)
+                elif first.startswith('VA '):
+                    self.set_vfo_text(first, 0)
+                    if not self.connected:
+                        self.write_serial('VB\r\nRX\r\nVA\r\n'.encode("ascii"))
+                        self.rb_vfos.SetSelection(0)
+                elif first.startswith('SR'):
+                    self.set_search_banks(first)
+                elif first.startswith('MW'):
+                    self.set_memory_banks_list(first)
+                elif first.startswith('MR '):
+                    if self.connected and self.filling_banks:
+                        self.set_memory_banks(first)
+                    else:
+                        continue
+                else:
+                    print('Ignored unexpected scanner response: %r' % first, file=sys.stderr)
+                    continue
 
-        self.connected = True
-        self.filling_banks = False
+                received_valid = True
+            except (ValueError, IndexError, TypeError) as error:
+                print('Ignored malformed scanner response %r: %s' % (first, error), file=sys.stderr)
+        if received_valid:
+            self.connected = True
+
+    def write_serial(self, data):
+        try:
+            return self.serial.write(data)
+        except serial.SerialException as error:
+            print('Serial write error: %s' % error, file=sys.stderr)
+
+    def close_serial(self):
+        try:
+            self.serial.close()
+        except serial.SerialException as error:
+            print('Serial close error: %s' % error, file=sys.stderr)
+
+    def validate_fields(self, fields, prefixes):
+        if len(fields) != len(prefixes):
+            raise ValueError('Unexpected field count')
+        for field, prefix in zip(fields, prefixes):
+            if not field.startswith(prefix):
+                raise ValueError('Unexpected field prefix')
+            value = field[2:]
+            if prefix in ('RF', 'ST', 'SL', 'SU'):
+                if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', value):
+                    raise ValueError('Invalid numeric field')
+                if prefix in ('RF', 'SL', 'SU') and not re.fullmatch(r'[0-9]{10}|[0-9]{4}\.[0-9]{4,5}', value):
+                    raise ValueError('Incomplete frequency field')
+            elif prefix in ('AU', 'AT', 'MP'):
+                if value not in ('0', '1'):
+                    raise ValueError('Invalid boolean field')
+            elif prefix == 'MD':
+                if not value.isascii() or not value.isdigit() or not 0 <= int(value) < self.cbx_mode.GetCount():
+                    raise ValueError('Invalid mode field')
+            elif prefix == 'MX':
+                if not re.fullmatch(r'[A-Ta-t][0-9]{2}', value):
+                    raise ValueError('Invalid memory channel')
 
     def log_new(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
         print("log_new")
@@ -267,7 +314,7 @@ class AorCtrl(AorCtrlFrame):
     def on_close(self, event):
         """Called on application shutdown."""
         self.stop_thread()               # stop reader thread
-        self.serial.close()             # cleanup
+        self.close_serial()             # cleanup
         self.Destroy()                  # close windows, exit app
 
     def set_port(self):
@@ -275,7 +322,7 @@ class AorCtrl(AorCtrlFrame):
            settings change.
         """
         self.stop_thread()
-        self.serial.close()
+        self.close_serial()
 
         dialog_serial_cfg = serial_conf_dialog.SerialConfigDialog(None, -1, "", serial=self.serial)
         dialog_serial_cfg.ShowModal()
@@ -284,7 +331,7 @@ class AorCtrl(AorCtrlFrame):
     def connect(self):
         """"""
         self.stop_thread()
-        self.serial.close()
+        self.close_serial()
 
         try:
             self.serial.open()
@@ -306,8 +353,8 @@ class AorCtrl(AorCtrlFrame):
             )
             self.connected = False
             self.memory_banks = []
-            self.serial.write('RX\r\n'.encode("ascii"))
-            self.serial.write('TB\r\n'.encode("ascii"))
+            self.write_serial('RX\r\n'.encode("ascii"))
+            self.write_serial('TB\r\n'.encode("ascii"))
 
     def get_memory_banks(self):
         """
@@ -332,7 +379,7 @@ class AorCtrl(AorCtrlFrame):
             towrite.append(comm)
             towrite.append('RX\r\n')
         # print 'towrite ', towrite
-        self.serial.write(''.join(towrite).encode("ascii"))
+        self.write_serial(''.join(towrite).encode("ascii"))
 
     def get_search_banks(self):
         """
@@ -341,6 +388,7 @@ class AorCtrl(AorCtrlFrame):
         Responds with:
         SRx SLnnnnnnnnnn SUnnnnnnnnnn STnnnnnn AUn MDn TTxxx...x
         """
+        self.filling_banks = False
         self.row = 0
         self.edit_list.list.ClearAll()
         # set column names
@@ -356,12 +404,16 @@ class AorCtrl(AorCtrlFrame):
         for item in channels:
             comm = 'SR%s\r\n' % item
             towrite.append(comm)
-        self.serial.write(''.join(towrite).encode("ascii"))
+        self.write_serial(''.join(towrite).encode("ascii"))
 
     def set_memory_banks_list(self, text):
         """"""
+        if not text.startswith('MW TB '):
+            raise ValueError('Invalid bank-list response')
         item = text.replace('TB', '')[3:]
         a, b = item.split(None, 1)
+        if not re.fullmatch(r'[A-Ta-t]:[0-9]+', a) or not b.startswith(chr(34)):
+            raise ValueError('Invalid bank descriptor')
         item = a + ' ' + b[1:]
         items = self.cbx_lists.GetItems()
         if item in items:
@@ -372,12 +424,14 @@ class AorCtrl(AorCtrlFrame):
     def set_memory_banks(self, item):
         """initializes and fills memory Bank ListControl
         """
-        columns = item.split(None, 8)[1:]
+        fields = item.split(None, 8)[1:]
+        self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
+        columns = fields
         columns = [item[2:] for item in columns]
 
         if columns[0] == self.last:
             return
-        self.edit_list.list.InsertStringItem(sys.maxsize, '')
+        self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
         self.edit_list.list.fill_line(self.row, columns)
 
         self.last = columns[0]
@@ -386,8 +440,16 @@ class AorCtrl(AorCtrlFrame):
     def set_search_banks(self, item):
         """initializes and fills search Bank ListControl
         """
-        self.edit_list.list.InsertStringItem(sys.maxsize, '')
         columns = item.split(None, 7)
+        if not re.fullmatch(r'SR[A-Ta-t]', columns[0]):
+            raise ValueError('Invalid search bank')
+        if len(columns) != 1:
+            self.validate_fields(columns[1:6], ('SL', 'SU', 'ST', 'AU', 'MD'))
+            if len(columns) == 8 and columns[6].startswith('AT'):
+                self.validate_fields(columns[6:], ('AT', 'TT'))
+            elif len(columns) not in (7, 8) or not columns[6].startswith('TT'):
+                raise ValueError('Invalid search-bank name field')
+        self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
         columns = [item[2:] for item in columns]
 
         if len(columns) < 4:
@@ -406,6 +468,7 @@ class AorCtrl(AorCtrlFrame):
 
     def set_vfo_text(self, text, vfx):
         data = text.split()[1:]
+        self.validate_fields(data, ('RF', 'ST', 'AU', 'MD', 'AT'))
         freq, step, auto, mode, att = (item[2:] for item in data)
         self.rb_vfos.SetSelection(vfx)
         if vfx == 0:
@@ -448,7 +511,21 @@ class AorCtrl(AorCtrlFrame):
            transformation (newlines) and generates an SerialRxEvent"""
         while self.alive.is_set():
             # time.sleep(0.2)
-            text_lines = [textline.decode("ascii") for textline in self.serial.readlines()]
+            try:
+                received = self.serial.readlines()
+            except serial.SerialException as error:
+                self.alive.clear()
+                print('Serial read error: %s' % error, file=sys.stderr)
+                return
+            text_lines = []
+            for textline in received:
+                if not textline.endswith(b'\n'):
+                    print('Ignored partial scanner response: %r' % textline, file=sys.stderr)
+                    continue
+                try:
+                    text_lines.append(textline.decode("ascii"))
+                except UnicodeDecodeError as error:
+                    print('Ignored non-ASCII scanner response: %s' % error, file=sys.stderr)
             # print text_lines
             text_lines = [textline.replace('\r\n', "").strip() for textline in text_lines if textline != '?\r\n']
 
