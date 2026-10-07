@@ -202,22 +202,9 @@ class AorCtrl(AorCtrlFrame):
         """Writes command RF to serial
         """
         freq = self.tuning_panel.freq
-        dot_pos = 4
-        comm = 'UNK'
-        # print freq
-        # RFnnnnnnnnm0 (Hz)
-        # RFnnnn.nnnnm (MHz)
-        if freq > 3:
-            alist = ['0', '0', '0', '0', '.', '0', '0', '0', '0', '0']
-
-            freq = str(freq)
-            start = dot_pos - freq.find('.')
-            for char_ in freq:
-                alist[start] = char_
-                start += 1
-            text = ''.join(alist)
-            comm = 'RF%s\r\n' % text
-
+        if not 0.1 < freq < 3000:
+            return
+        comm = 'RF%010.5f\r\n' % freq
         self.serial.write(comm.encode("ascii"))
 
     def on_select_list(self, evt):
