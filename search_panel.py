@@ -19,7 +19,7 @@ class EditListCtrl(wx.ListCtrl,
             self.InsertColumn(column, "Column %i" % column)
 
         for row in range(5):
-            newrow = self.InsertStringItem(sys.maxsize, '.')
+            newrow = self.InsertItem(self.GetItemCount(), '.')
             for column in range(8):
                 self.SetStringItem(newrow, column, '.')
 
