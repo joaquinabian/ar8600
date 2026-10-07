@@ -8,6 +8,11 @@ from aor_control_frame import AorCtrlFrame
 from aor_functions import do_nothing, format_frequency
 
 
+# GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
+GUI_MODE_TO_MD = (0, 1, 6, 7, 2, 8, 3, 4, 5)
+MD_TO_GUI_MODE = {code: index for index, code in enumerate(GUI_MODE_TO_MD)}
+
+
 menu_titles = ["Set", "Edit"]
 menu_title_by_id = {}
 for title_ in menu_titles:
@@ -52,6 +57,7 @@ class AorCtrl(AorCtrlFrame):
         self.memory_banks = []
         self.connected = False
         self.filling_banks = False
+        self.pending_memory_channels = set()
         self.list_item_clicked = None
         self.alive = threading.Event()
         AorCtrlFrame.__init__(self, *args, **kwds)
@@ -69,6 +75,7 @@ class AorCtrl(AorCtrlFrame):
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
         self.filling_banks = False
+        self.pending_memory_channels.clear()
         if self.thread is not None:
             self.alive.clear()          # clear alive event for thread
             self.thread.join()          # wait until thread has finished
@@ -190,7 +197,9 @@ class AorCtrl(AorCtrlFrame):
         """Set mode on RX
         """
         mode = self.cbx_mode.GetSelection()
-        self.write_serial(('MD%s\r\n' % mode).encode("ascii"))
+        if not 0 <= mode < len(GUI_MODE_TO_MD):
+            return
+        self.write_serial(('MD%s\r\n' % GUI_MODE_TO_MD[mode]).encode("ascii"))
 
     def on_select_step(self, evt):
         """Set step on RX
@@ -212,6 +221,7 @@ class AorCtrl(AorCtrlFrame):
     def on_select_list(self, evt):
         selection = self.cbx_lists.GetStringSelection()
         self.filling_banks = False
+        self.pending_memory_channels.clear()
         print(selection)
         if selection == 'SEARCH BANKS':
             self.get_search_banks()
@@ -252,7 +262,7 @@ class AorCtrl(AorCtrlFrame):
                 elif first.startswith('MW'):
                     self.set_memory_banks_list(first)
                 elif first.startswith('MR '):
-                    if self.connected and self.filling_banks:
+                    if self.filling_banks:
                         self.set_memory_banks(first)
                     else:
                         continue
@@ -294,7 +304,7 @@ class AorCtrl(AorCtrlFrame):
                 if value not in ('0', '1'):
                     raise ValueError('Invalid boolean field')
             elif prefix == 'MD':
-                if not value.isascii() or not value.isdigit() or not 0 <= int(value) < self.cbx_mode.GetCount():
+                if not value.isascii() or not value.isdigit() or int(value) not in MD_TO_GUI_MODE:
                     raise ValueError('Invalid mode field')
             elif prefix == 'MX':
                 if not re.fullmatch(r'[A-Ta-t][0-9]{2}', value):
@@ -378,6 +388,10 @@ class AorCtrl(AorCtrlFrame):
             comm = 'MR%s%02i\r\n' % (bank, channel)
             towrite.append(comm)
             towrite.append('RX\r\n')
+        # MR/RX has no load terminator; only channel-labelled responses can
+        # safely retire requests. An unlabelled '?' cannot identify a channel.
+        self.pending_memory_channels = {'%s%02i' % (bank, channel) for channel in range(int(channels))}
+        self.filling_banks = bool(self.pending_memory_channels)
         # print 'towrite ', towrite
         self.write_serial(''.join(towrite).encode("ascii"))
 
@@ -389,6 +403,7 @@ class AorCtrl(AorCtrlFrame):
         SRx SLnnnnnnnnnn SUnnnnnnnnnn STnnnnnn AUn MDn TTxxx...x
         """
         self.filling_banks = False
+        self.pending_memory_channels.clear()
         self.row = 0
         self.edit_list.list.ClearAll()
         # set column names
@@ -429,6 +444,8 @@ class AorCtrl(AorCtrlFrame):
         columns = fields
         columns = [item[2:] for item in columns]
 
+        if columns[0] not in self.pending_memory_channels:
+            return
         if columns[0] == self.last:
             return
         self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
@@ -436,6 +453,8 @@ class AorCtrl(AorCtrlFrame):
 
         self.last = columns[0]
         self.row += 1
+        self.pending_memory_channels.remove(columns[0])
+        self.filling_banks = bool(self.pending_memory_channels)
 
     def set_search_banks(self, item):
         """initializes and fills search Bank ListControl
@@ -499,7 +518,7 @@ class AorCtrl(AorCtrlFrame):
         # auto
         self.ckbx_auto.SetValue(int(auto))
         # mode
-        self.cbx_mode.SetSelection(int(mode))
+        self.cbx_mode.SetSelection(MD_TO_GUI_MODE[int(mode)])
         # att
         self.ckbx_att.SetValue(int(att))
 
