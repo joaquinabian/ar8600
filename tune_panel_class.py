@@ -24,7 +24,7 @@ class TuningPanel(MyPanel):
     def on_arrows(self, evt):
         obj = evt.GetEventObject()
         name = obj.GetLabel()
-        print 'xx ', name
+        print('xx ', name)
         evt.Skip(True)
 
     def on_enter(self, evt):
@@ -75,13 +75,13 @@ class MyFrame(wx.Frame):
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def on_connect(self, evt):
-        print 'connect'
+        print('connect')
 
         #
         #
 
 if __name__ == '__main__':
-    print 'hello'
+    print('hello')
     app = wx.PySimpleApp(0)
     wx.InitAllImageHandlers()
     frame_1 = MyFrame(None, -1, "")

@@ -229,15 +229,15 @@ class AorCtrlFrame(wx.Frame):
         # end wxGlade
 
     def log_new(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print "Event handler 'log_new' not implemented!"
+        print("Event handler 'log_new' not implemented!")
         event.Skip()
 
     def log_open(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print "Event handler 'log_open' not implemented!"
+        print("Event handler 'log_open' not implemented!")
         event.Skip()
 
     def config(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print "Event handler 'config' not implemented!"
+        print("Event handler 'config' not implemented!")
         event.Skip()
 
 # end of class AorCtrlFrame

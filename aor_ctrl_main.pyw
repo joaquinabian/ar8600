@@ -61,7 +61,7 @@ class AorCtrl(AorCtrlFrame):
     def start_thread(self):
         """Start the receiver thread"""
         self.thread = threading.Thread(target=self.com_thread)
-        self.thread.setDaemon(1)
+        self.thread.daemon = True
         self.alive.set()
         self.thread.start()
 
@@ -103,7 +103,7 @@ class AorCtrl(AorCtrlFrame):
         elif item.Label == 'connect':
             self.connect()
         else:
-            print 'some other tool pressed'
+            print('some other tool pressed')
 
     def open_menu(self, event):
         """"""
@@ -121,7 +121,7 @@ class AorCtrl(AorCtrlFrame):
         # do something
         operation = menu_title_by_id[event.GetId()]
         target = self.list_item_clicked
-        print 'Perform "%s" on "%s."' % (operation, target)
+        print('Perform "%s" on "%s."' % (operation, target))
 
     def on_move_frequency(self, evt):
         obj = evt.GetEventObject()
@@ -222,7 +222,7 @@ class AorCtrl(AorCtrlFrame):
 
     def on_select_list(self, evt):
         selection = self.cbx_lists.GetStringSelection()
-        print selection
+        print(selection)
         if selection == 'SEARCH BANKS':
             self.get_search_banks()
         elif selection == 'SELECT SCAN':
@@ -261,16 +261,16 @@ class AorCtrl(AorCtrlFrame):
                 if self.connected and self.filling_banks:
                     self.set_memory_banks(first)
             else:
-                print 'nothing'
+                print('nothing')
 
         self.connected = True
         self.filling_banks = False
 
     def log_new(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print "log_new"
+        print("log_new")
 
     def log_open(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print "log_open"
+        print("log_open")
 
     # noinspection PyPep8Naming
     def OnExit(self, event):
@@ -301,7 +301,7 @@ class AorCtrl(AorCtrlFrame):
 
         try:
             self.serial.open()
-        except serial.SerialException, e:
+        except serial.SerialException as e:
             dlg = wx.MessageDialog(None, str(e), "Serial Port Error", wx.OK | wx.ICON_ERROR)
             dlg.ShowModal()
             dlg.Destroy()
@@ -389,7 +389,7 @@ class AorCtrl(AorCtrlFrame):
 
         if columns[0] == self.last:
             return
-        self.edit_list.list.InsertStringItem(sys.maxint, '')
+        self.edit_list.list.InsertStringItem(sys.maxsize, '')
         self.edit_list.list.fill_line(self.row, columns)
 
         self.last = columns[0]
@@ -398,7 +398,7 @@ class AorCtrl(AorCtrlFrame):
     def set_search_banks(self, item):
         """initializes and fills search Bank ListControl
         """
-        self.edit_list.list.InsertStringItem(sys.maxint, '')
+        self.edit_list.list.InsertStringItem(sys.maxsize, '')
         columns = item.split(None, 7)
         columns = [item[2:] for item in columns]
 
@@ -435,7 +435,7 @@ class AorCtrl(AorCtrlFrame):
         lb.SetLabel(format_frequency(freq))
         # step
         if '.' in step:
-            print 'step with dot'
+            print('step with dot')
             # in megaherz
         else:
             # in kilos
@@ -458,14 +458,14 @@ class AorCtrl(AorCtrlFrame):
     def com_thread(self):
         """Thread that handles the incoming traffic. Does the basic input
            transformation (newlines) and generates an SerialRxEvent"""
-        while self.alive.isSet():
+        while self.alive.is_set():
             # time.sleep(0.2)
             text_lines = self.serial.readlines()
             # print text_lines
             text_lines = [textline.replace('\r\n', "").strip() for textline in text_lines if textline != '?\r\n']
 
             if text_lines:
-                print 'text < %s >' % text_lines
+                print('text < %s >' % text_lines)
                 event = SerialRxEvent(self.GetId(), text_lines)
                 self.GetEventHandler().AddPendingEvent(event)
 

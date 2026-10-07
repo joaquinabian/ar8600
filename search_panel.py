@@ -19,7 +19,7 @@ class EditListCtrl(wx.ListCtrl,
             self.InsertColumn(column, "Column %i" % column)
 
         for row in range(5):
-            newrow = self.InsertStringItem(sys.maxint, '.')
+            newrow = self.InsertStringItem(sys.maxsize, '.')
             for column in range(8):
                 self.SetStringItem(newrow, column, '.')
 
@@ -80,11 +80,11 @@ class DummyFrame(wx.Frame):
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def on_connect(self, evt):
-        print 'connect'
+        print('connect')
 
 
 if __name__ == '__main__':
-    print 'hello'
+    print('hello')
     app = wx.PySimpleApp(0)
     wx.InitAllImageHandlers()
     frame_1 = DummyFrame(None, -1, "")

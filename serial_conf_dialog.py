@@ -48,7 +48,7 @@ class SerialConfigDialog(wx.Dialog):
             self.ports.append(portname)
             if self.serial.portstr == portname:
                 preferred_index = n
-        print self.ports
+        print(self.ports)
         self.combo_box_port.SetSelection(preferred_index)
         # fill in baud rates and select current setting
         self.choice_baudrate.Clear()
@@ -158,7 +158,7 @@ class SerialConfigDialog(wx.Dialog):
         self.serial.rtscts   = self.checkbox_rtscts.GetValue()
         self.serial.xonxoff  = self.checkbox_xonxoff.GetValue()
 
-        print self.serial.parity
+        print(self.serial.parity)
 
         if self.checkbox_timeout.GetValue():
             try:
@@ -195,7 +195,7 @@ class MyApp(wx.App):
             dialog_serial_cfg = SerialConfigDialog(None, -1, "", serial=ser)
             self.SetTopWindow(dialog_serial_cfg)
             result = dialog_serial_cfg.ShowModal()
-            print ser
+            print(ser)
             if result != wx.ID_OK:
                 break
         return 0
