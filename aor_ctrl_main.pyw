@@ -190,7 +190,7 @@ class AorCtrl(AorCtrlFrame):
         mode = self.cbx_mode.GetSelection()
         self.serial.write(('MD%s\r\n' % mode).encode("ascii"))
 
-    def on_select_step(self):
+    def on_select_step(self, evt):
         """Set step on RX
         STnnnnm0<CR> Set the tuning step size in Hz
         STnnn.nm<CR> Set the tuning step size in kHz
