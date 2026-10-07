@@ -321,7 +321,6 @@ class AorCtrl(AorCtrlFrame):
             self.memory_banks = []
             self.serial.write('RX\r\n'.encode("ascii"))
             self.serial.write('TB\r\n'.encode("ascii"))
-            self.serial.write('TB\r\n'.encode("ascii"))
 
     def get_memory_banks(self):
         """
@@ -365,7 +364,7 @@ class AorCtrl(AorCtrlFrame):
         towrite = []
         comm = 'SR%%\r\n'
         channels = ['K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
-                    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'o', 'p', 'q', 'r', 's', 't']
+                    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't']
         towrite.append(comm)
         for item in channels:
             comm = 'SR%s\r\n' % item
@@ -378,6 +377,8 @@ class AorCtrl(AorCtrlFrame):
         a, b = item.split(None, 1)
         item = a + ' ' + b[1:]
         items = self.cbx_lists.GetItems()
+        if item in items:
+            return
         items.append(item)
         self.cbx_lists.SetItems(items)
 
