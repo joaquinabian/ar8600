@@ -54,6 +54,8 @@ class AorCtrl(AorCtrlFrame):
         self.vfa = None
         self.vfb = None
         self.vfo = None
+        self.vfo_status = {}
+        self.background_vfo = None
         self.memory_banks = []
         self.connected = False
         self.filling_banks = False
@@ -76,6 +78,7 @@ class AorCtrl(AorCtrlFrame):
         """Stop the receiver thread, wait util it's finished."""
         self.filling_banks = False
         self.pending_memory_channels.clear()
+        self.background_vfo = None
         if self.thread is not None:
             self.alive.clear()          # clear alive event for thread
             self.thread.join()          # wait until thread has finished
@@ -165,15 +168,19 @@ class AorCtrl(AorCtrlFrame):
     def on_select_vfo(self, evt):
         """Select working vfo"""
         selection = self.rb_vfos.GetSelection()
+        if selection in self.vfo_status:
+            self.set_vfo_text(self.vfo_status[selection], selection)
         comm = []
         if selection == 0:
             if not self.vfb:
+                self.background_vfo = 1
                 comm.append('VB\r\nRX\r\n')
             comm.append('VA\r\n')
             if not self.vfa:
                 comm.append('RX\r\n')
         elif selection == 1:
             if not self.vfa:
+                self.background_vfo = 0
                 comm.append('VA\r\nRX\r\n')
             comm.append('VB\r\n')
             if not self.vfb:
@@ -245,18 +252,16 @@ class AorCtrl(AorCtrlFrame):
                 if not isinstance(first, str):
                     raise ValueError('Response must be text')
                 # print 'event text ', text
-                if first.startswith('VF '):
-                    self.set_vfo_text(first, 2)
-                elif first.startswith('VB '):
-                    self.set_vfo_text(first, 1)
-                    if not self.connected:
-                        self.write_serial('VA\r\nRX\r\nVB\r\n'.encode("ascii"))
-                        self.rb_vfos.SetSelection(1)
-                elif first.startswith('VA '):
-                    self.set_vfo_text(first, 0)
-                    if not self.connected:
-                        self.write_serial('VB\r\nRX\r\nVA\r\n'.encode("ascii"))
-                        self.rb_vfos.SetSelection(0)
+                if first.startswith(('VA ', 'VB ', 'VF ')):
+                    vfx = {'VA': 0, 'VB': 1, 'VF': 2}[first[:2]]
+                    background = vfx == self.background_vfo
+                    self.set_vfo_text(first, vfx, active=not background)
+                    if background:
+                        self.background_vfo = None
+                    elif not self.connected and self.background_vfo is None and vfx in (0, 1):
+                        self.background_vfo = 1 - vfx
+                        command = 'VA\r\nRX\r\nVB\r\n' if vfx == 1 else 'VB\r\nRX\r\nVA\r\n'
+                        self.write_serial(command.encode("ascii"))
                 elif first.startswith('SR'):
                     self.set_search_banks(first)
                 elif first.startswith('MW'):
@@ -423,13 +428,11 @@ class AorCtrl(AorCtrlFrame):
 
     def set_memory_banks_list(self, text):
         """"""
-        if not text.startswith('MW TB '):
+        match = re.fullmatch(r'MW ([A-Ta-t]):([0-9]+) TB\1(.*)', text)
+        if match is None:
             raise ValueError('Invalid bank-list response')
-        item = text.replace('TB', '')[3:]
-        a, b = item.split(None, 1)
-        if not re.fullmatch(r'[A-Ta-t]:[0-9]+', a) or not b.startswith(chr(34)):
-            raise ValueError('Invalid bank descriptor')
-        item = a + ' ' + b[1:]
+        bank, channels, name = match.groups()
+        item = ('%s:%s %s' % (bank, channels, name)).rstrip()
         items = self.cbx_lists.GetItems()
         if item in items:
             return
@@ -485,11 +488,10 @@ class AorCtrl(AorCtrlFrame):
         self.edit_list.list.fill_line(self.row, columns)
         self.row += 1
 
-    def set_vfo_text(self, text, vfx):
+    def set_vfo_text(self, text, vfx, active=True):
         data = text.split()[1:]
         self.validate_fields(data, ('RF', 'ST', 'AU', 'MD', 'AT'))
         freq, step, auto, mode, att = (item[2:] for item in data)
-        self.rb_vfos.SetSelection(vfx)
         if vfx == 0:
             lb = self.lb_vfa
             self.vfa = freq
@@ -503,6 +505,10 @@ class AorCtrl(AorCtrlFrame):
             return
 
         lb.SetLabel(format_frequency(freq))
+        self.vfo_status[vfx] = text
+        if not active:
+            return
+        self.rb_vfos.SetSelection(vfx)
         # step
         if '.' in step:
             print('step with dot')
@@ -515,6 +521,8 @@ class AorCtrl(AorCtrlFrame):
                 if float(value) == step:
                     self.cbx_step.SetSelection(index)
                     break
+            else:
+                self.cbx_step.SetValue('%g' % step)
         # auto
         self.ckbx_auto.SetValue(int(auto))
         # mode
@@ -538,6 +546,8 @@ class AorCtrl(AorCtrlFrame):
                 return
             text_lines = []
             for textline in received:
+                if not textline.strip():
+                    continue
                 if not textline.endswith(b'\n'):
                     print('Ignored partial scanner response: %r' % textline, file=sys.stderr)
                     continue
@@ -547,6 +557,7 @@ class AorCtrl(AorCtrlFrame):
                     print('Ignored non-ASCII scanner response: %s' % error, file=sys.stderr)
             # print text_lines
             text_lines = [textline.replace('\r\n', "").strip() for textline in text_lines if textline != '?\r\n']
+            text_lines = [textline for textline in text_lines if textline]
 
             if text_lines:
                 print('text < %s >' % text_lines)
