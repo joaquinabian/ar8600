@@ -10,7 +10,8 @@ from datetime import datetime
 from aor_control_frame import AorCtrlFrame
 from aor_functions import (do_nothing, format_frequency, parse_lm_response, parse_lc_response,
                            parse_select_scan_response, parse_pass_frequency_response,
-                           make_pass_frequency_command, format_activity_row)
+                           make_pass_frequency_command, format_activity_row,
+                           parse_bandscope_status, BandscopeSweep, bandscope_frequency)
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -41,6 +42,273 @@ class SerialRxEvent(wx.PyCommandEvent):
     # noinspection PyMethodOverriding
     def Clone(self):
         return self.__class__(self.GetId(), self.data)
+
+
+class BandscopeWindow(wx.Frame):
+    """A single in-flight sweep, delivered by the application's existing reader."""
+    def __init__(self, controller):
+        super().__init__(controller, title='AR8600 BAND SCOPE', size=(800, 430))
+        self.controller = controller
+        self.status = None
+        self.samples = None
+        self.sweep = None
+        self.waiting = None
+        self.running = False
+        self.entered = False
+        self.restore_command = None
+        self.close_requested = False
+        self.started_at = None
+        self.last_duration = None
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        self.start_button = wx.Button(panel, label='Start')
+        self.stop_button = wx.Button(panel, label='Stop')
+        self.refresh_button = wx.Button(panel, label='Refresh once')
+        for button in (self.start_button, self.stop_button, self.refresh_button):
+            buttons.Add(button, 0, wx.ALL, 5)
+        sizer.Add(buttons)
+        self.info = wx.StaticText(panel, label='Centre: ---    Span: ---    Marker: ---')
+        sizer.Add(self.info, 0, wx.ALL, 5)
+        self.plot = wx.Panel(panel)
+        self.plot.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.plot.Bind(wx.EVT_PAINT, self.on_paint)
+        self.plot.Bind(wx.EVT_SIZE, self.on_plot_size)
+        sizer.Add(self.plot, 1, wx.EXPAND | wx.ALL, 5)
+        self.message = wx.StaticText(panel, label='Connect, then Start or Refresh once. Stop halts refresh; Close restores the previous VFO/memory mode when available.')
+        sizer.Add(self.message, 0, wx.ALL, 5)
+        panel.SetSizer(sizer)
+        self.timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
+        self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
+        self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
+        self.refresh_button.Bind(wx.EVT_BUTTON, self.on_refresh)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    @property
+    def pauses_lm(self):
+        return self.waiting is not None and (self.sweep is None or not self.sweep.failed)
+
+    def available(self):
+        return self.controller.connected and self.controller.serial.is_open and self.controller.alive.is_set()
+
+    def send(self, data):
+        if self.controller.write_serial(data) == len(data):
+            return True
+        self.disconnect()
+        self.message.SetLabel('Bandscope command failed; see serial diagnostics.')
+        return False
+
+    def on_start(self, event):
+        if self.waiting is not None:
+            return
+        self.running = True
+        self.request_sweep()
+
+    def on_refresh(self, event):
+        if self.waiting is None:
+            self.running = False
+            self.request_sweep()
+
+    def on_stop(self, event):
+        self.running = False
+        if self.waiting is None:
+            self.timer.Stop()
+        self.message.SetLabel('Stopping after the pending sweep.' if self.waiting else 'Refresh stopped.')
+
+    def request_sweep(self):
+        if not self.available():
+            self.running = False
+            self.message.SetLabel('Connect to the scanner before requesting a sweep.')
+            return
+        if self.waiting is not None:
+            return
+        self.close_requested = False
+        self.sweep = None
+        self.waiting = 'status' if self.entered else 'receiver'
+        self.start_button.Disable()
+        self.refresh_button.Disable()
+        self.started_at = time.monotonic()
+        # One-shot watchdog reports failure; it never sends another DS request.
+        self.timer.StartOnce(75000)
+        self.message.SetLabel('Reading bandscope status (LM polling paused).')
+        self.send(b'AM\r\n' if self.entered else b'RX\r\n')
+
+    def capture_receiver(self, text):
+        if self.waiting != 'receiver':
+            return
+        context = text.split()[0]
+        if context in ('VA', 'VB', 'VF'):
+            self.restore_command = (context + '\r\n').encode('ascii')
+        elif context == 'MR':
+            match = re.match(r'MR MX([A-Ja-j][0-9]{2}) ', text)
+            if match:
+                self.restore_command = ('MR%s\r\n' % match.group(1)).encode('ascii')
+        elif context not in ('SM', 'MS') and not re.fullmatch(r'SR[A-Ta-t]', context):
+            return
+        self.waiting = 'status'
+        self.entered = True
+        # The first AM enters; the second obtains the documented status.
+        self.send(b'AM\r\nAM\r\n')
+
+    def set_status(self, text):
+        status = parse_bandscope_status(text)
+        if self.waiting == 'receiver':  # The scanner was already in analyser mode.
+            self.entered = True
+            self.waiting = 'status'
+        if self.waiting != 'status':
+            return
+        if self.status != status:
+            self.samples = None  # Never relabel an old trace with new geometry.
+            self.plot.Refresh()
+        self.status = status
+        self.info.SetLabel('Centre: %.6f MHz    Span: %g MHz    Marker: %.6f MHz%s' %
+                           (status['centre_hz'] / 1000000, status['span_hz'] / 1000000,
+                            status['marker_hz'] / 1000000, '    Peak hold' if status['peak_hold'] else ''))
+        self.sweep = BandscopeSweep()
+        self.waiting = 'data'
+        self.started_at = time.monotonic()
+        self.timer.StartOnce(75000)
+        self.message.SetLabel('Waiting for sweep completion: 0 / 1024 samples (LM polling paused).')
+        self.send(b'DS\r\n')
+
+    def add_ds_line(self, text):
+        if self.waiting != 'data':
+            return  # Ignore late data after disconnect; do not populate ordinary lists.
+        try:
+            samples = self.sweep.add_line(text)
+        except ValueError as error:
+            print('Bandscope DS error %r: %s' % (text, error), file=sys.stderr)
+            self.message.SetLabel('Invalid sweep: %s' % error)
+            self.running = False
+            samples = None
+        if samples is not None:
+            self.samples = samples
+            self.last_duration = time.monotonic() - self.started_at
+            self.message.SetLabel('1024 samples received in %.2f s. 0: unmeasured; 1: outside specification; 2-F: raw level.' % self.last_duration)
+            self.plot.Refresh()
+        elif not self.sweep.failed:
+            self.message.SetLabel('Collecting: %d / 1024 samples (LM polling paused).' % (len(self.sweep.blocks) * 32))
+        if self.sweep.finished:
+            if self.sweep.failed:
+                self.message.SetLabel('Sweep rejected: incomplete or malformed data. Refresh once to retry.')
+            self.waiting = None
+            self.timer.Stop()
+            self.start_button.Enable()
+            self.refresh_button.Enable()
+            if self.close_requested:
+                self.restore_receiver()
+            elif self.running:
+                self.timer.StartOnce(500)
+
+    def on_timer(self, event):
+        if self.waiting is None:
+            if self.running:
+                self.request_sweep()
+            return
+        self.running = False
+        if self.waiting == 'data':
+            self.sweep.failed = True
+            self.message.SetLabel('Sweep timed out; LM resumed. Waiting for DS end; reconnect if it never arrives.')
+            # Retain the outstanding request to prevent overlap with late data.
+        else:
+            self.waiting = None
+            self.start_button.Enable()
+            self.refresh_button.Enable()
+            self.message.SetLabel('No valid bandscope status received. Refresh once to retry.')
+            if self.close_requested:
+                self.restore_receiver()
+        print('Bandscope request timed out', file=sys.stderr)
+
+    def restore_receiver(self, query=True):
+        if self.entered and self.restore_command and self.controller.serial.is_open:
+            self.controller.write_serial(self.restore_command + (b'RX\r\n' if query else b''))
+        elif self.entered and self.controller.serial.is_open:
+            self.controller.aor_status.SetStatusText('Bandscope refresh stopped. Select a VFO to leave analyser mode.')
+        self.entered = False
+        self.restore_command = None
+
+    def disconnect(self):
+        self.running = False
+        self.timer.Stop()
+        self.restore_receiver(query=False)
+        self.waiting = None
+        self.sweep = None
+        self.start_button.Enable()
+        self.refresh_button.Enable()
+        self.message.SetLabel('Disconnected.')
+
+    def on_close(self, event):
+        self.on_stop(event)
+        self.close_requested = True
+        if self.waiting != 'data':
+            self.waiting = None
+            self.timer.Stop()
+            self.start_button.Enable()
+            self.refresh_button.Enable()
+        if self.waiting is None:
+            self.restore_receiver()
+        self.Hide()  # Retain pending sweep state until its last line is drained.
+
+    def on_plot_size(self, event):
+        self.plot.Refresh()
+        event.Skip()
+
+    def on_paint(self, event):
+        dc = wx.AutoBufferedPaintDC(self.plot)
+        dc.SetBackground(wx.Brush('white'))
+        dc.Clear()
+        width, height = self.plot.GetClientSize()
+        left, top, right, bottom = 55, 20, width - 20, height - 45
+        if right <= left or bottom <= top:
+            return
+        dc.SetTextForeground('black')
+        dc.SetPen(wx.Pen('#dddddd'))
+        for level in (0, 2, 5, 10, 15):
+            y = bottom - round(level * (bottom - top) / 15)
+            dc.DrawLine(left, y, right, y)
+            dc.DrawText('%X' % level, 25, y - 7)
+        dc.DrawText('Raw', 12, 0)
+        dc.SetPen(wx.Pen('black'))
+        dc.DrawLine(left, top, left, bottom)
+        dc.DrawLine(left, bottom, right, bottom)
+        if self.status is None:
+            dc.DrawText('No bandscope status yet', left + 15, top + 15)
+            return
+        status = self.status
+        low = status['centre_hz'] - status['span_hz'] / 2
+        high = status['centre_hz'] + status['span_hz'] / 2
+        def x_at(frequency):
+            return left + round((frequency - low) * (right - left) / (high - low))
+        for n in range(5):
+            frequency = low + n * (high - low) / 4
+            x = x_at(frequency)
+            label = '%.3f' % (frequency / 1000000)
+            dc.DrawText(label, x - dc.GetTextExtent(label)[0] // 2, bottom + 6)
+        dc.DrawText('Frequency (MHz)', left + (right - left) // 2 - 50, bottom + 24)
+        dc.SetPen(wx.Pen('#aa3333', 1, wx.PENSTYLE_SHORT_DASH))
+        marker_x = x_at(status['marker_hz'])
+        if low <= status['marker_hz'] <= high:
+            dc.DrawLine(marker_x, top, marker_x, bottom)
+            dc.DrawText('Marker', marker_x + 4, top)
+        if status['centre_hz'] != status['marker_hz']:
+            dc.DrawText('Marker differs from centre: DS frequency geometry is not established by the manual.', left + 5, top + 30)
+            return
+        if self.samples is None:
+            return
+        dc.SetPen(wx.Pen('#1565b0', 1))
+        previous = None
+        for index, level in enumerate(self.samples):
+            frequency = bandscope_frequency(status, index)
+            if not low <= frequency <= high or level < 2:
+                previous = None  # 0/1 are validity codes, not measured signal levels.
+                continue
+            point = (x_at(frequency), bottom - round(level * (bottom - top) / 15))
+            if previous is None:
+                dc.DrawPoint(*point)
+            else:
+                dc.DrawLine(*previous, *point)
+            previous = point
 
 
 # noinspection PyUnusedLocal
@@ -76,6 +344,7 @@ class AorCtrl(AorCtrlFrame):
         self.select_scan_rows = {}
         self.pass_frequency_rows = {}
         self.pass_context = 'V'
+        self.bandscope = None
         AorCtrlFrame.__init__(self, *args, **kwds)
 
         self.create_monitor_controls()
@@ -83,6 +352,17 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_TIMER, self.on_lm_timer, self.lm_timer)
         self.__set_properties()
         self.__attach_events()           # register events
+        view_menu = wx.Menu()
+        bandscope_action = view_menu.Append(wx.ID_ANY, 'BAND SCOPE...')
+        self.GetMenuBar().Append(view_menu, 'View')
+        self.Bind(wx.EVT_MENU, self.on_bandscope, id=bandscope_action.GetId())
+
+    def on_bandscope(self, event):
+        if self.bandscope is None:
+            self.bandscope = BandscopeWindow(self)
+        self.bandscope.close_requested = False
+        self.bandscope.Show()
+        self.bandscope.Raise()
 
     def start_thread(self):
         """Start the receiver thread"""
@@ -93,6 +373,8 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        if self.bandscope is not None:
+            self.bandscope.disconnect()
         self.stop_monitoring()
         self.connected = False
         self.filling_banks = False
@@ -159,6 +441,8 @@ class AorCtrl(AorCtrlFrame):
             self.stop_monitoring()
             return
         if self.lm_pending:
+            return
+        if self.bandscope is not None and self.bandscope.pauses_lm:
             return
         self.lm_pending = True
         if self.write_serial(b'LM\r\n') != 4:
@@ -403,9 +687,17 @@ class AorCtrl(AorCtrlFrame):
             try:
                 if not isinstance(first, str):
                     raise ValueError('Response must be text')
+                if self.bandscope is not None:
+                    self.bandscope.capture_receiver(first)
                 # print 'event text ', text
                 if first.startswith('LM'):
                     self.set_signal_level(first)
+                elif first.startswith('AM '):
+                    if self.bandscope is not None:
+                        self.bandscope.set_status(first)
+                elif first.startswith('DS'):
+                    if self.bandscope is not None:
+                        self.bandscope.add_ds_line(first)
                 elif first.startswith('LC'):
                     if first in ('LC0', 'LC1'):
                         # Configuration replies are not reception events.

@@ -4,6 +4,79 @@ import re
 from decimal import Decimal
 
 
+BANDSCOPE_SPANS = {1: 10000000, 2: 5000000, 3: 2000000, 4: 1000000,
+                   5: 500000, 6: 200000, 7: 100000}
+
+
+def parse_bandscope_status(text):
+    match = re.fullmatch(r'AM PH([01]) CF([0-9]{10}) MF([0-9]{10}) SW([1-7])', text)
+    if match is None:
+        raise ValueError('Invalid bandscope status')
+    peak_hold, centre, marker, span = match.groups()
+    return {'peak_hold': bool(int(peak_hold)), 'centre_hz': int(centre),
+            'marker_hz': int(marker), 'span_code': int(span),
+            'span_hz': BANDSCOPE_SPANS[int(span)]}
+
+
+def parse_ds_block(text):
+    match = re.fullmatch(r'DS([0-9]{4})\s*:\s*([0-9A-Fa-f]{16})[ \t]*([0-9A-Fa-f]{16})', text)
+    if match is None:
+        raise ValueError('Invalid DS block: expected an index and 32 hex samples')
+    index = int(match.group(1))
+    if not 31 <= index <= 1023 or index % 32 != 31:
+        raise ValueError('Invalid DS block index')
+    return index, tuple(int(value, 16) for value in match.group(2) + match.group(3))
+
+
+class BandscopeSweep:
+    """Assemble one DS dump, retaining invalid/incomplete state until its end."""
+    def __init__(self):
+        self.blocks = {}
+        self.failed = False
+        self.finished = False
+
+    def add_line(self, text):
+        try:
+            index, values = parse_ds_block(text)
+        except ValueError:
+            self.failed = True
+            # Even a damaged final block ends this dump; never display it.
+            if re.match(r'DS0031\b', text):
+                self.finished = True
+            raise
+        if self.finished:
+            raise ValueError('DS data received after the sweep ended')
+        if index in self.blocks:
+            if self.blocks[index] != values:
+                self.failed = True
+                raise ValueError('Conflicting duplicate DS block')
+            return None  # Identical duplicates neither count nor overwrite.
+        self.blocks[index] = values
+        if index == 31:
+            self.finished = True
+            if len(self.blocks) != 32:
+                self.failed = True
+                raise ValueError('Incomplete DS sweep: %d / 32 blocks' % len(self.blocks))
+        if len(self.blocks) != 32 or self.failed:
+            return None
+        samples = [0] * 1024
+        # DS1023 covers 1023..992, followed by DS0991 covering 991..960.
+        for index, block in self.blocks.items():
+            for offset, value in enumerate(block):
+                samples[index - offset] = value
+        return tuple(samples)
+
+
+def bandscope_frequency(status, index):
+    """Use the manual's centre indices, without extrapolating its edge table."""
+    if not 0 <= index < 1024:
+        raise ValueError('Invalid DS sample index')
+    if status['marker_hz'] != status['centre_hz']:
+        raise ValueError('Manual does not establish geometry for a moved marker')
+    narrow = status['span_code'] in (6, 7)
+    return status['centre_hz'] + (index - (64 if narrow else 512)) * (2000 if narrow else 10000)
+
+
 def parse_select_scan_response(text):
     """GR lists a select-scan slot followed by the tagged memory's settings."""
     empty = re.fullmatch(r'GR([0-9]{2}) ---', text)
