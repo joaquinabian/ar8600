@@ -266,11 +266,14 @@ class AorCtrl(AorCtrlFrame):
                     self.set_search_banks(first)
                 elif first.startswith('MW'):
                     self.set_memory_banks_list(first)
-                elif first.startswith('MR '):
+                elif first.startswith('MX'):
                     if self.filling_banks:
                         self.set_memory_banks(first)
                     else:
                         continue
+                elif first.startswith('MR '):
+                    # RX memory status is not an MA listing response.
+                    continue
                 else:
                     print('Ignored unexpected scanner response: %r' % first, file=sys.stderr)
                     continue
@@ -370,13 +373,13 @@ class AorCtrl(AorCtrlFrame):
             self.memory_banks = []
             self.write_serial('RX\r\n'.encode("ascii"))
             self.write_serial('TB\r\n'.encode("ascii"))
+            self.write_serial('TB\r\n'.encode("ascii"))
 
     def get_memory_banks(self):
         """
-        MA[bank]             reads 10 channels of bank
-        MR[bank][channel]    recall channel in bank (sets in rx but doesn`t return anything but ? for empty channel
-        RX                   reads memory bank if in memory manual
-                             MR MX[bank][channel] MP[pass] RF[rf] ST AU MD AT TM
+        MA[bank] starts at channels 00-09; bare MA advances ten channels.
+        Populated channels return MX[bank][channel] MP RF ST AU MD AT TM.
+        Empty channels return MX[bank][channel] ---.
         """
         selection = self.cbx_lists.GetStringSelection()
         bank, channels = selection.split()[0].split(':')
@@ -388,17 +391,13 @@ class AorCtrl(AorCtrlFrame):
         for column, label in enumerate(column_headers):
             self.edit_list.list.InsertColumn(column, label)
 
-        towrite = []
-        for channel in range(int(channels)):
-            comm = 'MR%s%02i\r\n' % (bank, channel)
-            towrite.append(comm)
-            towrite.append('RX\r\n')
-        # MR/RX has no load terminator; only channel-labelled responses can
-        # safely retire requests. An unlabelled '?' cannot identify a channel.
-        self.pending_memory_channels = {'%s%02i' % (bank, channel) for channel in range(int(channels))}
+        channel_count = int(channels)
+        blocks = (channel_count + 9) // 10
+        self.pending_memory_channels = {'%s%02i' % (bank, channel) for channel in range(channel_count)}
         self.filling_banks = bool(self.pending_memory_channels)
-        # print 'towrite ', towrite
-        self.write_serial(''.join(towrite).encode("ascii"))
+        if blocks:
+            towrite = 'MA%s\r\n' % bank + 'MA\r\n' * (blocks - 1)
+            self.write_serial(towrite.encode("ascii"))
 
     def get_search_banks(self):
         """
@@ -436,13 +435,27 @@ class AorCtrl(AorCtrlFrame):
         items = self.cbx_lists.GetItems()
         if item in items:
             return
-        items.append(item)
+        # TB can start on either page; keep A, a, B, b, ... ordering.
+        bank_order = (bank.upper(), bank.islower())
+        position = len(items)
+        for index, existing in enumerate(items):
+            if re.match(r'[A-Ta-t]:', existing):
+                existing_order = (existing[0].upper(), existing[0].islower())
+                if existing_order > bank_order:
+                    position = index
+                    break
+        items.insert(position, item)
         self.cbx_lists.SetItems(items)
 
     def set_memory_banks(self, item):
         """initializes and fills memory Bank ListControl
         """
-        fields = item.split(None, 8)[1:]
+        empty = re.fullmatch(r'MX([A-Ta-t][0-9]{2}) ---', item)
+        if empty is not None:
+            self.pending_memory_channels.discard(empty.group(1))
+            self.filling_banks = bool(self.pending_memory_channels)
+            return
+        fields = item.split(None, 7)
         self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
         columns = fields
         columns = [item[2:] for item in columns]
@@ -537,31 +550,28 @@ class AorCtrl(AorCtrlFrame):
         """Thread that handles the incoming traffic. Does the basic input
            transformation (newlines) and generates an SerialRxEvent"""
         while self.alive.is_set():
-            # time.sleep(0.2)
             try:
-                received = self.serial.readlines()
+                textline = self.serial.read_until(b'\n')
             except serial.SerialException as error:
                 self.alive.clear()
                 print('Serial read error: %s' % error, file=sys.stderr)
                 return
-            text_lines = []
-            for textline in received:
-                if not textline.strip():
-                    continue
-                if not textline.endswith(b'\n'):
-                    print('Ignored partial scanner response: %r' % textline, file=sys.stderr)
-                    continue
-                try:
-                    text_lines.append(textline.decode("ascii"))
-                except UnicodeDecodeError as error:
-                    print('Ignored non-ASCII scanner response: %s' % error, file=sys.stderr)
-            # print text_lines
-            text_lines = [textline.replace('\r\n', "").strip() for textline in text_lines if textline != '?\r\n']
-            text_lines = [textline for textline in text_lines if textline]
-
-            if text_lines:
-                print('text < %s >' % text_lines)
-                event = SerialRxEvent(self.GetId(), text_lines)
+            if not textline.strip():
+                continue
+            if not textline.endswith(b'\n'):
+                print('Ignored partial scanner response: %r' % textline, file=sys.stderr)
+                continue
+            try:
+                textline = textline.decode("ascii")
+            except UnicodeDecodeError as error:
+                print('Ignored non-ASCII scanner response: %s' % error, file=sys.stderr)
+                continue
+            if textline == '?\r\n':
+                continue
+            textline = textline.replace('\r\n', "").strip()
+            if textline:
+                print('text < %s >' % [textline])
+                event = SerialRxEvent(self.GetId(), [textline])
                 self.GetEventHandler().AddPendingEvent(event)
 
 
