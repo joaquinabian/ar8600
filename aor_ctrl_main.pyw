@@ -138,20 +138,20 @@ class AorCtrl(AorCtrlFrame):
         else:
             return
 
-        self.serial.write(func)
-        self.serial.write('RX\r\n')
+        self.serial.write(func.encode("ascii"))
+        self.serial.write('RX\r\n'.encode("ascii"))
 
     def on_auto(self, evt):
         if self.ckbx_auto.IsChecked():
-            self.serial.write('AU1\r\nRX\r\n')
+            self.serial.write('AU1\r\nRX\r\n'.encode("ascii"))
         else:
-            self.serial.write('AU0\r\n')
+            self.serial.write('AU0\r\n'.encode("ascii"))
 
     def on_enter_att(self, evt):
         """Changes Attenuation ON/OFF
         """
         att = 1 if self.ckbx_att.IsChecked() else 0
-        self.serial.write('AT%s\r\n' % att)
+        self.serial.write(('AT%s\r\n' % att).encode("ascii"))
 
     def on_select_vfo(self, evt):
         """Select working vfo"""
@@ -176,19 +176,19 @@ class AorCtrl(AorCtrlFrame):
 
         towrite = ''.join(comm)
         # print 'towrite ', towrite
-        self.serial.write(towrite)
+        self.serial.write(towrite.encode("ascii"))
 
     def on_vfo_start(self, evt):
-        self.serial.write('VS\r\n')
+        self.serial.write('VS\r\n'.encode("ascii"))
 
     def on_vfo_stop(self, evt):
-        self.serial.write('VV0\r\n')
+        self.serial.write('VV0\r\n'.encode("ascii"))
 
     def on_select_mode(self, evt):
         """Set mode on RX
         """
         mode = self.cbx_mode.GetSelection()
-        self.serial.write('MD%s\r\n' % mode)
+        self.serial.write(('MD%s\r\n' % mode).encode("ascii"))
 
     def on_select_step(self):
         """Set step on RX
@@ -196,7 +196,7 @@ class AorCtrl(AorCtrlFrame):
         STnnn.nm<CR> Set the tuning step size in kHz
         """
         step = float(self.cbx_step.GetStringSelection())
-        self.serial.write('ST%06.2f\r\n' % step)
+        self.serial.write(('ST%06.2f\r\n' % step).encode("ascii"))
 
     def on_enter_freq(self, evt):
         """Writes command RF to serial
@@ -218,7 +218,7 @@ class AorCtrl(AorCtrlFrame):
             text = ''.join(alist)
             comm = 'RF%s\r\n' % text
 
-        self.serial.write(comm)
+        self.serial.write(comm.encode("ascii"))
 
     def on_select_list(self, evt):
         selection = self.cbx_lists.GetStringSelection()
@@ -246,12 +246,12 @@ class AorCtrl(AorCtrlFrame):
             elif first.startswith('VB '):
                 self.set_vfo_text(first, 1)
                 if not self.connected:
-                    self.serial.write('VA\r\nRX\r\nVB\r\n')
+                    self.serial.write('VA\r\nRX\r\nVB\r\n'.encode("ascii"))
                     self.rb_vfos.SetSelection(1)
             elif first.startswith('VA '):
                 self.set_vfo_text(first, 0)
                 if not self.connected:
-                    self.serial.write('VB\r\nRX\r\nVA\r\n')
+                    self.serial.write('VB\r\nRX\r\nVA\r\n'.encode("ascii"))
                     self.rb_vfos.SetSelection(0)
             elif first.startswith('SR'):
                 self.set_search_banks(first)
@@ -319,9 +319,9 @@ class AorCtrl(AorCtrlFrame):
             )
             self.connected = False
             self.memory_banks = []
-            self.serial.write('RX\r\n')
-            self.serial.write('TB\r\n')
-            self.serial.write('TB\r\n')
+            self.serial.write('RX\r\n'.encode("ascii"))
+            self.serial.write('TB\r\n'.encode("ascii"))
+            self.serial.write('TB\r\n'.encode("ascii"))
 
     def get_memory_banks(self):
         """
@@ -343,10 +343,10 @@ class AorCtrl(AorCtrlFrame):
         towrite = []
         for channel in range(int(channels)):
             comm = 'MR%s%02i\r\n' % (bank, channel)
-            towrite.append(comm.encode())
+            towrite.append(comm)
             towrite.append('RX\r\n')
         # print 'towrite ', towrite
-        self.serial.write(''.join(towrite))
+        self.serial.write(''.join(towrite).encode("ascii"))
 
     def get_search_banks(self):
         """
@@ -370,7 +370,7 @@ class AorCtrl(AorCtrlFrame):
         for item in channels:
             comm = 'SR%s\r\n' % item
             towrite.append(comm)
-        self.serial.write(''.join(towrite))
+        self.serial.write(''.join(towrite).encode("ascii"))
 
     def set_memory_banks_list(self, text):
         """"""
@@ -460,7 +460,7 @@ class AorCtrl(AorCtrlFrame):
            transformation (newlines) and generates an SerialRxEvent"""
         while self.alive.is_set():
             # time.sleep(0.2)
-            text_lines = self.serial.readlines()
+            text_lines = [textline.decode("ascii") for textline in self.serial.readlines()]
             # print text_lines
             text_lines = [textline.replace('\r\n', "").strip() for textline in text_lines if textline != '?\r\n']
 
