@@ -11,7 +11,8 @@ from aor_control_frame import AorCtrlFrame
 from aor_functions import (do_nothing, format_frequency, parse_lm_response, parse_lc_response,
                            parse_select_scan_response, parse_pass_frequency_response,
                            make_pass_frequency_command, format_activity_row,
-                           parse_bandscope_status, BandscopeSweep, bandscope_frequency)
+                           parse_bandscope_status, BandscopeSweep, bandscope_frequency,
+                           BANDSCOPE_SPAN_LABELS, bandscope_centre_command, bandscope_marker_frequency)
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -51,6 +52,9 @@ class BandscopeWindow(wx.Frame):
         self.controller = controller
         self.status = None
         self.samples = None
+        self.trace_status = None
+        self.sweep_status = None
+        self.sweep_requested = False
         self.sweep = None
         self.waiting = None
         self.running = False
@@ -67,13 +71,28 @@ class BandscopeWindow(wx.Frame):
         self.refresh_button = wx.Button(panel, label='Refresh once')
         for button in (self.start_button, self.stop_button, self.refresh_button):
             buttons.Add(button, 0, wx.ALL, 5)
+        buttons.Add(wx.StaticText(panel, label='Span:'), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 10)
+        self.span_choice = wx.Choice(panel, choices=BANDSCOPE_SPAN_LABELS)
+        self.span_choice.SetSelection(wx.NOT_FOUND)
+        self.span_choice.Disable()
+        buttons.Add(self.span_choice, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         sizer.Add(buttons)
+        centre_controls = wx.BoxSizer(wx.HORIZONTAL)
+        centre_controls.Add(wx.StaticText(panel, label='Centre (MHz):'), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        self.centre_input = wx.TextCtrl(panel, size=(120, -1), style=wx.TE_PROCESS_ENTER)
+        self.centre_button = wx.Button(panel, label='Set centre')
+        self.centre_input.Disable()
+        self.centre_button.Disable()
+        centre_controls.Add(self.centre_input, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        centre_controls.Add(self.centre_button, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        sizer.Add(centre_controls)
         self.info = wx.StaticText(panel, label='Centre: ---    Span: ---    Marker: ---')
         sizer.Add(self.info, 0, wx.ALL, 5)
         self.plot = wx.Panel(panel)
         self.plot.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.plot.Bind(wx.EVT_PAINT, self.on_paint)
         self.plot.Bind(wx.EVT_SIZE, self.on_plot_size)
+        self.plot.Bind(wx.EVT_LEFT_DOWN, self.on_marker_click)
         sizer.Add(self.plot, 1, wx.EXPAND | wx.ALL, 5)
         self.message = wx.StaticText(panel, label='Connect, then Start or Refresh once. Stop halts refresh; Close restores the previous VFO/memory mode when available.')
         sizer.Add(self.message, 0, wx.ALL, 5)
@@ -83,6 +102,9 @@ class BandscopeWindow(wx.Frame):
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
         self.refresh_button.Bind(wx.EVT_BUTTON, self.on_refresh)
+        self.span_choice.Bind(wx.EVT_CHOICE, self.on_span)
+        self.centre_button.Bind(wx.EVT_BUTTON, self.on_centre)
+        self.centre_input.Bind(wx.EVT_TEXT_ENTER, self.on_centre)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
     @property
@@ -117,6 +139,17 @@ class BandscopeWindow(wx.Frame):
         self.message.SetLabel('Stopping after the pending sweep.' if self.waiting else 'Refresh stopped.')
 
     def request_sweep(self):
+        self.request_status(sweep=True)
+
+    def set_controls_enabled(self, enabled):
+        self.start_button.Enable(enabled)
+        self.refresh_button.Enable(enabled)
+        settings_enabled = enabled and self.entered and self.status is not None and self.available()
+        self.span_choice.Enable(settings_enabled)
+        self.centre_input.Enable(settings_enabled)
+        self.centre_button.Enable(settings_enabled)
+
+    def request_status(self, command=b'', sweep=False):
         if not self.available():
             self.running = False
             self.message.SetLabel('Connect to the scanner before requesting a sweep.')
@@ -125,14 +158,55 @@ class BandscopeWindow(wx.Frame):
             return
         self.close_requested = False
         self.sweep = None
+        self.sweep_requested = sweep
         self.waiting = 'status' if self.entered else 'receiver'
-        self.start_button.Disable()
-        self.refresh_button.Disable()
+        self.set_controls_enabled(False)
         self.started_at = time.monotonic()
         # One-shot watchdog reports failure; it never sends another DS request.
         self.timer.StartOnce(75000)
         self.message.SetLabel('Reading bandscope status (LM polling paused).')
-        self.send(b'AM\r\n' if self.entered else b'RX\r\n')
+        self.send(command + b'AM\r\n' if self.entered else b'RX\r\n')
+
+    def change_setting(self, command, invalidate=False):
+        if self.waiting is not None or not self.entered or self.status is None or not self.available():
+            return
+        if invalidate:
+            self.samples = None
+            self.trace_status = None
+            self.plot.Refresh()
+        self.request_status(command, sweep=self.running)
+
+    def on_span(self, event):
+        selection = self.span_choice.GetSelection()
+        if 0 <= selection < len(BANDSCOPE_SPAN_LABELS):
+            self.change_setting(('SW%d\r\n' % (selection + 1)).encode('ascii'), invalidate=True)
+
+    def on_centre(self, event):
+        if self.waiting is not None or not self.entered or not self.available():
+            return
+        try:
+            command = bandscope_centre_command(self.centre_input.GetValue().strip())
+        except ValueError as error:
+            self.message.SetLabel(str(error))
+            return
+        self.change_setting(command, invalidate=True)
+
+    def on_marker_click(self, event):
+        if self.waiting is not None or not self.entered or self.status is None or not self.available():
+            return
+        width, height = self.plot.GetClientSize()
+        left, top, right, bottom = 55, 20, width - 20, height - 45
+        x, y = event.GetPosition()
+        if right <= left or not left <= x <= right or not top <= y <= bottom:
+            return
+        low = self.status['centre_hz'] - self.status['span_hz'] / 2
+        target = low + (x - left) * self.status['span_hz'] / (right - left)
+        try:
+            frequency = bandscope_marker_frequency(self.status, target)
+        except ValueError as error:
+            self.message.SetLabel(str(error))
+            return
+        self.change_setting(('MF%010d\r\n' % frequency).encode('ascii'))
 
     def capture_receiver(self, text):
         if self.waiting != 'receiver':
@@ -158,18 +232,32 @@ class BandscopeWindow(wx.Frame):
             self.waiting = 'status'
         if self.waiting != 'status':
             return
-        if self.status != status:
+        if self.status is None or any(self.status[field] != status[field] for field in ('centre_hz', 'span_code')):
             self.samples = None  # Never relabel an old trace with new geometry.
+            self.trace_status = None
             self.plot.Refresh()
         self.status = status
+        self.span_choice.SetSelection(status['span_code'] - 1)
+        self.centre_input.ChangeValue('%.6f' % (status['centre_hz'] / 1000000))
         self.info.SetLabel('Centre: %.6f MHz    Span: %g MHz    Marker: %.6f MHz%s' %
                            (status['centre_hz'] / 1000000, status['span_hz'] / 1000000,
                             status['marker_hz'] / 1000000, '    Peak hold' if status['peak_hold'] else ''))
-        self.sweep = BandscopeSweep()
+        self.plot.Refresh()
+        if not self.sweep_requested:
+            self.waiting = None
+            self.timer.Stop()
+            self.set_controls_enabled(True)
+            self.message.SetLabel('Status updated. Refresh once for a new sweep. Click the spectrum to move the marker.')
+            if self.running:
+                self.timer.StartOnce(500)
+            return
+        # Real narrow-span dumps contain 128 points; retain manual-format support.
+        self.sweep = BandscopeSweep((128, 1024) if status['span_code'] in (6, 7) else (1024,))
+        self.sweep_status = status.copy()
         self.waiting = 'data'
         self.started_at = time.monotonic()
         self.timer.StartOnce(75000)
-        self.message.SetLabel('Waiting for sweep completion: 0 / 1024 samples (LM polling paused).')
+        self.message.SetLabel('Waiting for sweep completion (LM polling paused).')
         self.send(b'DS\r\n')
 
     def add_ds_line(self, text):
@@ -184,18 +272,19 @@ class BandscopeWindow(wx.Frame):
             samples = None
         if samples is not None:
             self.samples = samples
+            self.trace_status = self.sweep_status
             self.last_duration = time.monotonic() - self.started_at
-            self.message.SetLabel('1024 samples received in %.2f s. 0: unmeasured; 1: outside specification; 2-F: raw level.' % self.last_duration)
+            self.message.SetLabel('%d samples received in %.2f s. 0: unmeasured; 1: outside specification; 2-F: raw level.' %
+                                  (len(samples), self.last_duration))
             self.plot.Refresh()
         elif not self.sweep.failed:
-            self.message.SetLabel('Collecting: %d / 1024 samples (LM polling paused).' % (len(self.sweep.blocks) * 32))
+            self.message.SetLabel('Collecting: %d samples (LM polling paused).' % (len(self.sweep.blocks) * 32))
         if self.sweep.finished:
             if self.sweep.failed:
                 self.message.SetLabel('Sweep rejected: incomplete or malformed data. Refresh once to retry.')
             self.waiting = None
             self.timer.Stop()
-            self.start_button.Enable()
-            self.refresh_button.Enable()
+            self.set_controls_enabled(True)
             if self.close_requested:
                 self.restore_receiver()
             elif self.running:
@@ -213,8 +302,7 @@ class BandscopeWindow(wx.Frame):
             # Retain the outstanding request to prevent overlap with late data.
         else:
             self.waiting = None
-            self.start_button.Enable()
-            self.refresh_button.Enable()
+            self.set_controls_enabled(True)
             self.message.SetLabel('No valid bandscope status received. Refresh once to retry.')
             if self.close_requested:
                 self.restore_receiver()
@@ -227,6 +315,7 @@ class BandscopeWindow(wx.Frame):
             self.controller.aor_status.SetStatusText('Bandscope refresh stopped. Select a VFO to leave analyser mode.')
         self.entered = False
         self.restore_command = None
+        self.set_controls_enabled(True)
 
     def disconnect(self):
         self.running = False
@@ -234,8 +323,7 @@ class BandscopeWindow(wx.Frame):
         self.restore_receiver(query=False)
         self.waiting = None
         self.sweep = None
-        self.start_button.Enable()
-        self.refresh_button.Enable()
+        self.set_controls_enabled(True)
         self.message.SetLabel('Disconnected.')
 
     def on_close(self, event):
@@ -244,8 +332,7 @@ class BandscopeWindow(wx.Frame):
         if self.waiting != 'data':
             self.waiting = None
             self.timer.Stop()
-            self.start_button.Enable()
-            self.refresh_button.Enable()
+            self.set_controls_enabled(True)
         if self.waiting is None:
             self.restore_receiver()
         self.Hide()  # Retain pending sweep state until its last line is drained.
@@ -291,15 +378,12 @@ class BandscopeWindow(wx.Frame):
         if low <= status['marker_hz'] <= high:
             dc.DrawLine(marker_x, top, marker_x, bottom)
             dc.DrawText('Marker', marker_x + 4, top)
-        if status['centre_hz'] != status['marker_hz']:
-            dc.DrawText('Marker differs from centre: DS frequency geometry is not established by the manual.', left + 5, top + 30)
-            return
         if self.samples is None:
             return
         dc.SetPen(wx.Pen('#1565b0', 1))
         previous = None
         for index, level in enumerate(self.samples):
-            frequency = bandscope_frequency(status, index)
+            frequency = bandscope_frequency(self.trace_status, index)
             if not low <= frequency <= high or level < 2:
                 previous = None  # 0/1 are validity codes, not measured signal levels.
                 continue
@@ -363,6 +447,8 @@ class AorCtrl(AorCtrlFrame):
         self.bandscope.close_requested = False
         self.bandscope.Show()
         self.bandscope.Raise()
+        if self.bandscope.waiting is None and self.bandscope.available():
+            self.bandscope.request_status()
 
     def start_thread(self):
         """Start the receiver thread"""

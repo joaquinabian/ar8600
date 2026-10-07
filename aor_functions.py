@@ -1,11 +1,47 @@
 __author__ = 'joaquin'
 
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 
 BANDSCOPE_SPANS = {1: 10000000, 2: 5000000, 3: 2000000, 4: 1000000,
                    5: 500000, 6: 200000, 7: 100000}
+BANDSCOPE_SPAN_LABELS = ('10 MHz', '5 MHz', '2 MHz', '1 MHz', '500 kHz', '200 kHz', '100 kHz')
+BANDSCOPE_MIN_FREQUENCY_HZ = 100000
+BANDSCOPE_MAX_FREQUENCY_HZ = 2040000000
+
+
+def bandscope_resolution(span_code):
+    if span_code not in BANDSCOPE_SPANS:
+        raise ValueError('Invalid bandscope span')
+    return 2000 if span_code in (6, 7) else 10000
+
+
+def bandscope_centre_command(frequency_mhz):
+    if not re.fullmatch(r'[0-9]{1,4}(?:\.[0-9]{1,6})?', frequency_mhz):
+        raise ValueError('Enter MHz with up to six decimal places')
+    frequency_hz = int(Decimal(frequency_mhz) * 1000000)
+    if not BANDSCOPE_MIN_FREQUENCY_HZ <= frequency_hz <= BANDSCOPE_MAX_FREQUENCY_HZ:
+        raise ValueError('Centre frequency must be between %g and %g MHz' %
+                         (BANDSCOPE_MIN_FREQUENCY_HZ / 1000000, BANDSCOPE_MAX_FREQUENCY_HZ / 1000000))
+    return ('CF%010d\r\n' % frequency_hz).encode('ascii')
+
+
+def bandscope_marker_frequency(status, target_hz):
+    """Snap to a CF-relative sample, inside both the span and receiver range."""
+    centre = status['centre_hz']
+    spacing = bandscope_resolution(status['span_code'])
+    low = max(centre - status['span_hz'] // 2, BANDSCOPE_MIN_FREQUENCY_HZ)
+    high = min(centre + status['span_hz'] // 2, BANDSCOPE_MAX_FREQUENCY_HZ)
+    minimum = int((Decimal(low - centre) / spacing).to_integral_value(rounding=ROUND_CEILING))
+    maximum = int((Decimal(high - centre) / spacing).to_integral_value(rounding=ROUND_FLOOR))
+    if minimum > maximum:
+        raise ValueError('No valid marker frequency in this span')
+    target = Decimal(str(target_hz))
+    if not target.is_finite():
+        raise ValueError('Invalid marker frequency')
+    offset = int(((target - centre) / spacing).to_integral_value(rounding=ROUND_HALF_UP))
+    return centre + max(minimum, min(maximum, offset)) * spacing
 
 
 def parse_bandscope_status(text):
@@ -30,7 +66,8 @@ def parse_ds_block(text):
 
 class BandscopeSweep:
     """Assemble one DS dump, retaining invalid/incomplete state until its end."""
-    def __init__(self):
+    def __init__(self, sample_counts=(1024,)):
+        self.sample_counts = sample_counts
         self.blocks = {}
         self.failed = False
         self.finished = False
@@ -46,6 +83,9 @@ class BandscopeSweep:
             raise
         if self.finished:
             raise ValueError('DS data received after the sweep ended')
+        if index >= max(self.sample_counts):
+            self.failed = True
+            raise ValueError('DS block outside the requested sweep')
         if index in self.blocks:
             if self.blocks[index] != values:
                 self.failed = True
@@ -54,12 +94,14 @@ class BandscopeSweep:
         self.blocks[index] = values
         if index == 31:
             self.finished = True
-            if len(self.blocks) != 32:
+            sample_count = len(self.blocks) * 32
+            if (sample_count not in self.sample_counts or
+                    set(self.blocks) != set(range(31, sample_count, 32))):
                 self.failed = True
-                raise ValueError('Incomplete DS sweep: %d / 32 blocks' % len(self.blocks))
-        if len(self.blocks) != 32 or self.failed:
+                raise ValueError('Incomplete DS sweep: %d blocks' % len(self.blocks))
+        if not self.finished or self.failed:
             return None
-        samples = [0] * 1024
+        samples = [0] * sample_count
         # DS1023 covers 1023..992, followed by DS0991 covering 991..960.
         for index, block in self.blocks.items():
             for offset, value in enumerate(block):
@@ -68,13 +110,11 @@ class BandscopeSweep:
 
 
 def bandscope_frequency(status, index):
-    """Use the manual's centre indices, without extrapolating its edge table."""
+    """DS frequencies remain relative to CF when MF moves (manual section 17-3)."""
     if not 0 <= index < 1024:
         raise ValueError('Invalid DS sample index')
-    if status['marker_hz'] != status['centre_hz']:
-        raise ValueError('Manual does not establish geometry for a moved marker')
     narrow = status['span_code'] in (6, 7)
-    return status['centre_hz'] + (index - (64 if narrow else 512)) * (2000 if narrow else 10000)
+    return status['centre_hz'] + (index - (64 if narrow else 512)) * bandscope_resolution(status['span_code'])
 
 
 def parse_select_scan_response(text):
