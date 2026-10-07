@@ -4,8 +4,11 @@ import serial_conf_dialog
 import serial
 import threading
 import re
+import time
+from collections import deque
+from datetime import datetime
 from aor_control_frame import AorCtrlFrame
-from aor_functions import do_nothing, format_frequency
+from aor_functions import do_nothing, format_frequency, parse_lm_response, parse_lc_response
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -62,8 +65,17 @@ class AorCtrl(AorCtrlFrame):
         self.pending_memory_channels = set()
         self.list_item_clicked = None
         self.alive = threading.Event()
+        self.lm_pending = False
+        self.lc_enabled = False
+        self.signal_level = None
+        self.squelch_open = None
+        self.activity_events = deque(maxlen=200)
+        self.active_transmission = None
         AorCtrlFrame.__init__(self, *args, **kwds)
 
+        self.create_monitor_controls()
+        self.lm_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_lm_timer, self.lm_timer)
         self.__set_properties()
         self.__attach_events()           # register events
 
@@ -76,6 +88,8 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        self.stop_monitoring()
+        self.connected = False
         self.filling_banks = False
         self.pending_memory_channels.clear()
         self.background_vfo = None
@@ -89,6 +103,103 @@ class AorCtrl(AorCtrlFrame):
                     print('Serial read cancellation error: %s' % error, file=sys.stderr)
             self.thread.join()          # wait until thread has finished
             self.thread = None
+
+    def create_monitor_controls(self):
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        meter = wx.BoxSizer(wx.HORIZONTAL)
+        self.signal_text = wx.StaticText(panel, label='Signal: --- / 255', size=(115, -1))
+        self.signal_gauge = wx.Gauge(panel, range=255, style=wx.GA_HORIZONTAL)
+        self.squelch_text = wx.StaticText(panel, label='Squelch: ---', size=(145, -1))
+        meter.Add(self.signal_text, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        meter.Add(self.signal_gauge, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        meter.Add(self.squelch_text, 0, wx.ALIGN_CENTER_VERTICAL)
+        sizer.Add(meter, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(wx.StaticText(panel, label='Recent activity'), 0, wx.LEFT | wx.BOTTOM, 5)
+        self.activity_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL,
+                                         size=(-1, 130))
+        for index, (label, width) in enumerate((('Time', 155), ('Frequency MHz', 120),
+                                               ('Source', 100), ('Level', 55),
+                                               ('Duration', 80), ('Squelch', 85))):
+            self.activity_list.InsertColumn(index, label, width=width)
+        sizer.Add(self.activity_list, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        panel.SetSizer(sizer)
+        self.GetSizer().Add(panel, 0, wx.EXPAND)
+        self.GetSizer().Fit(self)
+        self.Layout()
+
+    def start_monitoring(self):
+        if self.lm_timer.IsRunning() or not self.connected or not self.serial.is_open:
+            return
+        self.lm_pending = False
+        if self.write_serial(b'LC1\r\n') == 5:
+            self.lc_enabled = True
+            self.lm_timer.Start(250)
+
+    def stop_monitoring(self):
+        self.lm_timer.Stop()
+        self.lm_pending = False
+        enabled = self.lc_enabled
+        self.lc_enabled = False
+        if enabled and self.serial.is_open:
+            self.write_serial(b'LC0\r\n')
+        self.active_transmission = None
+        self.signal_level = self.squelch_open = None
+        self.signal_gauge.SetValue(0)
+        self.signal_text.SetLabel('Signal: --- / 255')
+        self.squelch_text.SetLabel('Squelch: ---')
+
+    def on_lm_timer(self, event):
+        if not self.connected or not self.serial.is_open or not self.alive.is_set():
+            self.stop_monitoring()
+            return
+        if self.lm_pending:
+            return
+        self.lm_pending = True
+        if self.write_serial(b'LM\r\n') != 4:
+            self.stop_monitoring()
+
+    def update_signal(self, level, squelch_open):
+        self.signal_level, self.squelch_open = level, squelch_open
+        self.signal_gauge.SetValue(level)
+        self.signal_text.SetLabel('Signal: %d / 255' % level)
+        self.squelch_text.SetLabel('Squelch: %s' % ('OPEN' if squelch_open else 'CLOSED'))
+
+    def set_signal_level(self, text):
+        self.lm_pending = False
+        level, squelch_open = parse_lm_response(text)
+        self.update_signal(level, squelch_open)
+
+    def record_activity(self, text):
+        activity = parse_lc_response(text)
+        stamp = time.monotonic()
+        activity.update(timestamp=datetime.now().astimezone(), duration=None)
+        if activity['squelch_open']:
+            self.active_transmission = (stamp, activity)
+        elif self.active_transmission is not None:
+            started, opened = self.active_transmission
+            if ((activity['source'], activity['source_id']) ==
+                    (opened['source'], opened['source_id']) and
+                    (activity['frequency_hz'] is None or
+                     activity['frequency_hz'] == opened['frequency_hz'])):
+                activity['frequency_hz'] = opened['frequency_hz']
+                activity['duration'] = stamp - started
+                self.active_transmission = None
+        self.update_signal(activity['level'], activity['squelch_open'])
+        if len(self.activity_events) == self.activity_events.maxlen:
+            self.activity_list.DeleteItem(0)
+        self.activity_events.append(activity)
+        row = self.activity_list.InsertItem(self.activity_list.GetItemCount(),
+                                            activity['timestamp'].strftime('%H:%M:%S.%f')[:-3])
+        frequency = activity['frequency_hz']
+        values = ('---' if frequency is None else format(frequency / 1000000, '.6f'),
+                  '%s %s' % (activity['source'], activity['source_id']),
+                  str(activity['level']),
+                  '---' if activity['duration'] is None else '%.2f s' % activity['duration'],
+                  'OPEN' if activity['squelch_open'] else 'CLOSED')
+        for column, value in enumerate(values, 1):
+            self.activity_list.SetItem(row, column, value)
+        self.activity_list.EnsureVisible(row)
 
     def __set_properties(self):
         self.SetTitle("Serial Terminal")
@@ -258,7 +369,14 @@ class AorCtrl(AorCtrlFrame):
                 if not isinstance(first, str):
                     raise ValueError('Response must be text')
                 # print 'event text ', text
-                if first.startswith(('VA ', 'VB ', 'VF ')):
+                if first.startswith('LM'):
+                    self.set_signal_level(first)
+                elif first.startswith('LC'):
+                    if first in ('LC0', 'LC1'):
+                        # Configuration replies are not reception events.
+                        continue
+                    self.record_activity(first)
+                elif first.startswith(('VA ', 'VB ', 'VF ')):
                     vfx = {'VA': 0, 'VB': 1, 'VF': 2}[first[:2]]
                     background = vfx == self.background_vfo
                     self.set_vfo_text(first, vfx, active=not background)
@@ -287,8 +405,9 @@ class AorCtrl(AorCtrlFrame):
                 received_valid = True
             except (ValueError, IndexError, TypeError) as error:
                 print('Ignored malformed scanner response %r: %s' % (first, error), file=sys.stderr)
-        if received_valid:
+        if received_valid and self.serial.is_open and self.alive.is_set() and not self.connected:
             self.connected = True
+            self.start_monitoring()
 
     def write_serial(self, data):
         try:
@@ -297,6 +416,8 @@ class AorCtrl(AorCtrlFrame):
             print('Serial write error: %s' % error, file=sys.stderr)
 
     def close_serial(self):
+        self.stop_monitoring()
+        self.connected = False
         try:
             self.serial.close()
         except serial.SerialException as error:
@@ -576,7 +697,9 @@ class AorCtrl(AorCtrlFrame):
                 continue
             if textline == '?\r\n':
                 continue
-            textline = textline.replace('\r\n', "").strip()
+            textline = textline.rstrip('\r\n')
+            if not textline.startswith('LM'):
+                textline = textline.strip()
             if textline:
                 print('text < %s >' % [textline])
                 event = SerialRxEvent(self.GetId(), [textline])
