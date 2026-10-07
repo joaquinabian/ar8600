@@ -40,7 +40,7 @@ class SerialConfigDialog(wx.Dialog):
         self.__set_properties()
         self.__do_layout()
         # fill in ports and select current setting
-        preferred_index = 0
+        preferred_index = -1
         self.combo_box_port.Clear()
         self.ports = []
         for n, (portname, desc, hwid) in enumerate(sorted(serial.tools.list_ports.comports())):
@@ -49,7 +49,12 @@ class SerialConfigDialog(wx.Dialog):
             if self.serial.portstr == portname:
                 preferred_index = n
         print(self.ports)
-        self.combo_box_port.SetSelection(preferred_index)
+        if preferred_index != -1:
+            self.combo_box_port.SetSelection(preferred_index)
+        elif self.serial.port is not None:
+            self.combo_box_port.SetValue(self.serial.port)
+        elif self.ports:
+            self.combo_box_port.SetSelection(0)
         # fill in baud rates and select current setting
         self.choice_baudrate.Clear()
         for n, baudrate in enumerate(self.serial.BAUDRATES):
@@ -149,30 +154,47 @@ class SerialConfigDialog(wx.Dialog):
         wx.EVT_CHECKBOX(self, self.checkbox_timeout.GetId(), self.OnTimeout)
 
     def OnOK(self, events):
-        success = True
-        self.serial.port = self.ports[self.combo_box_port.GetSelection()]
-        self.serial.baudrate = self.serial.BAUDRATES[self.choice_baudrate.GetSelection()]
-        self.serial.bytesize = self.serial.BYTESIZES[self.choice_databits.GetSelection()]
-        self.serial.stopbits = self.serial.STOPBITS[self.choice_stopbits.GetSelection()]
-        self.serial.parity   = self.serial.PARITIES[self.choice_parity.GetSelection()]
-        self.serial.rtscts   = self.checkbox_rtscts.GetValue()
-        self.serial.xonxoff  = self.checkbox_xonxoff.GetValue()
+        try:
+            port_index = self.combo_box_port.GetSelection()
+            if 0 <= port_index < len(self.ports):
+                port = self.ports[port_index]
+            else:
+                port = self.combo_box_port.GetValue().strip()
+            if not port:
+                raise ValueError('Port must not be empty')
 
+            settings = {'port': port}
+            for name, choice, values in (
+                    ('baudrate', self.choice_baudrate, self.serial.BAUDRATES),
+                    ('bytesize', self.choice_databits, self.serial.BYTESIZES),
+                    ('stopbits', self.choice_stopbits, self.serial.STOPBITS),
+                    ('parity', self.choice_parity, self.serial.PARITIES)):
+                index = choice.GetSelection()
+                if not 0 <= index < len(values):
+                    raise ValueError('Select a valid %s' % name)
+                settings[name] = values[index]
+            settings['rtscts'] = self.checkbox_rtscts.GetValue()
+            settings['xonxoff'] = self.checkbox_xonxoff.GetValue()
+            if self.checkbox_timeout.GetValue():
+                try:
+                    timeout = float(self.text_ctrl_timeout.GetValue())
+                except ValueError:
+                    raise ValueError('Timeout must be a numeric value')
+                if timeout < 0:
+                    raise ValueError('Timeout must not be negative')
+            else:
+                timeout = None
+            settings['timeout'] = timeout
+        except ValueError as error:
+            dlg = wx.MessageDialog(self, str(error), 'Value Error', wx.OK | wx.ICON_ERROR)
+            dlg.ShowModal()
+            dlg.Destroy()
+            return
+
+        for name, value in settings.items():
+            setattr(self.serial, name, value)
         print(self.serial.parity)
-
-        if self.checkbox_timeout.GetValue():
-            try:
-                self.serial.timeout = float(self.text_ctrl_timeout.GetValue())
-            except ValueError:
-                dlg = wx.MessageDialog(self, 'Timeout must be a numeric value',
-                                            'Value Error', wx.OK | wx.ICON_ERROR)
-                dlg.ShowModal()
-                dlg.Destroy()
-                success = False
-        else:
-            self.serial.timeout = None
-        if success:
-            self.EndModal(wx.ID_OK)
+        self.EndModal(wx.ID_OK)
 
     def OnCancel(self, events):
         self.EndModal(wx.ID_CANCEL)
