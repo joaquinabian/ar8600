@@ -19,6 +19,8 @@ class TuningPanel(MyPanel):
         name = obj.GetLabel()
         if name in "1234567890.":
             self.tune_freq.write(name)
+        elif name == "<-":
+            self.tune_freq.SetValue(self.tune_freq.GetValue()[:-1])
 
     # noinspection PyMethodMayBeStatic
     def on_arrows(self, evt):
