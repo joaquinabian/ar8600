@@ -481,13 +481,15 @@ class GroupDialog(wx.Dialog):
         labels = []
         for bank in self.banks:
             metadata = controller.memory_banks.get(bank) if kind == 'scan' else controller.search_banks.get(bank)
-            labels.append(bank + (' — ' + metadata.get('name', '').strip() if metadata and metadata.get('name', '').strip() else ''))
+            name = metadata.get('name', '').strip() if metadata else ''
+            labels.append(bank + (' — ' + name if name and name != bank else ''))
         sizer = wx.BoxSizer(wx.VERTICAL)
         self.message = wx.StaticText(self, label='Reading %s Group from scanner...' % kind.title())
         self.message.Wrap(320)
         instructions = wx.StaticText(self, label='Check boxes to link %s.\nHighlighting a row does not change its checkbox.' %
                                      ('Memory Banks' if kind == 'scan' else 'Search Banks'))
         self.members = wx.CheckListBox(self, choices=labels)
+        self.members.Disable()
         self.members.SetToolTip('Memory Banks scanned together.' if kind == 'scan' else 'Stored Search Banks searched together.')
         self.save = wx.Button(self, label='Save membership')
         self.save.Disable()
@@ -503,11 +505,15 @@ class GroupDialog(wx.Dialog):
         self.read_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_read_timeout, self.read_timer)
         self.read_timer.StartOnce(5000)
+        if group == 0:
+            self.set_message('LINK OFF — fixed, read-only group')
 
     def proposed_members(self):
         return tuple(self.banks[index] for index in self.members.GetCheckedItems())
 
     def set_message(self, message, error=False):
+        if self.group == 0 and not message.startswith('LINK OFF'):
+            message = 'LINK OFF — fixed, read-only group\n' + message
         self.message.SetForegroundColour(wx.RED if error else wx.NullColour)
         self.message.SetLabel(message)
         self.message.Wrap(320)
@@ -515,16 +521,22 @@ class GroupDialog(wx.Dialog):
 
     def on_members_changed(self, event):
         self.verification_members = None
+        self.update_save_state()
         if self.confirmed_members is not None:
             self.set_message('No changes to save' if self.proposed_members() == self.confirmed_members else
                              'Proposed links: %s. Press Save membership.' % (', '.join(self.proposed_members()) or '(none)'))
+
+    def update_save_state(self):
+        self.save.Enable(self.group != 0 and self.controller.connected and
+                         self.confirmed_members is not None and self.expected_members is None and
+                         set(self.proposed_members()) != set(self.confirmed_members))
 
     def show_members(self, members):
         self.read_timer.Stop()
         self.confirmed_members = tuple(members)
         self.members.SetCheckedItems([index for index, bank in enumerate(self.banks) if bank in members])
         self.members.Enable(self.group != 0)
-        self.save.Enable(self.group != 0 and self.controller.connected)
+        self.save.Disable()
         if self.expected_members is not None or self.verification_members is not None:
             expected = self.expected_members if self.expected_members is not None else self.verification_members
             self.expected_members = None
@@ -564,7 +576,7 @@ class GroupDialog(wx.Dialog):
             self.expected_members = None
             self.controller.group_loading[self.kind] = None
             self.members.Enable(True)
-            self.save.Enable(True)
+            self.update_save_state()
             self.set_message('Serial write failed; membership was not verified.', error=True)
         else:
             self.read_timer.StartOnce(5000)
@@ -704,6 +716,9 @@ class AorCtrl(AorCtrlFrame):
         self.connected = False
         self.filling_banks = False
         self.pending_memory_channels = set()
+        self.memory_rows = {}
+        self.memory_select_read = None
+        self.memory_flag_edit = None
         self.list_item_clicked = None
         self.alive = threading.Event()
         self.lm_pending = False
@@ -721,6 +736,8 @@ class AorCtrl(AorCtrlFrame):
         self.create_monitor_controls()
         self.lm_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_lm_timer, self.lm_timer)
+        self.memory_flag_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_memory_flag_timeout, self.memory_flag_timer)
         self.__set_properties()
         self.__attach_events()           # register events
         view_menu = wx.Menu()
@@ -781,8 +798,8 @@ class AorCtrl(AorCtrlFrame):
                 (self.memory_bank_choice, 'Memory Bank: a stored collection of individual memory channels. Select the bank to scan.'),
                 (self.search_bank_choice, 'Search Bank: a stored frequency range with its search parameters. Read the selected bank.'),
                 (self.bt_start, 'Start the selected operation and source using its scanner commands.'),
-                (self.bt_mkpassfreq, 'Add a frequency to the selected PASS FREQS context.'),
-                (self.edit_list.list, 'View the selected data; right-click a pass frequency for actions.'),
+                (self.bt_mkpassfreq, 'Add a frequency to the selected AR8600 pass-frequency list.'),
+                (self.edit_list.list, 'Memory channels: double-click Select Scan / Skip Scan to toggle, or right-click for actions. [x] enabled; [ ] disabled; [?] awaiting scanner confirmation.'),
                 (self.activity_list, 'View the most recent receiver activity; LOG VIEW shows the full in-memory log.'),
                 (self.signal_gauge, 'Raw AR8600 signal level (0-255), without S-unit or dBm calibration.'),
                 (self.signal_text, 'Raw AR8600 signal level (0-255).'),
@@ -845,16 +862,26 @@ class AorCtrl(AorCtrlFrame):
                         self.tuning_panel.tune_benter, self.tuning_panel.tune_frev,
                         self.tuning_panel.tune_rev, self.tuning_panel.tune_forw,
                         self.tuning_panel.tune_ffor):
-            control.Enable(ready)
+            control.Enable(ready and self.memory_flag_edit is None)
+        self.cbx_lists.Enable(self.memory_flag_edit is None)
+        self.operation_choice.Enable(self.memory_flag_edit is None)
+        self.source_choice.Enable(self.memory_flag_edit is None)
         view = self.current_list_view()
         self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view == 'LOG VIEW')
+        if self.memory_flag_edit is not None:
+            self.bt_refresh.Disable()
         self.bt_start.Enable(ready)
         self.update_operation_ui()
         self.bt_mkpassfreq.Enable(ready and view == 'PASS FREQS')
+        self.bt_mkpassfreq.Show(view == 'PASS FREQS')
+        self.panel_1.Layout()
         if self.bandscope is not None:
-            self.bandscope.set_controls_enabled(self.bandscope.waiting is None)
+            self.bandscope.set_controls_enabled(self.bandscope.waiting is None and self.memory_flag_edit is None)
 
     def on_bandscope(self, event):
+        if self.memory_flag_edit is not None:
+            self.aor_status.SetStatusText('Wait for the memory-channel flag read-back before opening bandscope.')
+            return
         if self.bandscope is None:
             self.bandscope = BandscopeWindow(self)
         self.bandscope.close_requested = False
@@ -868,7 +895,7 @@ class AorCtrl(AorCtrlFrame):
 
     def update_operation_ui(self):
         operation, source = self.operation_selection()
-        ready = self.connected and self.serial.is_open and self.alive.is_set()
+        ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_flag_edit is None
         tips = {'Current Bank': 'Memory Bank: a stored collection of individual memory channels. Scan only the selected bank.',
                 'Scan Group': 'Scan Group: a set of Memory Banks linked together for memory scanning.',
                 'Select Scan': 'Select Scan: a special list of selected individual memory channels; memory pass flags are ignored.',
@@ -912,7 +939,8 @@ class AorCtrl(AorCtrlFrame):
         elif source == 'Search Group':
             self.request_group('search')
         elif source == 'Search Bank':
-            self.on_search_source_changed(event)
+            self.cbx_lists.SetStringSelection('SEARCH BANKS')
+            self.on_select_list(None)
         elif source == 'Select Scan':
             self.cbx_lists.SetStringSelection('SELECT SCAN')
             self.on_select_list(None)
@@ -1005,6 +1033,8 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        if self.memory_flag_edit is not None and self.memory_flag_edit['restore'] is not None and self.serial.is_open:
+            self.write_serial(self.memory_flag_edit['restore'] + b'RX\r\n')
         if self.bandscope is not None:
             self.bandscope.disconnect()
         self.stop_monitoring()
@@ -1012,6 +1042,9 @@ class AorCtrl(AorCtrlFrame):
         self.active_operation = None
         self.filling_banks = False
         self.pending_memory_channels.clear()
+        self.memory_flag_timer.Stop()
+        self.memory_select_read = None
+        self.memory_flag_edit = None
         self.background_vfo = None
         if self.thread is not None:
             self.alive.clear()          # clear alive event for thread
@@ -1136,6 +1169,7 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_TOOL, self.on_tool)
         self.cbx_lists.Bind(wx.EVT_MOUSEWHEEL, do_nothing)
         self.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.open_menu, self.edit_list.list)
+        self.edit_list.list.Bind(wx.EVT_LEFT_DCLICK, self.on_memory_flag_double_click)
         self.tuning_panel.tune_arrows.Bind(wx.EVT_BUTTON, self.on_move_frequency)
         self.Bind(wx.EVT_BUTTON, self.on_enter_freq, self.tuning_panel.tune_benter)
         self.Bind(wx.EVT_COMBOBOX, self.on_select_list, self.cbx_lists)
@@ -1177,6 +1211,9 @@ class AorCtrl(AorCtrlFrame):
         """"""
         view = self.current_list_view()
         if view in ('LOG VIEW', 'SELECT SCAN'):
+            return
+        if self.selected_memory_bank() is not None:
+            self.open_memory_flag_menu(event.GetIndex())
             return
         if view == 'SEARCH BANKS':
             bank = self.edit_list.list.GetItemText(event.GetIndex())
@@ -1338,7 +1375,7 @@ class AorCtrl(AorCtrlFrame):
 
     def selected_memory_bank(self):
         index = self.cbx_lists.GetSelection()
-        return self.cbx_lists.GetClientData(index) if index != wx.NOT_FOUND else None
+        return self.cbx_lists.GetClientData(index) if index != wx.NOT_FOUND and self.cbx_lists.HasClientObjectData() else None
 
     def current_list_view(self):
         return '' if self.selected_memory_bank() is not None else self.cbx_lists.GetStringSelection()
@@ -1486,6 +1523,9 @@ class AorCtrl(AorCtrlFrame):
         self.write_serial(b'RX\r\n')
 
     def on_select_list(self, evt):
+        if self.memory_flag_edit is not None:
+            self.aor_status.SetStatusText('Wait for the memory-channel flag read-back before loading another list.')
+            return
         if self.selected_memory_bank() is not None:
             self.sync_memory_choices(self.selected_memory_bank())
         selection = self.current_list_view()
@@ -1584,12 +1624,19 @@ class AorCtrl(AorCtrlFrame):
                     self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
                     self.aor_status.SetStatusText('%s: %s, %s MHz' %
                                                 (first[:2], fields[0][2:], format_frequency(fields[2][2:])))
+                elif first in ('GA0', 'GA1', 'MP0', 'MP1'):
+                    # Acknowledgements are not a substitute for channel read-back.
+                    continue
                 else:
                     print('Ignored unexpected scanner response: %r' % first, file=sys.stderr)
                     continue
 
+                if first.startswith(('VA ', 'VB ', 'VF ', 'MR ', 'MS ', 'SM ', 'VS ', 'VV ')) or re.match(r'SR[A-Ta-t] RF', first):
+                    self.on_memory_flag_status(first)
                 received_valid = True
             except (ValueError, IndexError, TypeError) as error:
+                if isinstance(first, str) and first.startswith('GR') and self.memory_select_read is not None:
+                    self.memory_select_read['invalid'] = True
                 print('Ignored malformed scanner response %r: %s' % (first, error), file=sys.stderr)
         if received_valid and self.serial.is_open and self.alive.is_set() and not self.connected:
             self.connected = True
@@ -1710,11 +1757,15 @@ class AorCtrl(AorCtrlFrame):
         bank, channels = metadata['bank'], metadata['channels']
         self.row = 0
         self.last = None
+        self.memory_rows.clear()
+        self.memory_select_read = None
         self.edit_list.list.ClearAll()
         # set column names
-        column_headers = ['Channel', 'PASS', 'FREQ', 'ST', 'AUTO', 'MODE', 'ATT', 'NAME']
+        column_headers = ['Channel', 'Select Scan', 'Skip Scan', 'FREQ', 'ST', 'AUTO', 'MODE', 'ATT', 'NAME']
         for column, label in enumerate(column_headers):
             self.edit_list.list.InsertColumn(column, label)
+        self.edit_list.list.SetColumnWidth(1, 95)
+        self.edit_list.list.SetColumnWidth(2, 90)
 
         channel_count = channels
         blocks = (channel_count + 9) // 10
@@ -1723,6 +1774,154 @@ class AorCtrl(AorCtrlFrame):
         if blocks:
             towrite = 'MA%s\r\n' % bank + 'MA\r\n' * (blocks - 1)
             self.write_serial(towrite.encode("ascii"))
+        else:
+            self.read_memory_select_flags()
+
+    def show_memory_flags(self, channel):
+        entry = self.memory_rows[channel]
+        metadata = self.selected_memory_bank()
+        if metadata is None or metadata['bank'] != channel[0]:
+            return
+        def checked(value):
+            return '[?]' if value is None else ('[x]' if value else '[ ]')
+        values = [channel, checked(entry['select']), checked(entry['skip'])] + entry['fields'][2:]
+        self.edit_list.list.fill_line(entry['row'], values)
+
+    def read_memory_select_flags(self):
+        """GR supplies tags missing from MA; the following RX bounds the list."""
+        if self.memory_select_read is not None or not self.connected or not self.serial.is_open:
+            return
+        self.memory_select_read = {'channels': set(), 'slots': {}, 'seen': False, 'invalid': False}
+        self.memory_flag_timer.StartOnce(10000)
+        if self.write_serial(b'GR\r\nRX\r\n') != 8:
+            self.on_memory_flag_timeout(None)
+
+    def memory_flags_editable(self, channel):
+        return (self.selected_memory_bank() is not None and channel in self.memory_rows and
+                self.connected and self.serial.is_open and self.alive.is_set() and
+                not self.filling_banks and self.memory_select_read is None and
+                self.memory_flag_edit is None and self.memory_rows[channel]['select'] is not None and
+                self.memory_rows[channel]['skip'] is not None and
+                self.active_operation is None and self.background_vfo is None and
+                (self.bandscope is None or (not self.bandscope.entered and self.bandscope.waiting is None)))
+
+    def on_memory_flag_double_click(self, event):
+        row, flags, column = self.edit_list.list.HitTestSubItem(event.GetPosition())
+        if self.selected_memory_bank() is not None and row != wx.NOT_FOUND and column in (1, 2):
+            self.toggle_memory_flag(self.edit_list.list.GetItemText(row), 'select' if column == 1 else 'skip')
+        else:
+            event.Skip()
+
+    def open_memory_flag_menu(self, row):
+        channel = self.edit_list.list.GetItemText(row)
+        entry = self.memory_rows.get(channel)
+        if entry is None:
+            return
+        menu = wx.Menu()
+        for flag, label in (('select', 'Include in Select Scan'), ('skip', 'Skip in Memory Scan')):
+            item = menu.AppendCheckItem(wx.ID_ANY, label)
+            item.Check(bool(entry[flag]))
+            item.Enable(self.memory_flags_editable(channel))
+            menu.Bind(wx.EVT_MENU, lambda evt, flag=flag: self.toggle_memory_flag(channel, flag), id=item.GetId())
+        try:
+            self.edit_list.list.PopupMenu(menu)
+        finally:
+            menu.Destroy()
+
+    def toggle_memory_flag(self, channel, flag):
+        if flag not in ('select', 'skip') or not self.memory_flags_editable(channel):
+            self.aor_status.SetStatusText('Wait for memory flags to load and stop scanning/bandscope before editing.')
+            return
+        self.memory_flag_edit = {'channel': channel, 'flag': flag,
+                                 'desired': not self.memory_rows[channel][flag],
+                                 'phase': 'capture', 'restore': None}
+        self.memory_flag_timer.StartOnce(10000)
+        self.aor_status.SetStatusText('Reading receiver state before editing %s...' % channel)
+        self.update_connection_ui()
+        if self.write_serial(b'RX\r\n') != 4:
+            self.finish_memory_flag_edit('Could not read receiver state; flag was not changed.')
+
+    def on_memory_flag_status(self, text):
+        """Only validated RX statuses advance a flag edit or finish a GR list."""
+        if self.memory_select_read is not None:
+            snapshot = self.memory_select_read
+            self.memory_select_read = None
+            self.memory_flag_timer.Stop()
+            slots = snapshot['slots']
+            contiguous = bool(slots) and set(slots) == set(range(max(slots) + 1))
+            if snapshot['seen'] and contiguous and not snapshot['invalid']:
+                for channel, entry in self.memory_rows.items():
+                    entry['select'] = channel in snapshot['channels']
+                    self.show_memory_flags(channel)
+                edit = self.memory_flag_edit
+                if edit is not None and edit['phase'] == 'verify_select':
+                    actual = edit['channel'] in snapshot['channels']
+                    self.finish_memory_flag_edit('%s Select Scan %s' %
+                                                 (edit['channel'], 'saved and verified' if actual == edit['desired'] else 'verification failed'), verified=True)
+            else:
+                for channel, entry in self.memory_rows.items():
+                    entry['select'] = None
+                    self.show_memory_flags(channel)
+                if self.memory_flag_edit is not None:
+                    self.finish_memory_flag_edit('Select Scan read-back failed; flag could not be verified.')
+                else:
+                    self.aor_status.SetStatusText('Select Scan flags unavailable: incomplete or malformed GR list. Refresh to retry.')
+        edit = self.memory_flag_edit
+        if edit is None:
+            return
+        if edit['phase'] == 'capture':
+            if not text.startswith(('VA ', 'VB ', 'VF ', 'MR ')):
+                self.finish_memory_flag_edit('Stop scanning/searching before editing memory-channel flags.')
+                return
+            edit['restore'] = ((text[:2] + '\r\n') if text.startswith(('VA ', 'VB ', 'VF ')) else
+                               ('MR%s\r\n' % text.split()[1][2:])).encode('ascii')
+            edit['phase'] = 'recall'
+            command = ('MR%s\r\nRX\r\n' % edit['channel']).encode('ascii')
+        elif text.startswith('MR ') and text.split()[1] == 'MX' + edit['channel']:
+            entry = self.memory_rows[edit['channel']]
+            fields = [field[2:] for field in text.split(None, 8)[1:]]
+            entry['fields'] = fields
+            entry['skip'] = fields[1] == '1'
+            self.show_memory_flags(edit['channel'])
+            if edit['phase'] == 'recall':
+                edit['phase'] = 'verify_' + edit['flag']
+                command = ('%s%d\r\n' % ('GA' if edit['flag'] == 'select' else 'MP', edit['desired'])).encode('ascii')
+                if edit['flag'] == 'skip':
+                    command += b'RX\r\n'
+            elif edit['phase'] == 'verify_skip':
+                self.finish_memory_flag_edit('%s Skip Scan %s' %
+                                             (edit['channel'], 'saved and verified' if entry['skip'] == edit['desired'] else 'verification failed'), verified=True)
+                return
+            else:
+                return
+        else:
+            return  # Never change a flag until the requested memory is confirmed.
+        if self.write_serial(command) != len(command):
+            self.finish_memory_flag_edit('Serial write failed; memory flag was not verified.')
+        elif edit['phase'] == 'verify_select':
+            self.read_memory_select_flags()
+
+    def finish_memory_flag_edit(self, message, verified=False):
+        edit = self.memory_flag_edit
+        if edit is not None and edit['phase'].startswith('verify_') and not verified:
+            self.memory_rows[edit['channel']][edit['flag']] = None
+            self.show_memory_flags(edit['channel'])
+        self.memory_flag_edit = None
+        self.memory_select_read = None
+        self.memory_flag_timer.Stop()
+        if edit is not None and edit['restore'] is not None and self.serial.is_open:
+            command = edit['restore'] + b'RX\r\n'
+            if self.write_serial(command) != len(command):
+                message += ' Receiver restoration failed.'
+        self.aor_status.SetStatusText(message)
+        self.update_connection_ui()
+
+    def on_memory_flag_timeout(self, event):
+        for channel, entry in self.memory_rows.items():
+            if self.memory_select_read is not None:
+                entry['select'] = None
+                self.show_memory_flags(channel)
+        self.finish_memory_flag_edit('Memory flag read-back failed or timed out; state was not assumed. Refresh to retry.')
 
     def prepare_list(self, columns):
         self.edit_list.list.ClearAll()
@@ -1740,6 +1939,15 @@ class AorCtrl(AorCtrlFrame):
 
     def set_select_scan(self, text):
         entry = parse_select_scan_response(text)
+        if self.memory_select_read is not None:
+            self.memory_select_read['seen'] = True
+            slot = int(entry['slot'])
+            slots = self.memory_select_read['slots']
+            if slot in slots and slots[slot] != entry['channel']:
+                self.memory_select_read['invalid'] = True
+            slots[slot] = entry['channel']
+            if entry['channel'] is not None:
+                self.memory_select_read['channels'].add(entry['channel'])
         if self.current_list_view() != 'SELECT SCAN':
             return
         if entry['channel'] is None:
@@ -1884,6 +2092,8 @@ class AorCtrl(AorCtrlFrame):
         if empty is not None:
             self.pending_memory_channels.discard(empty.group(1))
             self.filling_banks = bool(self.pending_memory_channels)
+            if not self.filling_banks:
+                self.read_memory_select_flags()
             return
         fields = item.split(None, 7)
         self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
@@ -1894,22 +2104,43 @@ class AorCtrl(AorCtrlFrame):
             return
         if columns[0] == self.last:
             return
-        self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
-        self.edit_list.list.fill_line(self.row, columns)
+        row = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), columns[0])
+        self.memory_rows[columns[0]] = {'row': row, 'fields': columns, 'select': None, 'skip': columns[1] == '1'}
+        self.show_memory_flags(columns[0])
 
         self.last = columns[0]
         self.row += 1
         self.pending_memory_channels.remove(columns[0])
         self.filling_banks = bool(self.pending_memory_channels)
+        if not self.filling_banks:
+            self.read_memory_select_flags()
+
+    def update_search_bank_choices(self):
+        choice = self.search_bank_choice
+        selected = choice.GetSelection()
+        selected_bank = choice.GetClientData(selected) if selected != wx.NOT_FOUND else None
+        names = {}
+        counts = {}
+        for bank, entry in self.search_banks.items():
+            name = entry.get('name', '').strip()
+            if name and name != bank:
+                names[bank] = name
+                counts[name] = counts.get(name, 0) + 1
+        selected_index = wx.NOT_FOUND
+        for index in range(choice.GetCount()):
+            bank = choice.GetClientData(index)
+            name = names.get(bank)
+            label = bank if name is None else (name + ' [%s]' % bank if counts[name] > 1 else name)
+            choice.SetString(index, label)
+            if bank == selected_bank:
+                selected_index = index
+        choice.SetSelection(selected_index)
 
     def set_search_banks(self, item):
         entry = parse_search_bank_response(item)
         bank = entry['bank']
         self.search_banks[bank] = entry
-        index = next(index for index in range(self.search_bank_choice.GetCount())
-                     if self.search_bank_choice.GetClientData(index) == bank)
-        name = entry.get('name', '').strip()
-        self.search_bank_choice.SetString(index, '%s: %s' % (bank, name) if name and name != bank else bank)
+        self.update_search_bank_choices()
         if self.current_list_view() == 'SEARCH BANKS':
             if bank not in self.search_bank_rows:
                 self.search_bank_rows[bank] = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), bank)

@@ -293,14 +293,15 @@ def parse_search_bank_response(text):
         return {'bank': empty.group(1), 'empty': True}
     match = re.fullmatch(
         r'SR([A-Ta-t]) SL([0-9]{10}) SU([0-9]{10}) '
-        r'ST([0-9]{6}|[0-9]+\.[0-9]+) AU([01]) MD([0-8])(?: AT([01]))? TT(.*)', text)
+        r'ST((?:[0-9]{6}|[0-9]+\.[0-9]+)\+?) AU([01]) MD([0-8])(?: AT([01]))? TT(.*)', text)
     if not match:
         raise ValueError('Invalid Search Bank definition')
     bank, lower, upper, step, auto, mode, attenuation, name = match.groups()
     if int(lower) >= int(upper):
         raise ValueError('Invalid Search Bank limits')
     return {'bank': bank, 'empty': False, 'lower_hz': int(lower), 'upper_hz': int(upper),
-            'step_khz': Decimal(step) / (1 if '.' in step else 1000),
+            'step_khz': Decimal(step.rstrip('+')) / (1 if '.' in step else 1000),
+            'step_adjust': step.endswith('+'), 'step_response': step,
             'auto': auto == '1', 'mode': int(mode), 'attenuation': attenuation, 'name': name}
 
 
