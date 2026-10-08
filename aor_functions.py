@@ -243,3 +243,85 @@ def format_step(x):
     max step   = 0.10000
     """
     return x
+
+
+def receiver_frequency_hz(value):
+    """Validate new search inputs using the installed AR8600's frequency range."""
+    command = bandscope_centre_command(value.strip())
+    frequency = int(command[2:-2])
+    if frequency % 50:
+        raise ValueError('Frequency must be in 50 Hz increments')
+    return frequency
+
+
+def search_step_hz(value):
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', value.strip()):
+        raise ValueError('Enter a numeric step in kHz')
+    step = Decimal(value.strip()) * 1000
+    # 8.33 represents the documented eight-and-one-third airband step.
+    if step != 8330 and (not 50 <= step <= 999950 or step % 50):
+        raise ValueError('Use 0.05-999.95 kHz in 0.05 kHz steps, or 8.33 kHz')
+    return int(step)
+
+
+def search_parameters(lower, upper, step, mode_code):
+    lower_hz, upper_hz = receiver_frequency_hz(lower), receiver_frequency_hz(upper)
+    if lower_hz >= upper_hz:
+        raise ValueError('Lower frequency must be less than upper frequency')
+    step_hz = search_step_hz(step)
+    if mode_code is not None and mode_code not in range(9):
+        raise ValueError('Select Auto or a valid mode')
+    return lower_hz, upper_hz, step_hz
+
+
+def make_search_bank_command(bank, lower, upper, step, mode_code, name):
+    if not re.fullmatch(r'[A-Ta-t]', bank):
+        raise ValueError('Select a Search Bank A-T or a-t')
+    lower_hz, upper_hz, step_hz = search_parameters(lower, upper, step, mode_code)
+    if len(name) > 12 or any(not 32 <= ord(char) <= 126 for char in name):
+        raise ValueError('Use at most 12 printable ASCII characters for the name')
+    command = 'SE%s SL%010d SU%010d AU%d' % (bank, lower_hz, upper_hz, mode_code is None)
+    if mode_code is not None:
+        command += ' ST%06d MD%d' % (step_hz, mode_code)
+    # AT is deliberately omitted: retain the bank's existing attenuation.
+    return (command + ' TT' + name + '\r\n').encode('ascii')
+
+
+def parse_search_bank_response(text):
+    empty = re.fullmatch(r'SR([A-Ta-t]) ---', text)
+    if empty:
+        return {'bank': empty.group(1), 'empty': True}
+    match = re.fullmatch(
+        r'SR([A-Ta-t]) SL([0-9]{10}) SU([0-9]{10}) '
+        r'ST([0-9]{6}|[0-9]+\.[0-9]+) AU([01]) MD([0-8])(?: AT([01]))? TT(.*)', text)
+    if not match:
+        raise ValueError('Invalid Search Bank definition')
+    bank, lower, upper, step, auto, mode, attenuation, name = match.groups()
+    if int(lower) >= int(upper):
+        raise ValueError('Invalid Search Bank limits')
+    return {'bank': bank, 'empty': False, 'lower_hz': int(lower), 'upper_hz': int(upper),
+            'step_khz': Decimal(step) / (1 if '.' in step else 1000),
+            'auto': auto == '1', 'mode': int(mode), 'attenuation': attenuation, 'name': name}
+
+
+def parse_group_members(text, kind):
+    banks = 'ABCDEFGHIJabcdefghij' if kind == 'scan' else 'ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst'
+    prefix = 'BM' if kind == 'scan' else 'BS'
+    match = re.fullmatch(prefix + r'\s*([A-Za-z-]{%d})' % len(banks), text)
+    if not match:
+        raise ValueError('Invalid group membership response')
+    members = match.group(1).replace('-', '')
+    if any(bank not in banks for bank in members) or len(set(members)) != len(members):
+        raise ValueError('Invalid or duplicate group bank')
+    return tuple(bank for bank in banks if bank in members)
+
+
+def make_group_members_command(kind, group, members):
+    if kind not in ('scan', 'search') or not 1 <= group <= 9:
+        raise ValueError('Group 0 is fixed LINK OFF; edit groups 1-9 only')
+    banks = 'ABCDEFGHIJabcdefghij' if kind == 'scan' else 'ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst'
+    if any(bank not in banks for bank in members) or len(set(members)) != len(members):
+        raise ValueError('Invalid group banks')
+    select, link = ('GM', 'BM') if kind == 'scan' else ('GS', 'BS')
+    ordered = ''.join(bank for bank in banks if bank in members)
+    return ('%s%d\r\n%s%%%%%s\r\n%s\r\n' % (select, group, link, ordered, link)).encode('ascii')

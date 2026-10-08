@@ -13,6 +13,8 @@ from aor_functions import (do_nothing, format_frequency, parse_lm_response, pars
                            make_pass_frequency_command, format_activity_row,
                            parse_bandscope_status, BandscopeSweep, bandscope_frequency,
                            BANDSCOPE_SPAN_LABELS, bandscope_centre_command, bandscope_marker_frequency)
+from aor_functions import (search_parameters, make_search_bank_command, parse_search_bank_response,
+                           parse_group_members, make_group_members_command)
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -63,13 +65,16 @@ class BandscopeWindow(wx.Frame):
         self.close_requested = False
         self.started_at = None
         self.last_duration = None
+        self.stop_requested = False
+        self.pending_tune = None
+        self.setting_command = b''
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
         buttons = wx.BoxSizer(wx.HORIZONTAL)
         self.start_button = wx.Button(panel, label='Start')
         self.stop_button = wx.Button(panel, label='Stop')
-        self.refresh_button = wx.Button(panel, label='Refresh once')
-        for button in (self.start_button, self.stop_button, self.refresh_button):
+        self.loop_checkbox = wx.CheckBox(panel, label='Loop')
+        for button in (self.start_button, self.stop_button, self.loop_checkbox):
             buttons.Add(button, 0, wx.ALL, 5)
         buttons.Add(wx.StaticText(panel, label='Span:'), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 10)
         self.span_choice = wx.Choice(panel, choices=BANDSCOPE_SPAN_LABELS)
@@ -81,10 +86,12 @@ class BandscopeWindow(wx.Frame):
         centre_controls.Add(wx.StaticText(panel, label='Centre (MHz):'), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         self.centre_input = wx.TextCtrl(panel, size=(120, -1), style=wx.TE_PROCESS_ENTER)
         self.centre_button = wx.Button(panel, label='Set centre')
+        self.tune_button = wx.Button(panel, label='Tune to Marker')
         self.centre_input.Disable()
         self.centre_button.Disable()
         centre_controls.Add(self.centre_input, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         centre_controls.Add(self.centre_button, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        centre_controls.Add(self.tune_button, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         sizer.Add(centre_controls)
         self.info = wx.StaticText(panel, label='Centre: ---    Span: ---    Marker: ---')
         sizer.Add(self.info, 0, wx.ALL, 5)
@@ -94,25 +101,26 @@ class BandscopeWindow(wx.Frame):
         self.plot.Bind(wx.EVT_SIZE, self.on_plot_size)
         self.plot.Bind(wx.EVT_LEFT_DOWN, self.on_marker_click)
         sizer.Add(self.plot, 1, wx.EXPAND | wx.ALL, 5)
-        self.message = wx.StaticText(panel, label='Connect, then Start or Refresh once. Stop halts refresh; Close restores the previous VFO/memory mode when available.')
+        self.message = wx.StaticText(panel, label='Start reads one sweep. Check Loop for continuous sweeps; Stop restores receiver audio.')
         sizer.Add(self.message, 0, wx.ALL, 5)
         panel.SetSizer(sizer)
         self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
-        self.refresh_button.Bind(wx.EVT_BUTTON, self.on_refresh)
+        self.tune_button.Bind(wx.EVT_BUTTON, self.on_tune_marker)
         self.span_choice.Bind(wx.EVT_CHOICE, self.on_span)
         self.centre_button.Bind(wx.EVT_BUTTON, self.on_centre)
         self.centre_input.Bind(wx.EVT_TEXT_ENTER, self.on_centre)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         for control, tip in (
-                (self.start_button, 'Read successive bandscope sweeps, one at a time.'),
-                (self.stop_button, 'Stop automatic refresh after the pending sweep.'),
-                (self.refresh_button, 'Read one complete bandscope sweep.'),
+                (self.start_button, 'Read one sweep, then restore audio; Loop repeats until Stop.'),
+                (self.stop_button, 'Finish any pending sweep and restore the previous receiver state/audio.'),
+                (self.loop_checkbox, 'Keep analyser mode active and repeat completed sweeps until Stop.'),
+                (self.tune_button, 'Finish any pending sweep, restore audio, tune the active VFO to MF, then read RX.'),
                 (self.span_choice, 'Set the bandscope width and clear the previous trace.'),
                 (self.centre_input, 'Enter the bandscope centre frequency in MHz.'),
-                (self.centre_button, 'Set the bandscope centre; refresh to read a new trace.'),
+                (self.centre_button, 'Set the bandscope centre; Start reads a new trace.'),
                 (self.plot, 'Click to move the bandscope marker without tuning the receiver.')):
             control.SetToolTip(tip)
         self.set_controls_enabled(True)
@@ -135,27 +143,39 @@ class BandscopeWindow(wx.Frame):
         if self.waiting is not None:
             return
         self.running = True
+        self.stop_requested = False
+        self.close_requested = False
         self.request_sweep()
-
-    def on_refresh(self, event):
-        if self.waiting is None:
-            self.running = False
-            self.request_sweep()
 
     def on_stop(self, event):
         self.running = False
-        if self.waiting is None:
+        self.stop_requested = True
+        if self.waiting is not None:
+            self.message.SetLabel('Stopping after current sweep' if self.waiting == 'data' else 'Restoring receiver')
+        else:
             self.timer.Stop()
-        self.message.SetLabel('Stopping after the pending sweep.' if self.waiting else 'Refresh stopped.')
+            self.restore_receiver()
+
+    def on_tune_marker(self, event):
+        if not self.available() or self.status is None or self.waiting == 'restore':
+            return
+        self.pending_tune = self.status['marker_hz']
+        self.on_stop(event)
 
     def request_sweep(self):
-        self.request_status(sweep=True)
+        command = b''
+        if not self.entered and self.status is not None:
+            # This receiver resets AM geometry on entry; retain the viewer's settings.
+            command = ('CF%010d\r\nSW%d\r\nMF%010d\r\n' %
+                       (self.status['centre_hz'], self.status['span_code'], self.status['marker_hz'])).encode('ascii')
+        self.request_status(command, sweep=True)
 
     def set_controls_enabled(self, enabled):
         self.start_button.Enable(enabled and self.available())
-        self.refresh_button.Enable(enabled and self.available())
         self.stop_button.Enable(self.available())
-        settings_enabled = enabled and self.entered and self.status is not None and self.available()
+        self.loop_checkbox.Enable(self.available())
+        self.tune_button.Enable(self.available() and self.status is not None and self.waiting != 'restore')
+        settings_enabled = enabled and self.status is not None and self.available()
         self.span_choice.Enable(settings_enabled)
         self.centre_input.Enable(settings_enabled)
         self.centre_button.Enable(settings_enabled)
@@ -167,8 +187,9 @@ class BandscopeWindow(wx.Frame):
             return
         if self.waiting is not None:
             return
-        self.close_requested = False
+        self.stop_requested = False
         self.sweep = None
+        self.setting_command = command
         self.sweep_requested = sweep
         self.waiting = 'status' if self.entered else 'receiver'
         self.set_controls_enabled(False)
@@ -179,12 +200,15 @@ class BandscopeWindow(wx.Frame):
         self.send(command + b'AM\r\n' if self.entered else b'RX\r\n')
 
     def change_setting(self, command, invalidate=False):
-        if self.waiting is not None or not self.entered or self.status is None or not self.available():
+        if self.waiting is not None or self.status is None or not self.available():
             return
         if invalidate:
             self.samples = None
             self.trace_status = None
             self.plot.Refresh()
+        if not self.entered:
+            command = ('CF%010d\r\nSW%d\r\nMF%010d\r\n' %
+                       (self.status['centre_hz'], self.status['span_code'], self.status['marker_hz'])).encode('ascii') + command
         self.request_status(command, sweep=self.running)
 
     def on_span(self, event):
@@ -193,7 +217,7 @@ class BandscopeWindow(wx.Frame):
             self.change_setting(('SW%d\r\n' % (selection + 1)).encode('ascii'), invalidate=True)
 
     def on_centre(self, event):
-        if self.waiting is not None or not self.entered or not self.available():
+        if self.waiting is not None or not self.available():
             return
         try:
             command = bandscope_centre_command(self.centre_input.GetValue().strip())
@@ -203,7 +227,7 @@ class BandscopeWindow(wx.Frame):
         self.change_setting(command, invalidate=True)
 
     def on_marker_click(self, event):
-        if self.waiting is not None or not self.entered or self.status is None or not self.available():
+        if self.waiting is not None or self.status is None or not self.available():
             return
         width, height = self.plot.GetClientSize()
         left, top, right, bottom = 55, 20, width - 20, height - 45
@@ -220,27 +244,51 @@ class BandscopeWindow(wx.Frame):
         self.change_setting(('MF%010d\r\n' % frequency).encode('ascii'))
 
     def capture_receiver(self, text):
+        restored = text.startswith(('VA ', 'VB ', 'VF ', 'MR MX', 'MS MX', 'SM MX', 'VS V')) or re.match(r'SR[A-Ta-t] RF', text)
+        if self.waiting == 'restore' and restored:
+            if text.startswith(('VA ', 'VB ', 'VF ')):
+                self.controller.validate_fields(text.split()[1:], ('RF', 'ST', 'AU', 'MD', 'AT'))
+            self.waiting = None
+            self.timer.Stop()
+            self.set_controls_enabled(True)
+            self.message.SetLabel('Sweep complete — receiver restored' if self.samples is not None else 'Receiver restored')
+            return
         if self.waiting != 'receiver':
             return
-        context = text.split()[0]
+        fields = text.split()
+        if not fields:
+            return
+        context = fields[0]
         if context in ('VA', 'VB', 'VF'):
+            self.controller.validate_fields(fields[1:], ('RF', 'ST', 'AU', 'MD', 'AT'))
             self.restore_command = (context + '\r\n').encode('ascii')
-        elif context == 'MR':
-            match = re.match(r'MR MX([A-Ja-j][0-9]{2}) ', text)
-            if match:
-                self.restore_command = ('MR%s\r\n' % match.group(1)).encode('ascii')
-        elif context not in ('SM', 'MS') and not re.fullmatch(r'SR[A-Ta-t]', context):
+        elif context in ('MR', 'MS', 'SM'):
+            match = re.match(r'(?:MR|MS|SM) MX([A-Ja-j][0-9]{2}) ', text)
+            if not match:
+                return
+            self.restore_command = ('MR%s\r\n' % match.group(1) if context == 'MR' else
+                                    'MS%s\r\n' % match.group(1)[0] if context == 'MS' else 'SM\r\n').encode('ascii')
+        elif re.fullmatch(r'SR[A-Ta-t]', context) and ' RF' in text:
+            self.restore_command = ('SS%s\r\n' % context[2]).encode('ascii')
+        elif context == 'VS':
+            self.restore_command = b'VS\r\n'
+        else:
+            return
+        if self.stop_requested:
+            self.waiting = None
+            self.restore_receiver()
             return
         self.waiting = 'status'
         self.entered = True
         # The first AM enters; the second obtains the documented status.
-        self.send(b'AM\r\nAM\r\n')
+        self.send(b'AM\r\n' + self.setting_command + b'AM\r\n')
 
     def set_status(self, text):
         status = parse_bandscope_status(text)
         if self.waiting == 'receiver':  # The scanner was already in analyser mode.
             self.entered = True
             self.waiting = 'status'
+            self.restore_command = self.controller.normal_vfo_command()
         if self.waiting != 'status':
             return
         if self.status is None or any(self.status[field] != status[field] for field in ('centre_hz', 'span_code')):
@@ -254,13 +302,10 @@ class BandscopeWindow(wx.Frame):
                            (status['centre_hz'] / 1000000, status['span_hz'] / 1000000,
                             status['marker_hz'] / 1000000, '    Peak hold' if status['peak_hold'] else ''))
         self.plot.Refresh()
-        if not self.sweep_requested:
+        if not self.sweep_requested or self.stop_requested:
             self.waiting = None
             self.timer.Stop()
-            self.set_controls_enabled(True)
-            self.message.SetLabel('Status updated. Refresh once for a new sweep. Click the spectrum to move the marker.')
-            if self.running:
-                self.timer.StartOnce(500)
+            self.restore_receiver()
             return
         # Real narrow-span dumps contain 128 points; retain manual-format support.
         self.sweep = BandscopeSweep((128, 1024) if status['span_code'] in (6, 7) else (1024,))
@@ -268,7 +313,8 @@ class BandscopeWindow(wx.Frame):
         self.waiting = 'data'
         self.started_at = time.monotonic()
         self.timer.StartOnce(75000)
-        self.message.SetLabel('Waiting for sweep completion (LM polling paused).')
+        self.message.SetLabel('Continuous sweep — receiver audio unavailable' if self.loop_checkbox.IsChecked()
+                              else 'Sweeping — receiver audio unavailable')
         self.send(b'DS\r\n')
 
     def add_ds_line(self, text):
@@ -289,22 +335,29 @@ class BandscopeWindow(wx.Frame):
                                   (len(samples), self.last_duration))
             self.plot.Refresh()
         elif not self.sweep.failed:
-            self.message.SetLabel('Collecting: %d samples (LM polling paused).' % (len(self.sweep.blocks) * 32))
+            self.message.SetLabel('Stopping after current sweep' if self.stop_requested else
+                                  'Sweeping — receiver audio unavailable (%d samples)' % (len(self.sweep.blocks) * 32))
         if self.sweep.finished:
             if self.sweep.failed:
-                self.message.SetLabel('Sweep rejected: incomplete or malformed data. Refresh once to retry.')
+                self.message.SetLabel('Sweep rejected: incomplete or malformed data.')
             self.waiting = None
             self.timer.Stop()
             self.set_controls_enabled(True)
-            if self.close_requested:
-                self.restore_receiver()
-            elif self.running:
+            if self.running and self.loop_checkbox.IsChecked() and not self.stop_requested:
+                self.message.SetLabel('Continuous sweep')
                 self.timer.StartOnce(500)
+            else:
+                self.running = False
+                self.restore_receiver()
 
     def on_timer(self, event):
         if self.waiting is None:
             if self.running:
-                self.request_sweep()
+                if self.loop_checkbox.IsChecked():
+                    self.request_sweep()
+                else:
+                    self.running = False
+                    self.restore_receiver()
             return
         self.running = False
         if self.waiting == 'data':
@@ -314,22 +367,37 @@ class BandscopeWindow(wx.Frame):
         else:
             self.waiting = None
             self.set_controls_enabled(True)
-            self.message.SetLabel('No valid bandscope status received. Refresh once to retry.')
-            if self.close_requested:
-                self.restore_receiver()
+            self.message.SetLabel('No valid bandscope status received; restoring receiver.')
+            self.restore_receiver()
         print('Bandscope request timed out', file=sys.stderr)
 
     def restore_receiver(self, query=True):
-        if self.entered and self.restore_command and self.controller.serial.is_open:
-            self.controller.write_serial(self.restore_command + (b'RX\r\n' if query else b''))
-        elif self.entered and self.controller.serial.is_open:
-            self.controller.aor_status.SetStatusText('Bandscope refresh stopped. Select a VFO to leave analyser mode.')
+        self.timer.Stop()
+        command = self.restore_command or self.controller.normal_vfo_command()
+        tune = self.pending_tune
+        if self.controller.serial.is_open and (self.entered or tune is not None):
+            if tune is not None:
+                vfo = self.controller.normal_vfo_command()
+                if command != vfo:
+                    command += vfo
+                command += ('RF%010d\r\n' % tune).encode('ascii')
+            if query:
+                command += b'RX\r\n'
+                self.waiting = 'restore'
+                self.timer.StartOnce(5000)
+            self.controller.write_serial(command)
+            self.message.SetLabel('Restoring receiver' if query else 'Receiver restored')
+        else:
+            self.message.SetLabel('Receiver restored')
+        self.pending_tune = None
         self.entered = False
         self.restore_command = None
-        self.set_controls_enabled(True)
+        self.set_controls_enabled(self.waiting is None)
 
     def disconnect(self):
         self.running = False
+        self.stop_requested = True
+        self.pending_tune = None
         self.timer.Stop()
         self.restore_receiver(query=False)
         self.waiting = None
@@ -340,12 +408,6 @@ class BandscopeWindow(wx.Frame):
     def on_close(self, event):
         self.on_stop(event)
         self.close_requested = True
-        if self.waiting != 'data':
-            self.waiting = None
-            self.timer.Stop()
-            self.set_controls_enabled(True)
-        if self.waiting is None:
-            self.restore_receiver()
         self.Hide()  # Retain pending sweep state until its last line is drained.
 
     def on_plot_size(self, event):
@@ -388,7 +450,8 @@ class BandscopeWindow(wx.Frame):
         marker_x = x_at(status['marker_hz'])
         if low <= status['marker_hz'] <= high:
             dc.DrawLine(marker_x, top, marker_x, bottom)
-            dc.DrawText('Marker', marker_x + 4, top)
+            label = '%.3f MHz' % (status['marker_hz'] / 1000000)
+            dc.DrawText(label, min(marker_x + 4, right - dc.GetTextExtent(label)[0]), top)
         if self.samples is None:
             return
         dc.SetPen(wx.Pen('#1565b0', 1))
@@ -404,6 +467,208 @@ class BandscopeWindow(wx.Frame):
             else:
                 dc.DrawLine(*previous, *point)
             previous = point
+
+
+class GroupDialog(wx.Dialog):
+    """Read back the scanner's membership; Save is an explicit replacement."""
+    def __init__(self, controller, kind, group):
+        super().__init__(controller, title='%s Group %d' % (kind.title(), group), size=(350, 440))
+        self.controller, self.kind, self.group = controller, kind, group
+        self.confirmed_members = None
+        self.expected_members = None
+        self.verification_members = None
+        self.banks = list('ABCDEFGHIJabcdefghij' if kind == 'scan' else 'ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst')
+        labels = []
+        for bank in self.banks:
+            metadata = controller.memory_banks.get(bank) if kind == 'scan' else controller.search_banks.get(bank)
+            labels.append(bank + (' — ' + metadata.get('name', '').strip() if metadata and metadata.get('name', '').strip() else ''))
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        self.message = wx.StaticText(self, label='Reading %s Group from scanner...' % kind.title())
+        self.message.Wrap(320)
+        instructions = wx.StaticText(self, label='Check boxes to link %s.\nHighlighting a row does not change its checkbox.' %
+                                     ('Memory Banks' if kind == 'scan' else 'Search Banks'))
+        self.members = wx.CheckListBox(self, choices=labels)
+        self.members.SetToolTip('Memory Banks scanned together.' if kind == 'scan' else 'Stored Search Banks searched together.')
+        self.save = wx.Button(self, label='Save membership')
+        self.save.Disable()
+        sizer.Add(self.message, 0, wx.ALL, 8)
+        sizer.Add(instructions, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        sizer.Add(self.members, 1, wx.EXPAND | wx.ALL, 8)
+        sizer.Add(self.save, 0, wx.ALL, 8)
+        self.SetSizer(sizer)
+        self.save.SetToolTip('Replace group links with these checked banks, then read back the scanner configuration.')
+        self.save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.members.Bind(wx.EVT_CHECKLISTBOX, self.on_members_changed)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.read_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_read_timeout, self.read_timer)
+        self.read_timer.StartOnce(5000)
+
+    def proposed_members(self):
+        return tuple(self.banks[index] for index in self.members.GetCheckedItems())
+
+    def set_message(self, message, error=False):
+        self.message.SetForegroundColour(wx.RED if error else wx.NullColour)
+        self.message.SetLabel(message)
+        self.message.Wrap(320)
+        self.Layout()
+
+    def on_members_changed(self, event):
+        self.verification_members = None
+        if self.confirmed_members is not None:
+            self.set_message('No changes to save' if self.proposed_members() == self.confirmed_members else
+                             'Proposed links: %s. Press Save membership.' % (', '.join(self.proposed_members()) or '(none)'))
+
+    def show_members(self, members):
+        self.read_timer.Stop()
+        self.confirmed_members = tuple(members)
+        self.members.SetCheckedItems([index for index, bank in enumerate(self.banks) if bank in members])
+        self.members.Enable(self.group != 0)
+        self.save.Enable(self.group != 0 and self.controller.connected)
+        if self.expected_members is not None or self.verification_members is not None:
+            expected = self.expected_members if self.expected_members is not None else self.verification_members
+            self.expected_members = None
+            # BM/BS replacement can itself reply, before the explicit read-back.
+            # Compare both replies and retain the result instead of erasing it.
+            self.verification_members = expected
+            matches = set(members) == set(expected)
+            self.set_message('%s Group %d saved and verified' % (self.kind.title(), self.group) if matches else
+                             'Save verification failed. Scanner returned: %s; requested: %s' %
+                             (', '.join(members) or '(none)', ', '.join(expected) or '(none)'), error=not matches)
+            self.controller.aor_status.SetStatusText(self.message.GetLabel().replace('\n', ' '))
+        else:
+            self.set_message('LINK OFF — fixed, read-only group' if self.group == 0 else
+                             'Scanner links: ' + (', '.join(members) or '(none)'))
+
+    def on_save(self, event):
+        if self.group == 0 or not self.controller.connected or self.confirmed_members is None or self.expected_members is not None:
+            return
+        if self.controller.group_loading[self.kind] is not None:
+            self.set_message('Wait for the current group read-back before saving.')
+            return
+        members = self.proposed_members()
+        if members == self.confirmed_members:
+            self.verification_members = None
+            self.set_message('No changes to save')
+            return
+        command = make_group_members_command(self.kind, self.group, members)
+        self.save.Disable()
+        self.members.Disable()
+        self.expected_members = members
+        self.set_message('Saving and verifying scanner links...')
+        self.controller.group_loading[self.kind] = self.group
+        # The editor has already read and identified this group; BM/BS is the
+        # explicit read-back for the replacement, rather than an unrelated GM/GS query.
+        self.controller.group_response[self.kind] = self.group
+        if self.controller.write_serial(command) != len(command):
+            self.expected_members = None
+            self.controller.group_loading[self.kind] = None
+            self.members.Enable(True)
+            self.save.Enable(True)
+            self.set_message('Serial write failed; membership was not verified.', error=True)
+        else:
+            self.read_timer.StartOnce(5000)
+        self.controller.update_connection_ui()
+
+    def on_read_timeout(self, event):
+        self.expected_members = None
+        self.verification_members = None
+        self.confirmed_members = None
+        self.save.Disable()
+        self.members.Disable()
+        self.controller.group_loading[self.kind] = None
+        self.set_message('No group read-back received. Close and reopen the editor to read again.', error=True)
+        self.controller.update_connection_ui()
+
+    def on_close(self, event):
+        self.read_timer.Stop()
+        self.controller.group_dialogs[self.kind] = None
+        self.Destroy()
+
+
+class SearchBankDialog(wx.Dialog):
+    def __init__(self, controller, bank):
+        super().__init__(controller, title='Create / Edit Search Bank')
+        self.controller = controller
+        self.bank = wx.Choice(self, choices=list('ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst'))
+        self.bank.SetStringSelection(bank)
+        self.lower = wx.TextCtrl(self)
+        self.upper = wx.TextCtrl(self)
+        self.step = wx.TextCtrl(self, value='100')
+        self.mode = wx.Choice(self, choices=['Auto'] + controller.cbx_mode.GetItems())
+        self.mode.SetSelection(0)
+        self.name = wx.TextCtrl(self)
+        self.name.SetMaxLength(12)
+        grid = wx.FlexGridSizer(0, 2, 6, 8)
+        for label, control, tip in (
+                ('Search Bank', self.bank, 'Stored Search Bank to create or edit; A-T or a-t.'),
+                ('Lower MHz', self.lower, 'Lower limit of this stored frequency range.'),
+                ('Upper MHz', self.upper, 'Upper limit, greater than Lower.'),
+                ('Step kHz', self.step, 'Manual tuning step; Auto follows the scanner bandplan.'),
+                ('Mode / Auto', self.mode, 'Choose modulation or the scanner automatic mode/step.'),
+                ('Name', self.name, 'Up to 12 printable ASCII characters identifying this Search Bank.')):
+            grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(control, 1, wx.EXPAND)
+            control.SetToolTip(tip)
+        self.message = wx.StaticText(self, label='Reading scanner values. Existing attenuation is retained.')
+        self.save = wx.Button(self, label='Save to scanner')
+        self.save.Disable()
+        self.save.SetToolTip('Write this Search Bank with SE and read back SR; stored memories are unaffected.')
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(grid, 0, wx.ALL, 10)
+        sizer.Add(self.message, 0, wx.ALL, 10)
+        sizer.Add(self.save, 0, wx.ALL, 10)
+        self.SetSizerAndFit(sizer)
+        self.bank.Bind(wx.EVT_CHOICE, self.on_bank)
+        self.save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def on_bank(self, event):
+        self.save.Disable()
+        self.message.SetLabel('Reading scanner values...')
+        self.controller.edit_bank_pending = self.bank.GetStringSelection()
+        self.controller.write_serial(('SR%s\r\n' % self.controller.edit_bank_pending).encode('ascii'))
+
+    def show_bank(self, entry):
+        if self.bank.GetStringSelection() != entry['bank']:
+            return
+        if entry['empty']:
+            self.lower.ChangeValue('')
+            self.upper.ChangeValue('')
+            self.step.ChangeValue('100')
+            self.mode.SetSelection(0)
+            self.name.ChangeValue('')
+        else:
+            self.lower.ChangeValue('%.6f' % (entry['lower_hz'] / 1000000))
+            self.upper.ChangeValue('%.6f' % (entry['upper_hz'] / 1000000))
+            self.step.ChangeValue(format(entry['step_khz'], 'f'))
+            self.mode.SetSelection(0 if entry['auto'] else MD_TO_GUI_MODE[entry['mode']] + 1)
+            self.name.ChangeValue(entry['name'])
+        self.save.Enable(self.controller.connected)
+        self.message.SetLabel('Scanner values received. Attenuation is retained when saving.')
+
+    def on_save(self, event):
+        if not self.controller.connected or self.controller.bank_write_pending is not None:
+            return
+        selection = self.mode.GetSelection()
+        code = None if selection == 0 else GUI_MODE_TO_MD[selection - 1]
+        try:
+            command = make_search_bank_command(self.bank.GetStringSelection(), self.lower.GetValue(),
+                                               self.upper.GetValue(), self.step.GetValue(), code, self.name.GetValue())
+        except ValueError as error:
+            self.message.SetLabel(str(error))
+            self.Fit()
+            return
+        bank = self.bank.GetStringSelection()
+        self.controller.bank_write_pending = bank
+        self.save.Disable()
+        self.message.SetLabel('Write requested; waiting for scanner read-back...')
+        self.controller.write_serial(command + ('SR%s\r\n' % bank).encode('ascii'))
+
+    def on_close(self, event):
+        self.controller.search_bank_dialog = None
+        self.controller.edit_bank_pending = None
+        self.Destroy()
 
 
 # noinspection PyUnusedLocal
@@ -424,7 +689,18 @@ class AorCtrl(AorCtrlFrame):
         self.vfo = None
         self.vfo_status = {}
         self.background_vfo = None
-        self.memory_banks = []
+        self.memory_banks = {}
+        self.search_banks = {}
+        self.search_bank_rows = {}
+        self.search_bank_dialog = None
+        self.edit_bank_pending = None
+        self.bank_write_pending = None
+        self.groups = {'scan': {}, 'search': {}}
+        self.group_loading = {'scan': None, 'search': None}
+        self.group_response = {'scan': None, 'search': None}
+        self.group_dialogs = {'scan': None, 'search': None}
+        self.search_restore_command = None
+        self.active_operation = None
         self.connected = False
         self.filling_banks = False
         self.pending_memory_channels = set()
@@ -500,9 +776,11 @@ class AorCtrl(AorCtrlFrame):
                 (self.ckbx_att, 'Enable or disable the receiver attenuator.'),
                 (self.cbx_lists, 'Choose memory, search, Select Scan, pass-frequency or local log data.'),
                 (self.bt_refresh, 'Reload the selected list; for pass frequencies, choose a bank or VFO.'),
-                (self.bt_vfostart, 'Start searching with the current VFO.'),
-                (self.bt_vfostop, 'Stop the current VFO search.'),
-                (self.bt_start, 'Start Select Scan when SELECT SCAN is the selected list.'),
+                (self.operation_choice, 'Choose memory scanning or frequency searching.'),
+                (self.source_choice, 'Choose the Memory Bank, linked group, selected-channel list, or frequency range to use.'),
+                (self.memory_bank_choice, 'Memory Bank: a stored collection of individual memory channels. Select the bank to scan.'),
+                (self.search_bank_choice, 'Search Bank: a stored frequency range with its search parameters. Read the selected bank.'),
+                (self.bt_start, 'Start the selected operation and source using its scanner commands.'),
                 (self.bt_mkpassfreq, 'Add a frequency to the selected PASS FREQS context.'),
                 (self.edit_list.list, 'View the selected data; right-click a pass frequency for actions.'),
                 (self.activity_list, 'View the most recent receiver activity; LOG VIEW shows the full in-memory log.'),
@@ -526,15 +804,24 @@ class AorCtrl(AorCtrlFrame):
                 (self.ckbx_nl, 'Noise limiter control is not implemented.'),
                 (self.ckbx_afc, 'Automatic frequency control is not implemented.'),
                 (self.sql, 'Squelch adjustment is not implemented; the current state is shown below.'),
-                (self.cbx_scan, 'Scan-group selection is not implemented.'),
-                (self.bt_scgrp, 'Scan-group configuration is not implemented.'),
-                (self.ckbx_sel, 'Select Scan membership editing is not implemented.'),
-                (self.ckbx_pas, 'Memory pass-flag editing is not implemented.'),
-                (self.bt_stop, 'Scan Stop / Memory control is not implemented.'),
-                (self.cbx_search, 'Search-group selection is not implemented.'),
-                (self.bt_search, 'Search-group configuration is not implemented.')):
+                ):
             control.SetToolTip(tip)
             control.Disable()
+        for control, tip in (
+                (self.cbx_lists, 'Read a Memory Bank (stored individual channels), Search Bank (stored range), Select Scan (selected channels), or local log.'),
+                (self.cbx_scan, 'Scan Group: Memory Banks linked together for memory scanning. Read group 0-9; 0 is fixed LINK OFF.'),
+                (self.bt_scgrp, 'View linked Memory Banks; edit membership for Scan Groups 1-9.'),
+                (self.cbx_search, 'Search Group: Search Banks linked together for frequency searching. Read group 0-9; 0 is fixed LINK OFF.'),
+                (self.bt_search, 'View linked stored frequency ranges; edit Search Groups 1-9.'),
+                (self.range_lower, 'Lower frequency limit in MHz; configures VFO-A, without writing a Search Bank.'),
+                (self.range_upper, 'Upper frequency limit in MHz; must exceed Lower; configures VFO-B.'),
+                (self.range_step, 'Search step in kHz. Auto uses the scanner bandplan and may override this step.'),
+                (self.range_mode, 'Choose modulation, or Auto for the scanner bandplan mode and step.'),
+                (self.bt_stop, 'Stop the active scan/search, restore normal receiver operation, and request RX.'),
+                (self.bt_newsearchbank, 'Create a stored Search Bank: lower/upper range and search parameters.'),
+                (self.bt_editsearchbank, 'Read and edit the selected stored Search Bank; retain its attenuation.'),
+                ):
+            control.SetToolTip(tip)
         self.update_connection_ui()
 
     def update_connection_ui(self):
@@ -551,14 +838,18 @@ class AorCtrl(AorCtrlFrame):
                                 'Disconnect from the AR8600.' if self.serial.is_open else
                                 'Connect to the AR8600 using the configured serial port.')
         for control in (self.rb_vfos, self.cbx_mode, self.cbx_step, self.ckbx_auto,
-                        self.ckbx_att, self.bt_vfostart, self.bt_vfostop,
+                        self.ckbx_att,
+                        self.cbx_scan, self.bt_scgrp, self.bt_stop, self.cbx_search, self.bt_search,
+                        self.range_lower, self.range_upper, self.range_step, self.range_mode,
+                        self.bt_newsearchbank, self.bt_editsearchbank,
                         self.tuning_panel.tune_benter, self.tuning_panel.tune_frev,
                         self.tuning_panel.tune_rev, self.tuning_panel.tune_forw,
                         self.tuning_panel.tune_ffor):
             control.Enable(ready)
-        view = self.cbx_lists.GetStringSelection()
-        self.bt_refresh.Enable((ready and bool(view) and view != 'DATABASE') or view == 'LOG VIEW')
-        self.bt_start.Enable(ready and view == 'SELECT SCAN')
+        view = self.current_list_view()
+        self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view == 'LOG VIEW')
+        self.bt_start.Enable(ready)
+        self.update_operation_ui()
         self.bt_mkpassfreq.Enable(ready and view == 'PASS FREQS')
         if self.bandscope is not None:
             self.bandscope.set_controls_enabled(self.bandscope.waiting is None)
@@ -571,6 +862,139 @@ class AorCtrl(AorCtrlFrame):
         self.bandscope.Raise()
         if self.bandscope.waiting is None and self.bandscope.available():
             self.bandscope.request_status()
+
+    def operation_selection(self):
+        return self.operation_choice.GetStringSelection(), self.source_choice.GetStringSelection()
+
+    def update_operation_ui(self):
+        operation, source = self.operation_selection()
+        ready = self.connected and self.serial.is_open and self.alive.is_set()
+        tips = {'Current Bank': 'Memory Bank: a stored collection of individual memory channels. Scan only the selected bank.',
+                'Scan Group': 'Scan Group: a set of Memory Banks linked together for memory scanning.',
+                'Select Scan': 'Select Scan: a special list of selected individual memory channels; memory pass flags are ignored.',
+                'Range': 'Search between two VFO frequency limits without creating a stored Search Bank.',
+                'Search Bank': 'Search Bank: a stored frequency range with its search parameters.',
+                'Search Group': 'Search Group: a set of Search Banks linked together for frequency searching.'}
+        self.source_choice.SetToolTip(tips[source])
+        idle = self.active_operation is None
+        panels = (self.memory_source_panel, self.scan_source_panel, self.range_source_panel,
+                  self.bank_source_panel, self.search_source_panel)
+        selected = {('Memory Scan', 'Current Bank'): self.memory_source_panel,
+                    ('Memory Scan', 'Scan Group'): self.scan_source_panel,
+                    ('Frequency Search', 'Range'): self.range_source_panel,
+                    ('Frequency Search', 'Search Bank'): self.bank_source_panel,
+                    ('Frequency Search', 'Search Group'): self.search_source_panel}.get((operation, source))
+        for panel in panels:
+            panel.Show(panel is selected)
+            panel.Enable(ready and idle and panel is selected)
+        for kind, control in (('scan', self.cbx_scan), ('search', self.cbx_search)):
+            panel = self.scan_source_panel if kind == 'scan' else self.search_source_panel
+            control.Enable(ready and idle and panel is selected and self.group_loading[kind] is None)
+        self.bt_start.Enable(ready and idle)
+        self.bt_stop.Enable(ready)
+        self.operation_panel.Layout()
+        self.panel_1.Layout()
+        self.Layout()
+
+    def on_operation_changed(self, event):
+        choices = ['Current Bank', 'Scan Group', 'Select Scan'] if self.operation_choice.GetSelection() == 0 else ['Range', 'Search Bank', 'Search Group']
+        self.source_choice.SetItems(choices)
+        self.source_choice.SetSelection(0)
+        self.on_source_changed(event)
+
+    def on_source_changed(self, event):
+        self.update_operation_ui()
+        if not self.connected or not self.serial.is_open or self.active_operation is not None:
+            return
+        operation, source = self.operation_selection()
+        if source == 'Scan Group':
+            self.request_group('scan')
+        elif source == 'Search Group':
+            self.request_group('search')
+        elif source == 'Search Bank':
+            self.on_search_source_changed(event)
+        elif source == 'Select Scan':
+            self.cbx_lists.SetStringSelection('SELECT SCAN')
+            self.on_select_list(None)
+
+    def operation_memory_bank(self):
+        index = self.memory_bank_choice.GetSelection()
+        return self.memory_bank_choice.GetClientData(index) if index != wx.NOT_FOUND else self.selected_memory_bank()
+
+    def sync_memory_choices(self, selected=None):
+        previous = selected or self.operation_memory_bank()
+        self.memory_bank_choice.Clear()
+        for bank in sorted(self.memory_banks, key=lambda b: (b.upper(), b.islower())):
+            metadata = self.memory_banks[bank]
+            name = metadata['name']
+            label = name if name and name != bank else '%s:%d' % (bank, metadata['channels'])
+            index = self.memory_bank_choice.Append(label, metadata)
+            if previous and previous['bank'] == bank:
+                self.memory_bank_choice.SetSelection(index)
+
+    def on_memory_source_changed(self, event):
+        metadata = self.operation_memory_bank()
+        if metadata is None:
+            return
+        for index in range(self.cbx_lists.GetCount()):
+            data = self.cbx_lists.GetClientData(index)
+            if data and data['bank'] == metadata['bank']:
+                self.cbx_lists.SetSelection(index)
+                self.on_select_list(None)
+                break
+
+    def on_search_source_changed(self, event):
+        if not self.connected or not self.serial.is_open:
+            return
+        if self.current_list_view() != 'SEARCH BANKS':
+            self.cbx_lists.SetStringSelection('SEARCH BANKS')
+            self.search_bank_rows.clear()
+            self.filling_banks = False
+            self.pending_memory_channels.clear()
+            self.prepare_list((('Search Bank', 85), ('Lower MHz', 100), ('Upper MHz', 100), ('Step kHz', 70),
+                               ('Auto', 45), ('Mode', 55), ('ATT', 40), ('Name', 130)))
+        bank = self.search_bank_choice.GetClientData(self.search_bank_choice.GetSelection())
+        self.write_serial(('SR%s\r\n' % bank).encode('ascii'))
+        self.update_connection_ui()
+
+    def on_operation_start(self, event):
+        if not self.connected or not self.serial.is_open or self.active_operation is not None:
+            return
+        operation, source = self.operation_selection()
+        started = False
+        if operation == 'Memory Scan':
+            if source == 'Current Bank':
+                metadata = self.operation_memory_bank()
+                if metadata is None:
+                    self.aor_status.SetStatusText('Choose a Memory Bank to scan.')
+                    return
+                command = ('GM0\r\nMS%s\r\nRX\r\n' % metadata['bank']).encode('ascii')
+                started = self.write_serial(command) == len(command)
+            else:
+                started = self.on_select_scan_start(event, source=source)
+        elif source == 'Range':
+            started = self.on_vfo_start(event)
+        elif source == 'Search Bank':
+            bank = self.search_bank_choice.GetClientData(self.search_bank_choice.GetSelection())
+            started = self.on_start_search_bank(event, bank=bank)
+        else:
+            started = self.on_group_search(event)
+        if started:
+            self.active_operation = (operation, source)
+            self.aor_status.SetStatusText('%s started: %s' % (operation, source))
+            self.update_operation_ui()
+
+    def on_operation_stop(self, event):
+        if not self.connected or not self.serial.is_open:
+            return
+        # Range Search has cached VFO settings to restore; other sources leave
+        # scanning/searching by selecting normal receiver mode, then reading RX.
+        if self.active_operation == ('Frequency Search', 'Range') or self.search_restore_command is not None:
+            self.on_vfo_stop(event)
+        else:
+            self.write_serial(self.normal_vfo_command() + b'RX\r\n')
+        self.active_operation = None
+        self.update_operation_ui()
 
     def start_thread(self):
         """Start the receiver thread"""
@@ -585,6 +1009,7 @@ class AorCtrl(AorCtrlFrame):
             self.bandscope.disconnect()
         self.stop_monitoring()
         self.connected = False
+        self.active_operation = None
         self.filling_banks = False
         self.pending_memory_channels.clear()
         self.background_vfo = None
@@ -699,7 +1124,7 @@ class AorCtrl(AorCtrlFrame):
         for column, value in enumerate(values, 1):
             self.activity_list.SetItem(row, column, value)
         self.activity_list.EnsureVisible(row)
-        if self.cbx_lists.GetStringSelection() == 'LOG VIEW':
+        if self.current_list_view() == 'LOG VIEW':
             self.show_log_view()
 
     def __set_properties(self):
@@ -720,9 +1145,18 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_COMBOBOX, self.on_select_mode, self.cbx_mode)
         self.Bind(wx.EVT_COMBOBOX, self.on_select_step, self.cbx_step)
         self.Bind(wx.EVT_RADIOBOX, self.on_select_vfo, self.rb_vfos)
-        self.Bind(wx.EVT_BUTTON, self.on_vfo_start, self.bt_vfostart)
-        self.Bind(wx.EVT_BUTTON, self.on_vfo_stop, self.bt_vfostop)
-        self.Bind(wx.EVT_BUTTON, self.on_select_scan_start, self.bt_start)
+        self.Bind(wx.EVT_BUTTON, self.on_operation_start, self.bt_start)
+        self.Bind(wx.EVT_BUTTON, self.on_operation_stop, self.bt_stop)
+        self.cbx_scan.Bind(wx.EVT_COMBOBOX, lambda evt: self.request_group('scan'))
+        self.cbx_search.Bind(wx.EVT_COMBOBOX, lambda evt: self.request_group('search'))
+        self.bt_scgrp.Bind(wx.EVT_BUTTON, lambda evt: self.open_group('scan'))
+        self.bt_search.Bind(wx.EVT_BUTTON, lambda evt: self.open_group('search'))
+        self.operation_choice.Bind(wx.EVT_CHOICE, self.on_operation_changed)
+        self.source_choice.Bind(wx.EVT_CHOICE, self.on_source_changed)
+        self.memory_bank_choice.Bind(wx.EVT_CHOICE, self.on_memory_source_changed)
+        self.search_bank_choice.Bind(wx.EVT_CHOICE, self.on_search_source_changed)
+        self.bt_newsearchbank.Bind(wx.EVT_BUTTON, lambda evt: self.open_search_bank(create=True))
+        self.bt_editsearchbank.Bind(wx.EVT_BUTTON, lambda evt: self.open_search_bank())
         self.Bind(wx.EVT_BUTTON, self.on_add_pass_frequency, self.bt_mkpassfreq)
         self.Bind(EVT_SERIALRX, self.on_serial_read)
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -741,8 +1175,20 @@ class AorCtrl(AorCtrlFrame):
 
     def open_menu(self, event):
         """"""
-        view = self.cbx_lists.GetStringSelection()
+        view = self.current_list_view()
         if view in ('LOG VIEW', 'SELECT SCAN'):
+            return
+        if view == 'SEARCH BANKS':
+            bank = self.edit_list.list.GetItemText(event.GetIndex())
+            entry = self.search_banks.get(bank)
+            if entry is None:
+                return
+            menu = wx.Menu()
+            edit = menu.Append(wx.ID_ANY, 'Edit Search Bank...')
+            edit.Enable(self.connected and self.serial.is_open)
+            menu.Bind(wx.EVT_MENU, lambda evt: self.open_search_bank(bank=bank), id=edit.GetId())
+            self.edit_list.list.PopupMenu(menu)
+            menu.Destroy()
             return
         if view == 'PASS FREQS':
             row = event.GetIndex()
@@ -836,15 +1282,182 @@ class AorCtrl(AorCtrlFrame):
         self.write_serial(towrite.encode("ascii"))
 
     def on_vfo_start(self, evt):
-        self.write_serial('VS\r\n'.encode("ascii"))
+        if not self.connected or not self.serial.is_open:
+            return
+        if self.search_restore_command is not None:
+            self.aor_status.SetStatusText('Stop the current range search before starting another.')
+            return
+        selection = self.range_mode.GetSelection()
+        mode = None if selection == 0 else GUI_MODE_TO_MD[selection - 1]
+        try:
+            lower, upper, step = search_parameters(self.range_lower.GetValue(), self.range_upper.GetValue(),
+                                                   self.range_step.GetValue(), mode)
+        except ValueError as error:
+            self.aor_status.SetStatusText(str(error))
+            return
+        restore = bytearray()
+        for vfx, context in ((0, 'VA'), (1, 'VB'), (2, 'VF')):
+            status = self.vfo_status.get(vfx)
+            if status:
+                fields = {field[:2]: field[2:] for field in status.split()[1:]}
+                restore.extend(('%s\r\nRF%s\r\nAU0\r\nMD%s\r\nST%s\r\nAT%s\r\nAU%s\r\n' %
+                                (context, fields['RF'], fields['MD'], fields['ST'], fields['AT'], fields['AU'])).encode('ascii'))
+        self.search_restore_command = bytes(restore) + self.normal_vfo_command()
+        command = 'VA\r\nRF%010d\r\nVB\r\nRF%010d\r\nVA\r\n' % (lower, upper)
+        command += ('AU1\r\n' if mode is None else 'AU0\r\nMD%d\r\nST%06d\r\n' % (mode, step))
+        data = (command + 'VS\r\nRX\r\n').encode('ascii')
+        if self.write_serial(data) != len(data):
+            self.search_restore_command = None
+            return False
+        self.aor_status.SetStatusText('VFO range search started; Stop Search restores the previous VFO settings.')
+        return True
 
     def on_vfo_stop(self, evt):
-        self.write_serial('VV0\r\n'.encode("ascii"))
+        if not self.connected or not self.serial.is_open:
+            return
+        # VA/VB/VF select normal receiver operation. VV0 is VFO Scan, not Search stop.
+        command = self.normal_vfo_command() + (self.search_restore_command or b'') + b'RX\r\n'
+        self.search_restore_command = None
+        self.write_serial(command)
 
-    def on_select_scan_start(self, evt):
-        if self.cbx_lists.GetStringSelection() == 'SELECT SCAN' and self.connected and self.serial.is_open:
-            self.write_serial(b'SM\r\n')
+    def on_select_scan_start(self, evt, source=None):
+        if not self.connected or not self.serial.is_open:
+            return
+        if source == 'Select Scan' or (source is None and self.current_list_view() == 'SELECT SCAN'):
+            sent = self.write_serial(b'SM\r\n') == 4
             self.aor_status.SetStatusText('Select Scan start requested')
+            return sent
+        else:
+            bank = self.choose_start_bank('scan')
+            if bank:
+                command = ('GM%s\r\nMS%s\r\nRX\r\n' % (self.cbx_scan.GetValue(), bank)).encode('ascii')
+                return self.write_serial(command) == len(command)
+
+    def normal_vfo_command(self):
+        return (('VA', 'VB', 'VF')[self.rb_vfos.GetSelection()] + '\r\n').encode('ascii')
+
+    def selected_memory_bank(self):
+        index = self.cbx_lists.GetSelection()
+        return self.cbx_lists.GetClientData(index) if index != wx.NOT_FOUND else None
+
+    def current_list_view(self):
+        return '' if self.selected_memory_bank() is not None else self.cbx_lists.GetStringSelection()
+
+    def request_group(self, kind):
+        if not self.connected or not self.serial.is_open or self.group_loading[kind] is not None:
+            return
+        control = self.cbx_scan if kind == 'scan' else self.cbx_search
+        group = int(control.GetValue())
+        prefix = 'GM' if kind == 'scan' else 'GS'
+        self.group_loading[kind] = group
+        self.group_response[kind] = None
+        self.write_serial(('%s%d\r\n%s\r\n' % (prefix, group, prefix)).encode('ascii'))
+        self.update_connection_ui()
+
+    def set_group_response(self, text):
+        match = re.match(r'G([MS])([0-9])(?:\s|$)', text)
+        if match:
+            kind = 'scan' if match.group(1) == 'M' else 'search'
+            self.group_response[kind] = int(match.group(2))
+            return
+        kind = 'scan' if text.startswith('BM') else 'search'
+        members = parse_group_members(text, kind)
+        group = self.group_response[kind]
+        if group is None:
+            raise ValueError('Group membership received without an identified group')
+        self.groups[kind][group] = members
+        control = self.cbx_scan if kind == 'scan' else self.cbx_search
+        if self.group_loading[kind] in (None, group):
+            control.SetStringSelection(str(group))
+            self.group_loading[kind] = None
+            self.aor_status.SetStatusText('%s Group %d: %s' %
+                                         (kind.title(), group, 'LINK OFF' if group == 0 else ', '.join(members) or 'no linked banks'))
+        dialog = self.group_dialogs[kind]
+        if dialog is not None and dialog.group == group:
+            dialog.show_members(members)
+        self.update_connection_ui()
+
+    def open_group(self, kind):
+        if not self.connected:
+            return
+        if self.group_dialogs[kind] is not None:
+            self.group_dialogs[kind].Raise()
+            return
+        control = self.cbx_scan if kind == 'scan' else self.cbx_search
+        group = int(control.GetValue())
+        dialog = GroupDialog(self, kind, group)
+        self.group_dialogs[kind] = dialog
+        dialog.Show()
+        self.request_group(kind)
+
+    def selected_search_bank(self):
+        if self.operation_selection() == ('Frequency Search', 'Search Bank'):
+            index = self.search_bank_choice.GetSelection()
+            if index != wx.NOT_FOUND:
+                return self.search_bank_choice.GetClientData(index)
+        if self.current_list_view() == 'SEARCH BANKS':
+            row = self.edit_list.list.GetFirstSelected()
+            if row != wx.NOT_FOUND:
+                bank = self.edit_list.list.GetItemText(row)
+                if re.fullmatch(r'[A-Ta-t]', bank):
+                    return bank
+
+    def choose_start_bank(self, kind):
+        group = int((self.cbx_scan if kind == 'scan' else self.cbx_search).GetValue())
+        if self.group_loading[kind] is not None:
+            self.aor_status.SetStatusText('Wait for group configuration before starting.')
+            return None
+        metadata = self.operation_memory_bank() if kind == 'scan' else None
+        selected = metadata['bank'] if metadata else self.selected_search_bank() if kind == 'search' else None
+        members = self.groups[kind].get(group, ())
+        if selected and (group == 0 or not members or selected in members):
+            return selected
+        if members:
+            return members[0]
+        definitions = self.memory_banks if kind == 'scan' else self.search_banks
+        banks = [bank for bank in sorted(definitions, key=lambda b: (b.upper(), b.islower()))
+                 if kind == 'scan' or not definitions[bank]['empty']]
+        if not banks:
+            self.aor_status.SetStatusText('Read Memory Banks / SEARCH BANKS first, then choose a starting bank.')
+            return None
+        dialog = wx.SingleChoiceDialog(self, 'Select a starting bank (group 0 is LINK OFF):',
+                                        '%s Group' % kind.title(), banks)
+        try:
+            return banks[dialog.GetSelection()] if dialog.ShowModal() == wx.ID_OK else None
+        finally:
+            dialog.Destroy()
+
+    def on_group_search(self, event):
+        if self.connected and self.serial.is_open:
+            bank = self.choose_start_bank('search')
+            if bank:
+                command = ('GS%s\r\nSS%s\r\nRX\r\n' % (self.cbx_search.GetValue(), bank)).encode('ascii')
+                return self.write_serial(command) == len(command)
+
+    def open_search_bank(self, create=False, bank=None):
+        if not self.connected:
+            return
+        if self.search_bank_dialog is not None:
+            self.search_bank_dialog.Raise()
+            return
+        bank = bank or (None if create else self.selected_search_bank())
+        if bank is None and not create:
+            self.aor_status.SetStatusText('Choose SEARCH BANKS and select a row to edit.')
+            return
+        if bank is None:
+            bank = next((b for b, entry in self.search_banks.items() if entry['empty']), 'A')
+        self.search_bank_dialog = SearchBankDialog(self, bank)
+        self.search_bank_dialog.Show()
+        self.search_bank_dialog.on_bank(None)
+
+    def on_start_search_bank(self, event, bank=None):
+        bank = bank or self.selected_search_bank()
+        entry = self.search_banks.get(bank)
+        if self.connected and self.serial.is_open and entry is not None and not entry['empty']:
+            command = ('SS%s\r\nRX\r\n' % bank).encode('ascii')
+            return self.write_serial(command) == len(command)
+        else:
+            self.aor_status.SetStatusText('Choose SEARCH BANKS and select a populated row to start.')
 
     def on_select_mode(self, evt):
         """Set mode on RX
@@ -873,7 +1486,9 @@ class AorCtrl(AorCtrlFrame):
         self.write_serial(b'RX\r\n')
 
     def on_select_list(self, evt):
-        selection = self.cbx_lists.GetStringSelection()
+        if self.selected_memory_bank() is not None:
+            self.sync_memory_choices(self.selected_memory_bank())
+        selection = self.current_list_view()
         self.update_connection_ui()
         if selection not in ('LOG VIEW', 'DATABASE') and not (
                 self.connected and self.serial.is_open and self.alive.is_set()):
@@ -932,9 +1547,22 @@ class AorCtrl(AorCtrlFrame):
                         self.background_vfo = 1 - vfx
                         command = 'VA\r\nRX\r\nVB\r\n' if vfx == 1 else 'VB\r\nRX\r\nVA\r\n'
                         self.write_serial(command.encode("ascii"))
+                elif first.startswith(('GM', 'GS', 'BM', 'BS')):
+                    self.set_group_response(first)
+                elif first.startswith(('VS ', 'VV ')):
+                    match = re.fullmatch(r'V[SV] (V[ABF]) (RF.*)', first)
+                    if match is None:
+                        raise ValueError('Invalid VFO search/scan status')
+                    self.set_vfo_text(match.group(1) + ' ' + match.group(2),
+                                      {'VA': 0, 'VB': 1, 'VF': 2}[match.group(1)])
+                elif re.match(r'SR[A-Ta-t] RF', first):
+                    fields = first.split(None, 6)
+                    self.validate_fields(fields[1:6], ('RF', 'ST', 'AU', 'MD', 'AT'))
+                    if len(fields) != 7 or not fields[6].startswith('TT'):
+                        raise ValueError('Invalid active Search Bank status')
+                    self.aor_status.SetStatusText('Searching bank %s: %s MHz' % (first[2], format_frequency(fields[1][2:])))
                 elif first.startswith('SR'):
-                    if self.cbx_lists.GetStringSelection() not in ('SELECT SCAN', 'PASS FREQS', 'LOG VIEW'):
-                        self.set_search_banks(first)
+                    self.set_search_banks(first)
                 elif first.startswith('GR'):
                     self.set_select_scan(first)
                 elif first.startswith('PR'):
@@ -951,9 +1579,11 @@ class AorCtrl(AorCtrlFrame):
                         self.set_memory_banks(first)
                     else:
                         continue
-                elif first.startswith('MR '):
-                    # RX memory status is not an MA listing response.
-                    continue
+                elif first.startswith(('MR ', 'MS ')):
+                    fields = first.split(None, 8)[1:]
+                    self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
+                    self.aor_status.SetStatusText('%s: %s, %s MHz' %
+                                                (first[:2], fields[0][2:], format_frequency(fields[2][2:])))
                 else:
                     print('Ignored unexpected scanner response: %r' % first, file=sys.stderr)
                     continue
@@ -1060,7 +1690,9 @@ class AorCtrl(AorCtrlFrame):
             )
             self.connected = False
             self.update_connection_ui()
-            self.memory_banks = []
+            self.memory_banks.clear()
+            self.group_loading = {'scan': None, 'search': None}
+            self.group_response = {'scan': None, 'search': None}
             self.write_serial('RX\r\n'.encode("ascii"))
             self.write_serial('TB\r\n'.encode("ascii"))
             self.write_serial('TB\r\n'.encode("ascii"))
@@ -1071,8 +1703,11 @@ class AorCtrl(AorCtrlFrame):
         Populated channels return MX[bank][channel] MP RF ST AU MD AT TM.
         Empty channels return MX[bank][channel] ---.
         """
-        selection = self.cbx_lists.GetStringSelection()
-        bank, channels = selection.split()[0].split(':')
+        metadata = self.selected_memory_bank()
+        if metadata is None:
+            self.filling_banks = False
+            return
+        bank, channels = metadata['bank'], metadata['channels']
         self.row = 0
         self.last = None
         self.edit_list.list.ClearAll()
@@ -1081,7 +1716,7 @@ class AorCtrl(AorCtrlFrame):
         for column, label in enumerate(column_headers):
             self.edit_list.list.InsertColumn(column, label)
 
-        channel_count = int(channels)
+        channel_count = channels
         blocks = (channel_count + 9) // 10
         self.pending_memory_channels = {'%s%02i' % (bank, channel) for channel in range(channel_count)}
         self.filling_banks = bool(self.pending_memory_channels)
@@ -1105,7 +1740,7 @@ class AorCtrl(AorCtrlFrame):
 
     def set_select_scan(self, text):
         entry = parse_select_scan_response(text)
-        if self.cbx_lists.GetStringSelection() != 'SELECT SCAN':
+        if self.current_list_view() != 'SELECT SCAN':
             return
         if entry['channel'] is None:
             self.aor_status.SetStatusText('Select Scan: %d tagged channels' % len(self.select_scan_rows))
@@ -1130,7 +1765,7 @@ class AorCtrl(AorCtrlFrame):
 
     def set_pass_frequency(self, text):
         entry = parse_pass_frequency_response(text)
-        if self.cbx_lists.GetStringSelection() != 'PASS FREQS' or entry['context'] != self.pass_context:
+        if self.current_list_view() != 'PASS FREQS' or entry['context'] != self.pass_context:
             return
         slot = entry['slot']
         previous = self.pass_frequency_rows.get(slot)
@@ -1156,7 +1791,7 @@ class AorCtrl(AorCtrlFrame):
             dialog.Destroy()
 
     def on_add_pass_frequency(self, evt):
-        if self.cbx_lists.GetStringSelection() != 'PASS FREQS' or not self.connected or not self.serial.is_open:
+        if self.current_list_view() != 'PASS FREQS' or not self.connected or not self.serial.is_open:
             return
         dialog = wx.TextEntryDialog(self, 'Add frequency in MHz to pass list %s:' % self.pass_context,
                                     'Add pass frequency')
@@ -1175,7 +1810,7 @@ class AorCtrl(AorCtrlFrame):
 
     def remove_pass_frequency(self, slot):
         entry = self.pass_frequency_rows.get(slot)
-        if (self.cbx_lists.GetStringSelection() != 'PASS FREQS' or not self.connected or not self.serial.is_open
+        if (self.current_list_view() != 'PASS FREQS' or not self.connected or not self.serial.is_open
                 or entry is None or entry['frequency_hz'] is None or entry['context'] == 'V'):
             return
         command = ('PD%s%s\r\n' % (entry['context'], slot)).encode('ascii')
@@ -1200,9 +1835,10 @@ class AorCtrl(AorCtrlFrame):
         self.filling_banks = False
         self.pending_memory_channels.clear()
         self.row = 0
+        self.search_bank_rows.clear()
         self.edit_list.list.ClearAll()
         # set column names
-        column_headers = ['Bank', 'Start', 'Stop', 'Step', 'AUTO', 'MODE', 'ATT', 'NAME']
+        column_headers = ['Search Bank', 'Lower MHz', 'Upper MHz', 'Step kHz', 'AUTO', 'MODE', 'ATT', 'NAME']
         for column, label in enumerate(column_headers):
             self.edit_list.list.InsertColumn(column, label)
 
@@ -1222,21 +1858,24 @@ class AorCtrl(AorCtrlFrame):
         if match is None:
             raise ValueError('Invalid bank-list response')
         bank, channels, name = match.groups()
-        item = ('%s:%s %s' % (bank, channels, name)).rstrip()
-        items = self.cbx_lists.GetItems()
-        if item in items:
-            return
-        # TB can start on either page; keep A, a, B, b, ... ordering.
-        bank_order = (bank.upper(), bank.islower())
-        position = len(items)
-        for index, existing in enumerate(items):
-            if re.match(r'[A-Ta-t]:', existing):
-                existing_order = (existing[0].upper(), existing[0].islower())
-                if existing_order > bank_order:
-                    position = index
-                    break
-        items.insert(position, item)
-        self.cbx_lists.SetItems(items)
+        count = int(channels)
+        if bank not in 'ABCDEFGHIJabcdefghij' or not 0 <= count <= 100:
+            raise ValueError('Invalid memory bank identifier/count')
+        previous = self.selected_memory_bank()
+        previous_index = self.cbx_lists.GetSelection()
+        self.memory_banks[bank] = {'bank': bank, 'channels': count, 'name': name.strip()}
+        self.cbx_lists.Clear()
+        for view in ('SEARCH BANKS', 'SELECT SCAN', 'PASS FREQS', 'LOG VIEW', 'DATABASE'):
+            self.cbx_lists.Append(view)
+        for identifier in sorted(self.memory_banks, key=lambda b: (b.upper(), b.islower())):
+            metadata = self.memory_banks[identifier]
+            label = metadata['name'] if metadata['name'] and metadata['name'] != identifier else '%s:%d' % (identifier, metadata['channels'])
+            index = self.cbx_lists.Append(label, metadata)
+            if previous and previous['bank'] == identifier:
+                self.cbx_lists.SetSelection(index)
+        if previous is None:
+            self.cbx_lists.SetSelection(previous_index if 0 <= previous_index < 5 else wx.NOT_FOUND)
+        self.sync_memory_choices()
 
     def set_memory_banks(self, item):
         """initializes and fills memory Bank ListControl
@@ -1264,33 +1903,29 @@ class AorCtrl(AorCtrlFrame):
         self.filling_banks = bool(self.pending_memory_channels)
 
     def set_search_banks(self, item):
-        """initializes and fills search Bank ListControl
-        """
-        columns = item.split(None, 7)
-        if not re.fullmatch(r'SR[A-Ta-t]', columns[0]):
-            raise ValueError('Invalid search bank')
-        if len(columns) != 1:
-            self.validate_fields(columns[1:6], ('SL', 'SU', 'ST', 'AU', 'MD'))
-            if len(columns) == 8 and columns[6].startswith('AT'):
-                self.validate_fields(columns[6:], ('AT', 'TT'))
-            elif len(columns) not in (7, 8) or not columns[6].startswith('TT'):
-                raise ValueError('Invalid search-bank name field')
-        self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
-        columns = [item[2:] for item in columns]
-
-        if len(columns) < 4:
-            self.edit_list.list.fill_line(self.row, columns)
-            self.row += 1
-            return
-        l1 = list(columns[1])
-        l1.insert(4, '.')
-        l2 = list(columns[2])
-        l2.insert(4, '.')
-        columns[1] = ''.join(l1)
-        columns[2] = ''.join(l2)
-
-        self.edit_list.list.fill_line(self.row, columns)
-        self.row += 1
+        entry = parse_search_bank_response(item)
+        bank = entry['bank']
+        self.search_banks[bank] = entry
+        index = next(index for index in range(self.search_bank_choice.GetCount())
+                     if self.search_bank_choice.GetClientData(index) == bank)
+        name = entry.get('name', '').strip()
+        self.search_bank_choice.SetString(index, '%s: %s' % (bank, name) if name and name != bank else bank)
+        if self.current_list_view() == 'SEARCH BANKS':
+            if bank not in self.search_bank_rows:
+                self.search_bank_rows[bank] = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), bank)
+            if entry['empty']:
+                values = (bank, '---', '---', '---', '---', '---', '---', '')
+            else:
+                values = (bank, '%.6f' % (entry['lower_hz'] / 1000000), '%.6f' % (entry['upper_hz'] / 1000000),
+                          format(entry['step_khz'], 'f'), str(int(entry['auto'])),
+                          self.cbx_mode.GetString(MD_TO_GUI_MODE[entry['mode']]), entry['attenuation'] or '---', entry['name'])
+            self.edit_list.list.fill_line(self.search_bank_rows[bank], values)
+        if bank in (self.edit_bank_pending, self.bank_write_pending):
+            self.edit_bank_pending = None
+            self.bank_write_pending = None
+            if self.search_bank_dialog is not None:
+                self.search_bank_dialog.show_bank(entry)
+            self.aor_status.SetStatusText('Search Bank %s read back from scanner' % bank)
 
     def set_vfo_text(self, text, vfx, active=True):
         data = text.split()[1:]
