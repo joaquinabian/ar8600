@@ -106,6 +106,16 @@ class BandscopeWindow(wx.Frame):
         self.centre_button.Bind(wx.EVT_BUTTON, self.on_centre)
         self.centre_input.Bind(wx.EVT_TEXT_ENTER, self.on_centre)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+        for control, tip in (
+                (self.start_button, 'Read successive bandscope sweeps, one at a time.'),
+                (self.stop_button, 'Stop automatic refresh after the pending sweep.'),
+                (self.refresh_button, 'Read one complete bandscope sweep.'),
+                (self.span_choice, 'Set the bandscope width and clear the previous trace.'),
+                (self.centre_input, 'Enter the bandscope centre frequency in MHz.'),
+                (self.centre_button, 'Set the bandscope centre; refresh to read a new trace.'),
+                (self.plot, 'Click to move the bandscope marker without tuning the receiver.')):
+            control.SetToolTip(tip)
+        self.set_controls_enabled(True)
 
     @property
     def pauses_lm(self):
@@ -142,8 +152,9 @@ class BandscopeWindow(wx.Frame):
         self.request_status(sweep=True)
 
     def set_controls_enabled(self, enabled):
-        self.start_button.Enable(enabled)
-        self.refresh_button.Enable(enabled)
+        self.start_button.Enable(enabled and self.available())
+        self.refresh_button.Enable(enabled and self.available())
+        self.stop_button.Enable(self.available())
         settings_enabled = enabled and self.entered and self.status is not None and self.available()
         self.span_choice.Enable(settings_enabled)
         self.centre_input.Enable(settings_enabled)
@@ -400,10 +411,10 @@ class AorCtrl(AorCtrlFrame):
     """Simple terminal program for wxPython"""
 
     def __init__(self, *args, **kwds):
-        self.serial = serial.Serial(baudrate=9600, bytesize=8, stopbits=2,
+        self.serial = serial.Serial(baudrate=19200, bytesize=8, stopbits=2,
                                     parity='N', rtscts=0, xonxoff=1)
 
-        self.serial.port = 'COM7'      # if serial is instantiated with port parameter, then it is opened
+        self.serial.port = 'COM14'     # if serial is instantiated with port parameter, then it is opened
         self.serial.timeout = 1        # make sure that the alive event can be checked from time to time
         self.thread = None
         self.row = 0
@@ -440,6 +451,117 @@ class AorCtrl(AorCtrlFrame):
         bandscope_action = view_menu.Append(wx.ID_ANY, 'BAND SCOPE...')
         self.GetMenuBar().Append(view_menu, 'View')
         self.Bind(wx.EVT_MENU, self.on_bandscope, id=bandscope_action.GetId())
+        bandscope_action.SetHelp('Open the bandscope viewer; connect to read scanner data.')
+        self.setup_usability()
+
+    def setup_usability(self):
+        toolbar = self.GetToolBar()
+        tools = [toolbar.GetToolByPos(index) for index in range(toolbar.GetToolsCount())]
+        for tool in tools:
+            name = tool.GetLabel()
+            if name == 'connect':
+                self.connect_tool_id = tool.GetId()
+            elif name == 'config':
+                self.config_tool_id = tool.GetId()
+                tool.SetLabel('Serial Config')
+                toolbar.SetToolShortHelp(tool.GetId(),
+                                        'Configure the serial port and baud rate (disconnects first).')
+            else:
+                label, tip = {
+                    'newlog': ('New Log', 'Create a log file (not implemented).'),
+                    'open': ('Open', 'Open a log file (not implemented).'),
+                    'upload': ('Upload', 'Upload data (not implemented).'),
+                }[name]
+                if name in ('newlog', 'open'):
+                    item = self.mfile.Append(tool.GetId(), label, tip)
+                    item.Enable(False)
+                    self.Bind(wx.EVT_MENU, self.log_new if name == 'newlog' else self.log_open,
+                              id=tool.GetId())
+                    toolbar.DeleteTool(tool.GetId())
+                else:
+                    tool.SetLabel(label)
+                    toolbar.SetToolShortHelp(tool.GetId(), tip)
+                    toolbar.EnableTool(tool.GetId(), False)
+        toolbar.Realize()
+        edit_index = self.GetMenuBar().FindMenu('Edit')
+        if edit_index != wx.NOT_FOUND and self.GetMenuBar().GetMenu(edit_index).GetMenuItemCount() == 0:
+            self.GetMenuBar().Remove(edit_index).Destroy()
+        for label in (self.lb_vfa, self.lb_vfb, self.lb_vfo):
+            label.SetLabel('----.-----')
+
+        self.aor_status.SetFieldsCount(2)
+        self.aor_status.SetStatusWidths([-1, 260])
+        self.aor_status.SetStatusText('Choose Serial Config, then Connect.')
+        for control, tip in (
+                (self.rb_vfos, 'Select the active receiver VFO.'),
+                (self.cbx_mode, 'Set the receiver modulation mode.'),
+                (self.cbx_step, 'Set the receiver tuning step in kHz.'),
+                (self.ckbx_auto, 'Enable automatic receiver settings for the tuned frequency.'),
+                (self.ckbx_att, 'Enable or disable the receiver attenuator.'),
+                (self.cbx_lists, 'Choose memory, search, Select Scan, pass-frequency or local log data.'),
+                (self.bt_refresh, 'Reload the selected list; for pass frequencies, choose a bank or VFO.'),
+                (self.bt_vfostart, 'Start searching with the current VFO.'),
+                (self.bt_vfostop, 'Stop the current VFO search.'),
+                (self.bt_start, 'Start Select Scan when SELECT SCAN is the selected list.'),
+                (self.bt_mkpassfreq, 'Add a frequency to the selected PASS FREQS context.'),
+                (self.edit_list.list, 'View the selected data; right-click a pass frequency for actions.'),
+                (self.activity_list, 'View the most recent receiver activity; LOG VIEW shows the full in-memory log.'),
+                (self.signal_gauge, 'Raw AR8600 signal level (0-255), without S-unit or dBm calibration.'),
+                (self.signal_text, 'Raw AR8600 signal level (0-255).'),
+                (self.squelch_text, 'OPEN means reception is audible; CLOSED means the squelch is muting it.'),
+                (self.tuning_panel.tune_freq, 'Enter a frequency in MHz; Enter applies it to the receiver.'),
+                (self.tuning_panel.tune_benter, 'Set the receiver frequency to the entered MHz value.'),
+                (self.tuning_panel.tune_back, 'Delete the last character of the frequency entry.'),
+                (self.tuning_panel.tune_bdot, 'Append a decimal point to the frequency entry.'),
+                (self.tuning_panel.tune_rev, 'Tune down using the current receiver step.'),
+                (self.tuning_panel.tune_forw, 'Tune up using the current receiver step.'),
+                (self.tuning_panel.tune_frev, 'Tune down using the receiver fast tuning control.'),
+                (self.tuning_panel.tune_ffor, 'Tune up using the receiver fast tuning control.')):
+            control.SetToolTip(tip)
+        for digit in range(10):
+            getattr(self.tuning_panel, 'tune_b%d' % digit).SetToolTip(
+                'Append %d to the frequency entry in MHz.' % digit)
+        # These existing controls have no application handler.
+        for control, tip in (
+                (self.ckbx_nl, 'Noise limiter control is not implemented.'),
+                (self.ckbx_afc, 'Automatic frequency control is not implemented.'),
+                (self.sql, 'Squelch adjustment is not implemented; the current state is shown below.'),
+                (self.cbx_scan, 'Scan-group selection is not implemented.'),
+                (self.bt_scgrp, 'Scan-group configuration is not implemented.'),
+                (self.ckbx_sel, 'Select Scan membership editing is not implemented.'),
+                (self.ckbx_pas, 'Memory pass-flag editing is not implemented.'),
+                (self.bt_stop, 'Scan Stop / Memory control is not implemented.'),
+                (self.cbx_search, 'Search-group selection is not implemented.'),
+                (self.bt_search, 'Search-group configuration is not implemented.')):
+            control.SetToolTip(tip)
+            control.Disable()
+        self.update_connection_ui()
+
+    def update_connection_ui(self):
+        port_open = self.serial.is_open and self.alive.is_set()
+        ready = port_open and self.connected
+        state = 'Connected' if ready else 'Connecting'
+        self.aor_status.SetStatusText(
+            '%s: %s @ %s baud' % (state, self.serial.port, self.serial.baudrate)
+            if port_open else 'Disconnected', 1)
+        toolbar = self.GetToolBar()
+        toolbar.FindById(self.connect_tool_id).SetLabel(
+            'Disconnect' if self.serial.is_open else 'Connect')
+        toolbar.SetToolShortHelp(self.connect_tool_id,
+                                'Disconnect from the AR8600.' if self.serial.is_open else
+                                'Connect to the AR8600 using the configured serial port.')
+        for control in (self.rb_vfos, self.cbx_mode, self.cbx_step, self.ckbx_auto,
+                        self.ckbx_att, self.bt_vfostart, self.bt_vfostop,
+                        self.tuning_panel.tune_benter, self.tuning_panel.tune_frev,
+                        self.tuning_panel.tune_rev, self.tuning_panel.tune_forw,
+                        self.tuning_panel.tune_ffor):
+            control.Enable(ready)
+        view = self.cbx_lists.GetStringSelection()
+        self.bt_refresh.Enable((ready and bool(view) and view != 'DATABASE') or view == 'LOG VIEW')
+        self.bt_start.Enable(ready and view == 'SELECT SCAN')
+        self.bt_mkpassfreq.Enable(ready and view == 'PASS FREQS')
+        if self.bandscope is not None:
+            self.bandscope.set_controls_enabled(self.bandscope.waiting is None)
 
     def on_bandscope(self, event):
         if self.bandscope is None:
@@ -476,6 +598,7 @@ class AorCtrl(AorCtrlFrame):
                     print('Serial read cancellation error: %s' % error, file=sys.stderr)
             self.thread.join()          # wait until thread has finished
             self.thread = None
+        self.update_connection_ui()
 
     def create_monitor_controls(self):
         panel = wx.Panel(self)
@@ -525,6 +648,7 @@ class AorCtrl(AorCtrlFrame):
     def on_lm_timer(self, event):
         if not self.connected or not self.serial.is_open or not self.alive.is_set():
             self.stop_monitoring()
+            self.update_connection_ui()
             return
         if self.lm_pending:
             return
@@ -604,12 +728,14 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
     def on_tool(self, evt):
-        tb = self.GetToolBar()
-        item = tb.FindById(evt.GetId())
-        if item.Label == 'config':
+        if evt.GetId() == self.config_tool_id:
             self.set_port()
-        elif item.Label == 'connect':
-            self.connect()
+        elif evt.GetId() == self.connect_tool_id:
+            if self.serial.is_open:
+                self.stop_thread()
+                self.close_serial()
+            else:
+                self.connect()
         else:
             print('some other tool pressed')
 
@@ -626,7 +752,8 @@ class AorCtrl(AorCtrlFrame):
             choose = menu.Append(wx.ID_ANY, 'Choose pass-frequency bank / VFO...')
             menu.Bind(wx.EVT_MENU, self.on_choose_pass_context, id=choose.GetId())
             remove = menu.Append(wx.ID_ANY, 'Remove pass frequency')
-            remove.Enable(entry is not None and entry['frequency_hz'] is not None
+            remove.Enable(self.connected and self.serial.is_open and self.alive.is_set()
+                          and entry is not None and entry['frequency_hz'] is not None
                           and entry['context'] != 'V')
             menu.Bind(wx.EVT_MENU, lambda evt: self.remove_pass_frequency(slot),
                       id=remove.GetId())
@@ -743,9 +870,15 @@ class AorCtrl(AorCtrlFrame):
             return
         comm = 'RF%010.5f\r\n' % freq
         self.write_serial(comm.encode("ascii"))
+        self.write_serial(b'RX\r\n')
 
     def on_select_list(self, evt):
         selection = self.cbx_lists.GetStringSelection()
+        self.update_connection_ui()
+        if selection not in ('LOG VIEW', 'DATABASE') and not (
+                self.connected and self.serial.is_open and self.alive.is_set()):
+            self.aor_status.SetStatusText('Connect to read scanner lists; LOG VIEW is available offline.')
+            return
         self.filling_banks = False
         self.pending_memory_channels.clear()
         print(selection)
@@ -831,6 +964,8 @@ class AorCtrl(AorCtrlFrame):
         if received_valid and self.serial.is_open and self.alive.is_set() and not self.connected:
             self.connected = True
             self.start_monitoring()
+            self.aor_status.SetStatusText('Select a VFO or list, or enter a frequency in MHz.')
+            self.update_connection_ui()
 
     def write_serial(self, data):
         try:
@@ -845,6 +980,10 @@ class AorCtrl(AorCtrlFrame):
             self.serial.close()
         except serial.SerialException as error:
             print('Serial close error: %s' % error, file=sys.stderr)
+        self.update_connection_ui()
+        if not self.serial.is_open:
+            self.SetTitle('Serial Terminal')
+            self.aor_status.SetStatusText('Choose Serial Config, then Connect.')
 
     def validate_fields(self, fields, prefixes):
         if len(fields) != len(prefixes):
@@ -920,6 +1059,7 @@ class AorCtrl(AorCtrlFrame):
                 )
             )
             self.connected = False
+            self.update_connection_ui()
             self.memory_banks = []
             self.write_serial('RX\r\n'.encode("ascii"))
             self.write_serial('TB\r\n'.encode("ascii"))

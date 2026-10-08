@@ -98,7 +98,7 @@ class AorCtrlFrame(wx.Frame):
         aor_status_fields = ["frame_1_statusbar"]
         for i in range(len(aor_status_fields)):
             self.aor_status.SetStatusText(aor_status_fields[i], i)
-        self.aor_toolbar.SetToolBitmapSize((5, 5))
+        self.aor_toolbar.SetToolBitmapSize((32, 32))
         self.aor_toolbar.Realize()
         self.rb_vfos.SetMinSize((78, 100))
         self.rb_vfos.SetSelection(0)
