@@ -185,7 +185,7 @@ def parse_lm_response(text):
 def parse_lc_response(text):
     """Parse LC1 activity, whose signal level is decimal, not hexadecimal."""
     match = re.fullmatch(
-        r'LC(%?)([0-9]{3}) (V[ABF]|SR[A-Ta-t]|M[A-Ta-t][0-9]{2})'
+        r'LC(%?)([0-9]{3}) (V[ABF]|SR[A-Ta-t]|MX?[A-Ta-t][0-9]{2})'
         r'(?: RF([0-9]{10}|[0-9]{4}\.[0-9]{4,5}))?', text)
     if match is None:
         raise ValueError('Invalid LC activity response')
@@ -198,7 +198,7 @@ def parse_lc_response(text):
     elif context.startswith('SR'):
         source, identifier = 'Search', context[2:]
     else:
-        source, identifier = 'Memory', context[1:]
+        source, identifier = 'Memory', context[2:] if context.startswith('MX') else context[1:]
     frequency_hz = None
     if frequency is not None:
         frequency_hz = Decimal(frequency)
@@ -271,6 +271,67 @@ def parse_level_squelch_response(text):
     if match is None or int(match.group(1)) > 255:
         raise ValueError('Invalid DB level squelch response')
     return int(match.group(1))
+
+
+# XM is a protocol-code selector, not an index in the main GUI mode list.
+# The English XM table repeats WFM at code 7; WAM is the inferred correction
+# consistent with its nine supported scan modes. XM7 needs specific hardware confirmation.
+SCAN_FILTER_MODES = ('All', 'WFM', 'NFM', 'AM', 'USB', 'LSB', 'CW', 'SFM', 'WAM', 'NAM')
+SCAN_FILTER_CODES = ('F', '0', '1', '2', '3', '4', '5', '6', '7', '8')
+
+
+def parse_operation_parameter(text):
+    match = re.fullmatch(r'([DXS][ABDP]|XM)[ +]?([0-9.]+|FF|F)', text)
+    if match is None:
+        raise ValueError('Invalid scan/search parameter response')
+    key, raw = match.groups()
+    if key == 'XM':
+        if raw not in SCAN_FILTER_CODES:
+            raise ValueError('Invalid mode filter')
+        value = raw
+    elif key[1] in 'AB':
+        if not re.fullmatch(r'[0-9]{3}', raw) or int(raw) > 255:
+            raise ValueError('Invalid squelch threshold')
+        value = int(raw)
+    elif key[1] == 'D':
+        if raw == 'FF' and key != 'XD':
+            value = 'Hold'
+        elif re.fullmatch(r'[0-9]\.[0-9]', raw):
+            value = int(Decimal(raw) * 10)
+        elif re.fullmatch(r'[0-9]{2}', raw):
+            value = int(raw)
+        else:
+            raise ValueError('Invalid resume delay')
+    else:
+        if not re.fullmatch(r'[0-9]{2}', raw):
+            raise ValueError('Invalid maximum dwell')
+        value = int(raw)
+    return key, value
+
+
+def operation_parameter_command(key, value):
+    if key == 'XM':
+        if value not in SCAN_FILTER_CODES:
+            raise ValueError('Invalid mode filter')
+        raw = value
+    elif key[1] in 'AB':
+        if not isinstance(value, int) or not 0 <= value <= 255:
+            raise ValueError('Threshold must be Off or 1-255')
+        raw = '%03d' % value
+    elif key[1] == 'D':
+        if value == 'Hold' and key in ('DD', 'SD'):
+            raw = 'FF'
+        elif isinstance(value, int) and 0 <= value <= 99:
+            raw = '%02d' % value
+        else:
+            raise ValueError('Resume delay must be Off, 0.1-9.9 s, or supported Hold')
+    elif key[1] == 'P' and isinstance(value, int) and 0 <= value <= 60:
+        raw = '%02d' % value
+    else:
+        raise ValueError('Maximum dwell must be Off or 1-60 s')
+    if key not in ('DA', 'DB', 'DD', 'DP', 'XA', 'XB', 'XD', 'XM', 'XP', 'SA', 'SB', 'SD', 'SP'):
+        raise ValueError('Unknown scan/search parameter')
+    return (key + raw + '\r\n').encode('ascii')
 
 
 def receiver_frequency_hz(value):

@@ -34,6 +34,16 @@ class MemoryTableModel(dv.DataViewIndexListModel):
     def IsEnabledByRow(self, row, col):
         return col not in (1, 2) or self.controller.memory_flags_editable(self.channels[row])
 
+    def GetAttrByRow(self, row, col, attr):
+        if self.channels[row] != self.controller.receiving_channel:
+            return False
+        colour = wx.SystemSettings.GetColour(wx.SYS_COLOUR_HIGHLIGHT)
+        background = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+        attr.SetBackgroundColour(wx.Colour(*[(colour[i] + 4 * background[i]) // 5 for i in range(3)]))
+        if col == 8:
+            attr.SetBold(True)
+        return True
+
     def SetValueByRow(self, value, row, col):
         if col in (1, 2) and self.IsEnabledByRow(row, col):
             self.controller.toggle_memory_flag(self.channels[row], 'select' if col == 1 else 'skip')
@@ -101,11 +111,24 @@ class EditListCtrlPanel(wx.Panel):
                 self.memory.AppendToggleColumn(label, index, mode=dv.DATAVIEW_CELL_ACTIVATABLE, width=width)
             else:
                 self.memory.AppendTextColumn(label, index, width=width)
-        self.memory.SetToolTip('Selected: Include this memory channel in Lists -> SELECTED CHANNELS (AR8600 Select Scan).\n'
-                               'Skip: Skip this memory channel during Stored Channels scanning (AR8600 memory PASS flag).\n'
-                               'Blank or disabled toggles are awaiting scanner state/read-back.')
+        self.memory.Bind(wx.EVT_MOTION, self.on_memory_hover)
+        self.memory.Bind(wx.EVT_LEAVE_WINDOW, self.on_memory_leave)
         self.memory.Hide()
         self.GetSizer().Add(self.memory, 1, wx.EXPAND)
+
+    def on_memory_hover(self, event):
+        item, column = self.memory.HitTest(event.GetPosition())
+        tip = {1: 'Include this channel in Selected Channels.',
+               2: 'Skip this channel during Stored Channels scanning.'}.get(
+                   column.GetModelColumn() if item.IsOk() and column is not None else -1, '')
+        current = self.memory.GetToolTipText()
+        if tip != current:
+            self.memory.SetToolTip(tip) if tip else self.memory.UnsetToolTip()
+        event.Skip()
+
+    def on_memory_leave(self, event):
+        self.memory.UnsetToolTip()
+        event.Skip()
 
     def show_memory(self, show):
         self.list.Show(not show)

@@ -17,7 +17,9 @@ from aor_functions import (do_nothing, format_frequency, display_frequency, disp
                            parse_bandscope_status, BandscopeSweep, bandscope_frequency,
                            BANDSCOPE_SPAN_LABELS, bandscope_centre_command, bandscope_marker_frequency)
 from aor_functions import (search_parameters, make_search_bank_command, parse_search_bank_response,
-                           parse_group_members, make_group_members_command)
+                           parse_group_members, make_group_members_command,
+                           parse_operation_parameter, operation_parameter_command,
+                           SCAN_FILTER_MODES, SCAN_FILTER_CODES)
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -687,6 +689,161 @@ class SearchBankDialog(wx.Dialog):
 
 
 # noinspection PyUnusedLocal
+class OperationSettingsDialog(wx.Dialog):
+    """One confirmed scanner context; Save writes changed fields and reads back."""
+    def __init__(self, controller, family, group):
+        super().__init__(controller, title='Operation Settings')
+        self.controller, self.family, self.group = controller, family, group
+        self.context_confirmed = family == 'D'
+        self.values, self.expected = {}, None
+        self.controls, self.options = {}, {}
+        self.context_label = wx.StaticText(self, label='Reading scanner context...')
+        self.message = wx.StaticText(self, label='Reading current settings...', size=(360, 45))
+        grid = wx.FlexGridSizer(0, 2, 8, 10)
+        fields = [('D', 'Resume delay', ['Off'] + (['Hold'] if family != 'X' else []) +
+                   ['%.1f s' % (n / 10) for n in range(1, 100)],
+                   [0] + (['Hold'] if family != 'X' else []) + list(range(1, 100)),
+                   'Wait after the signal disappears and squelch closes before resuming. '+family+'D.'),
+                  ('P', 'Maximum dwell', ['Off'] + ['%d s' % n for n in range(1, 61)],
+                   list(range(61)), 'Continue after this time even if the signal remains active. '+family+'P / FREE.'),
+                  ('B', 'Signal threshold', ['Off'] + [str(n) for n in range(1, 256)],
+                   list(range(256)), 'Ignore signals below this raw level; 0 disables it. '+family+'B.'),
+                  ('A', 'Voice threshold', ['Off'] + [str(n) for n in range(1, 256)],
+                   list(range(256)), 'Require sufficient detected audio/voice; 0 disables it. '+family+'A.')]
+        if family == 'X':
+            fields.append(('M', 'Mode filter', SCAN_FILTER_MODES, SCAN_FILTER_CODES,
+                           'AR8600 XM: scan all modes or only the selected modulation.'))
+        for suffix, label, labels, values, tip in fields:
+            key = family + suffix
+            control = wx.Choice(self, choices=list(labels), size=(150, -1))
+            control.SetToolTip(tip)
+            control.Disable()
+            self.controls[key], self.options[key] = control, list(values)
+            control.Bind(wx.EVT_CHOICE, self.on_changed)
+            grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(control, 0, wx.EXPAND)
+        self.save = wx.Button(self, label='Save settings')
+        self.refresh = wx.Button(self, label='Read settings')
+        close = wx.Button(self, wx.ID_CLOSE, 'Close')
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        for button in (self.save, self.refresh, close):
+            buttons.Add(button, 0, wx.RIGHT, 6)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        for item in (self.context_label, grid, self.message, buttons):
+            sizer.Add(item, 0, wx.EXPAND | wx.ALL, 10)
+        self.SetSizerAndFit(sizer)
+        self.save.Disable()
+        self.save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.refresh.Bind(wx.EVT_BUTTON, self.read)
+        close.Bind(wx.EVT_BUTTON, lambda event: self.Close())
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timeout, self.timer)
+
+    def read(self, event=None):
+        self.values.clear()
+        self.context_confirmed = self.family == 'D'
+        self.save.Disable()
+        for control in self.controls.values():
+            control.Disable()
+        self.message.SetLabel('Reading scanner settings...')
+        self.refresh.Disable()
+        prefix = 'GM' if self.family == 'X' else 'GS'
+        command = b''
+        if self.family != 'D':
+            command = (('%s%d\r\n' % (prefix, self.group)) if self.group is not None else '').encode('ascii')
+            command += (prefix + '\r\n').encode('ascii')
+        else:
+            command = ''.join(key + '\r\n' for key in self.controls).encode('ascii')
+        self.timer.StartOnce(5000)
+        if self.controller.write_serial(command) != len(command):
+            self.on_timeout(None)
+
+    def accept_context(self, kind, group):
+        if ('X' if kind == 'scan' else 'S') != self.family:
+            return
+        if self.group is not None and self.group != group:
+            self.message.SetLabel('Scanner returned a different group; settings remain locked.')
+            self.context_confirmed = False
+            return
+        self.group, self.context_confirmed = group, True
+        self.update()
+
+    def accept(self, key, value):
+        if key not in self.controls:
+            return
+        self.values[key] = value
+        # Do not invent a selectable value for an out-of-range scanner setting.
+        self.controls[key].SetSelection(self.options[key].index(value) if value in self.options[key] else wx.NOT_FOUND)
+        self.update()
+
+    def update(self):
+        complete = self.context_confirmed and set(self.values) == set(self.controls)
+        self.context_label.SetLabel('Scan Group 0 — factory defaults, read only' if self.family == 'X' and self.group == 0 else
+                                   'Applies to Manual Range / VFO (DB also controls Level Squelch)' if self.family == 'D' else
+                                   'Applies to %s group %s%s' %
+                                   ('Linked Memory Banks' if self.family == 'X' else 'Linked Ranges',
+                                    self.group, ' - fixed, read-only' if self.group == 0 else ''))
+        if not complete:
+            return
+        self.timer.Stop()
+        self.refresh.Enable()
+        for control in self.controls.values():
+            control.Enable(self.family == 'D' or self.group != 0)
+        if self.expected is not None:
+            matched = all(self.values[key] == value for key, value in self.expected.items())
+            self.message.SetLabel('Settings saved and verified.' if matched else
+                                  'Verification failed; controls show scanner-returned values.')
+            self.expected = None
+        else:
+            self.message.SetLabel('Current scanner settings.' if self.family == 'D' or self.group != 0 else
+                                  'Group 0 is fixed and read-only.')
+        self.on_changed(None)
+
+    def proposed(self):
+        if any(control.GetSelection() == wx.NOT_FOUND for control in self.controls.values()):
+            raise ValueError('Choose a supported value for every setting before saving.')
+        return {key: self.options[key][control.GetSelection()] for key, control in self.controls.items()}
+
+    def on_changed(self, event):
+        try:
+            changed = self.proposed() != self.values
+        except ValueError:
+            changed = False
+        self.save.Enable(self.context_confirmed and len(self.values) == len(self.controls) and
+                         (self.family == 'D' or self.group != 0) and changed and self.expected is None)
+
+    def on_save(self, event):
+        if not self.save.IsEnabled():
+            return
+        proposed = self.proposed()
+        changed = {key: value for key, value in proposed.items() if self.values[key] != value}
+        command = b''.join(operation_parameter_command(key, value) for key, value in changed.items())
+        if self.family != 'D':
+            command = ('%s%d\r\n' % ('GM' if self.family == 'X' else 'GS', self.group)).encode('ascii') + command
+        self.expected = proposed
+        if self.controller.write_serial(command) != len(command):
+            self.expected = None
+            self.message.SetLabel('Write failed; read settings before retrying.')
+            self.save.Disable()
+            return
+        self.read()
+
+    def on_timeout(self, event):
+        self.timer.Stop()
+        self.expected = None
+        self.save.Disable()
+        self.refresh.Enable(self.controller.connected)
+        self.message.SetLabel('Settings read-back failed or timed out; values were not assumed.')
+        print('Scan/search settings read-back failed or timed out', file=sys.stderr)
+
+    def on_close(self, event):
+        self.timer.Stop()
+        self.controller.settings_dialog = None
+        self.controller.update_connection_ui()
+        self.Destroy()
+
+
 class AorCtrl(AorCtrlFrame):
     """Simple terminal program for wxPython"""
 
@@ -727,6 +884,13 @@ class AorCtrl(AorCtrlFrame):
         self.memory_rows = {}
         self.memory_select_read = None
         self.memory_flag_edit = None
+        self.memory_flag_cells_pending = False
+        self.monitor_muted = False
+        self.settings_dialog = None
+        self.receiver_status = None
+        self.receiving_channel = None
+        self.vfo_channel = None
+        self.operation_signal_open = False
         self.alive = threading.Event()
         self.lm_pending = False
         self.lc_enabled = False
@@ -740,6 +904,17 @@ class AorCtrl(AorCtrlFrame):
         self.bandscope = None
         AorCtrlFrame.__init__(self, *args, **kwds)
         self.edit_list.create_memory_view(self)
+
+        self.now_panel = wx.Panel(self)
+        now_sizer = wx.StaticBoxSizer(wx.VERTICAL, self.now_panel, 'Now Receiving')
+        self.now_text = wx.StaticText(self.now_panel, label='—')
+        now_sizer.Add(self.now_text, 0, wx.EXPAND | wx.ALL, 4)
+        self.now_panel.SetSizer(now_sizer)
+        self.GetSizer().Insert(1, self.now_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        self.bt_settings = wx.Button(self.operation_panel, label='Settings...')
+        # Keep the existing common operation buttons in one compact row.
+        self.bt_start.GetContainingSizer().Add(self.bt_settings, 0, wx.LEFT, 5)
+        self.bt_settings.SetToolTip('Read and edit timing and signal acceptance settings for this operation/context.')
 
         self.create_monitor_controls()
         self.lm_timer = wx.Timer(self)
@@ -873,23 +1048,31 @@ class AorCtrl(AorCtrlFrame):
                         self.tuning_panel.tune_benter, self.tuning_panel.tune_frev,
                         self.tuning_panel.tune_rev, self.tuning_panel.tune_forw,
                         self.tuning_panel.tune_ffor):
-            control.Enable(ready and self.memory_flag_edit is None)
-        self.cbx_lists.Enable(self.memory_flag_edit is None)
-        self.operation_choice.Enable(self.memory_flag_edit is None)
-        self.source_choice.Enable(self.memory_flag_edit is None)
-        self.sql.Enable(ready and self.level_squelch_value is not None and not self.level_squelch_pending and self.memory_flag_edit is None)
-        self.edit_list.memory.Refresh()
+            control.Enable(ready)
+        self.cbx_lists.Enable()
+        self.operation_choice.Enable()
+        self.source_choice.Enable()
+        self.sql.Enable(ready and self.level_squelch_value is not None and not self.level_squelch_pending)
+        self.bt_settings.Enable(ready and self.active_operation is None)
+        if not port_open:
+            self.receiver_status = None
+            self.vfo_channel = None
+            self.show_now_receiving()
+        pending = self.memory_flag_edit is not None
+        if pending != self.memory_flag_cells_pending:
+            self.memory_flag_cells_pending = pending
+            # Tell the model that only the flag cells' editability changed.
+            for row in range(len(self.edit_list.memory_model.channels)):
+                self.edit_list.memory_model.RowChanged(row)
         view = self.current_list_view()
         self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view == 'LOG VIEW')
-        if self.memory_flag_edit is not None:
-            self.bt_refresh.Disable()
         self.bt_start.Enable(ready)
         self.update_operation_ui()
         self.bt_mkpassfreq.Enable(ready and view == 'PASS FREQS')
         self.bt_mkpassfreq.Show(view == 'PASS FREQS')
         self.panel_1.Layout()
         if self.bandscope is not None:
-            self.bandscope.set_controls_enabled(self.bandscope.waiting is None and self.memory_flag_edit is None)
+            self.bandscope.set_controls_enabled(self.bandscope.waiting is None)
 
     def on_bandscope(self, event):
         if self.memory_flag_edit is not None:
@@ -911,7 +1094,7 @@ class AorCtrl(AorCtrlFrame):
 
     def update_operation_ui(self):
         operation, source = self.operation_selection()
-        ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_flag_edit is None
+        ready = self.connected and self.serial.is_open and self.alive.is_set()
         tips = {'Current Bank': 'Memory Bank: a stored collection of individual memory channels. Scan only the selected bank.',
                 'Scan Group': 'AR8600 Scan Group: several Memory Banks linked for scanning.',
                 'Select Scan': 'AR8600 Select Scan: only memory channels explicitly selected; memory PASS flags are ignored.',
@@ -935,6 +1118,13 @@ class AorCtrl(AorCtrlFrame):
             control.Enable(ready and idle and panel is selected and self.group_loading[kind] is None)
         self.bt_start.Enable(ready and idle)
         self.bt_stop.Enable(ready)
+        self.bt_settings.Enable(ready and idle)
+        if self.settings_dialog is not None:
+            self.bt_start.Disable()
+            self.operation_choice.Disable()
+            self.source_choice.Disable()
+            for panel in panels:
+                panel.Disable()
         self.operation_panel.Layout()
         self.panel_1.Layout()
         self.Layout()
@@ -1025,6 +1215,8 @@ class AorCtrl(AorCtrlFrame):
             started = self.on_group_search(event)
         if started:
             self.active_operation = (operation, source)
+            self.operation_signal_open = False
+            self.show_now_receiving()
             self.aor_status.SetStatusText('%s started: %s' % (operation, source))
             self.update_operation_ui()
 
@@ -1038,7 +1230,186 @@ class AorCtrl(AorCtrlFrame):
         else:
             self.write_serial(self.normal_vfo_command() + b'RX\r\n')
         self.active_operation = None
+        self.operation_signal_open = False
+        self.receiver_status = None
+        self.show_now_receiving()
         self.update_operation_ui()
+
+    def open_operation_settings(self, event):
+        if self.settings_dialog is not None:
+            self.settings_dialog.Raise()
+            return
+        if not self.connected or self.memory_flag_edit is not None or self.active_operation is not None:
+            return
+        operation, source = self.operation_selection()
+        family = 'X' if operation == 'Memory Scan' else 'D' if source == 'Range' else 'S'
+        group = (0 if source == 'Current Bank' else int(self.cbx_scan.GetValue()) if source == 'Scan Group' else
+                 int(self.cbx_search.GetValue()) if source == 'Search Group' else None)
+        self.settings_dialog = OperationSettingsDialog(self, family, group)
+        self.settings_dialog.Show()
+        self.settings_dialog.read()
+        self.update_connection_ui()
+
+    def accept_operation_parameter(self, text):
+        key, value = parse_operation_parameter(text)
+        if key == 'DB':
+            self.level_squelch_value = value
+            self.level_squelch_pending = False
+            self.sql.SetValue(value)
+            self.sql_value.SetLabel('Off' if value == 0 else str(value))
+            self.update_connection_ui()
+        if self.settings_dialog is not None:
+            self.settings_dialog.accept(key, value)
+
+    def show_now_receiving(self):
+        previous = self.receiving_channel
+        self.receiving_channel = None
+        moving = self.active_operation is not None and not self.operation_signal_open
+        state = self.receiver_status
+        if not self.connected or not self.serial.is_open or state is None and not moving:
+            text = '—'
+        elif moving:
+            text = 'Scanning...' if self.active_operation[0] == 'Memory Scan' else 'Searching...'
+        else:
+            channel = state.get('channel')
+            name = state.get('name', '')
+            identity = self.vfo_channel
+            if (not channel and identity is not None and identity['confirmed'] and
+                    all(state.get(key) is None or state[key] == value
+                        for key, value in identity['expected'].items())):
+                channel, name = identity['channel'], identity['name']
+            if channel:
+                text = channel + (' — ' + name if name else '')
+                self.receiving_channel = channel
+            else:
+                text = '—'
+        self.now_text.SetLabel(text)
+        self.now_text.SetForegroundColour(wx.SystemSettings.GetColour(
+            wx.SYS_COLOUR_GRAYTEXT if moving else wx.SYS_COLOUR_WINDOWTEXT))
+        for channel in (previous, self.receiving_channel):
+            if channel in self.memory_rows:
+                self.show_memory_flags(channel)
+
+    def clear_vfo_channel(self):
+        """A manual receiver change ends the explicit memory-to-VFO association."""
+        self.vfo_channel = None
+        self.show_now_receiving()
+
+    def receive_context_status(self, text):
+        """Only called for validated active RX statuses, never cached/background VFOs."""
+        if self.monitor_muted:
+            return
+        memory = text.startswith(('MR ', 'MS ', 'SM '))
+        fields = text.split(None, 8)[1:] if memory else text.split(None, 6)[1:] if re.match(r'SR[A-Ta-t] RF', text) else text.split()[1:]
+        if text.startswith(('VS ', 'VV ')):
+            fields = fields[1:]
+        values = {field[:2]: field[2:] for field in fields}
+        state = {'context': {'VA': 'VFO-A', 'VB': 'VFO-B', 'VF': 'VFO'}.get(text[:2], text.split()[0]),
+                 'frequency_hz': protocol_frequency_hz(values['RF']),
+                 'step_hz': protocol_step_hz(values['ST']), 'mode': int(values['MD']),
+                 'auto': int(values['AU']), 'attenuator': int(values['AT']),
+                 'channel': values.get('MX'), 'name': values.get('TM', values.get('TT', ''))}
+        identity = self.vfo_channel
+        if identity is not None:
+            if any(state[key] != value for key, value in identity['expected'].items()):
+                self.vfo_channel = None
+            else:
+                # With Auto on, the first RX supplies the scanner's chosen mode/step.
+                identity['expected'].update(mode=state['mode'], step_hz=state['step_hz'])
+                identity['confirmed'] = True
+        if (self.active_operation is not None and self.operation_signal_open and
+                self.receiver_status is not None and
+                (state['channel'], state['frequency_hz']) !=
+                (self.receiver_status.get('channel'), self.receiver_status['frequency_hz'])):
+            # A moving RX cursor is not a new squelch-open/paused-channel event.
+            self.operation_signal_open = False
+        self.receiver_status = state
+        if text.startswith(('MS ', 'SM ', 'VS ', 'VV ')) or re.match(r'SR[A-Ta-t] RF', text):
+            if self.active_operation is None:
+                self.active_operation = ('Memory Scan', 'Current Bank') if memory else ('Frequency Search', 'Search Bank')
+            # An RX scan cursor alone does not prove that reception is paused.
+        elif text.startswith(('VA ', 'VB ', 'VF ', 'MR ')):
+            self.active_operation = None
+            self.operation_signal_open = False
+        self.show_now_receiving()
+
+    def receive_activity_context(self, activity):
+        if self.monitor_muted:
+            return
+        if self.active_operation is not None and self.active_operation[0] == 'Memory Scan' and activity['source'] != 'Memory':
+            return  # Ignore a preceding VFO's queued LC event while scan starts.
+        was_open = self.operation_signal_open
+        if self.active_operation is not None:
+            self.operation_signal_open = activity['squelch_open']
+        if activity['squelch_open']:
+            channel = activity['source_id'] if activity['source'] == 'Memory' else None
+            context = ('VFO-' + activity['source_id'] if activity['source'] == 'VFO' and activity['source_id'] in ('A', 'B') else
+                       'VFO' if activity['source'] == 'VFO' else 'Stored Range ' + activity['source_id'])
+            cached = self.memory_rows.get(channel)
+            fields = cached['fields'] if cached else None
+            state = {'context': context, 'channel': channel, 'frequency_hz': activity['frequency_hz'],
+                     'name': fields[7] if fields else '', 'mode': None, 'step_hz': None}
+            if fields and protocol_frequency_hz(fields[2]) == activity['frequency_hz']:
+                state.update(mode=int(fields[5]), step_hz=protocol_step_hz(fields[3]))
+            elif self.receiver_status is not None and (self.receiver_status['context'], self.receiver_status['frequency_hz']) == (context, activity['frequency_hz']):
+                state.update(mode=self.receiver_status['mode'], step_hz=self.receiver_status['step_hz'])
+            self.receiver_status = state
+            if state['mode'] is None or channel and not was_open and self.active_operation is not None:
+                # One RX on an LC1 open supplies details absent from LC; no new polling.
+                self.write_serial(b'RX\r\n')
+        self.show_now_receiving()
+
+    def on_memory_activate(self, event):
+        if not event.GetItem().IsOk() or event.GetColumn() in (1, 2):
+            return
+        channel = self.edit_list.memory_model.channels[self.edit_list.memory_model.GetRow(event.GetItem())]
+        self.tune_memory_channel(channel)
+
+    def on_memory_double_click(self, event):
+        item, column = self.edit_list.memory.HitTest(event.GetPosition())
+        if not item.IsOk() or column is None or column.GetModelColumn() in (0, 1, 2):
+            event.Skip()  # Channel uses native activation; toggle columns keep their own behavior.
+            return
+        # Windows native item activation is limited to the primary column.
+        channel = self.edit_list.memory_model.channels[self.edit_list.memory_model.GetRow(item)]
+        self.tune_memory_channel(channel)
+
+    def tune_memory_channel(self, channel):
+        if (not self.connected or not self.serial.is_open or not self.alive.is_set() or
+                self.filling_banks or self.memory_select_read is not None or self.memory_flag_edit is not None or
+                self.monitor_muted or self.active_operation is not None or self.settings_dialog is not None or
+                self.background_vfo is not None or
+                self.bandscope is not None and (self.bandscope.entered or self.bandscope.waiting is not None)):
+            return
+        fields = self.memory_rows[channel]['fields']
+        frequency, step, auto, mode, att = fields[2:7]
+        context = self.normal_vfo_command()
+        self.clear_vfo_channel()
+        expected = {'context': {b'VA\r\n': 'VFO-A', b'VB\r\n': 'VFO-B', b'VF\r\n': 'VFO'}[context],
+                    'frequency_hz': protocol_frequency_hz(frequency), 'auto': int(auto), 'attenuator': int(att)}
+        if auto == '0':
+            expected.update(mode=int(mode), step_hz=protocol_step_hz(step))
+        self.vfo_channel = {'channel': channel, 'name': fields[7], 'expected': expected, 'confirmed': False}
+        command = context + ('RF%s\r\nAT%s\r\n' % (frequency, att)).encode('ascii')
+        command += (b'AU1\r\n' if auto == '1' else ('AU0\r\nMD%s\r\nST%s\r\n' % (mode, step)).encode('ascii'))
+        self.monitor_muted = True
+        try:
+            if self.write_serial(b'MC1\r\n' + command) != len(command) + 5:
+                self.vfo_channel = None
+                self.aor_status.SetStatusText('Channel tuning write failed; requesting actual receiver state.')
+        finally:
+            self.release_monitor_mute()
+            if self.serial.is_open:
+                self.write_serial(b'RX\r\n')
+
+    def release_monitor_mute(self):
+        if self.monitor_muted and self.serial.is_open:
+            if self.write_serial(b'MC0\r\n') != 5:
+                print('Could not release temporary monitor mute (MC0)', file=sys.stderr)
+                self.aor_status.SetStatusText('MC0 failed: temporary squelch mute could not be released. See serial diagnostics.')
+                return False
+        self.monitor_muted = False
+        return True
 
     def start_thread(self):
         """Start the receiver thread"""
@@ -1088,8 +1459,11 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
-        if self.memory_flag_edit is not None and self.memory_flag_edit['restore'] is not None and self.serial.is_open:
-            self.write_serial(self.memory_flag_edit['restore'] + b'RX\r\n')
+        if self.memory_flag_edit is not None and self.memory_flag_edit['restore'] is not None and not self.memory_flag_edit.get('restored') and self.serial.is_open:
+            self.write_serial(self.memory_flag_edit['restore'])
+        self.release_monitor_mute()
+        if self.settings_dialog is not None:
+            self.settings_dialog.Close()
         if self.bandscope is not None:
             self.bandscope.disconnect()
         self.stop_monitoring()
@@ -1173,6 +1547,8 @@ class AorCtrl(AorCtrlFrame):
             return
         if self.lm_pending:
             return
+        if self.monitor_muted:
+            return
         if self.bandscope is not None and self.bandscope.pauses_lm:
             return
         self.lm_pending = True
@@ -1184,6 +1560,9 @@ class AorCtrl(AorCtrlFrame):
         self.signal_gauge.SetValue(level)
         self.signal_text.SetLabel('Signal: %d / 255' % level)
         self.squelch_text.SetLabel('Squelch: %s' % ('OPEN' if squelch_open else 'CLOSED'))
+        if self.active_operation is not None and not squelch_open and not self.monitor_muted:
+            self.operation_signal_open = False
+            self.show_now_receiving()
 
     def set_signal_level(self, text):
         self.lm_pending = False
@@ -1206,6 +1585,7 @@ class AorCtrl(AorCtrlFrame):
                 activity['duration'] = stamp - started
                 self.active_transmission = None
         self.update_signal(activity['level'], activity['squelch_open'])
+        self.receive_activity_context(activity)
         if len(self.activity_events) == self.activity_events.maxlen:
             self.activity_list.DeleteItem(0)
         self.activity_events.append(activity)
@@ -1233,6 +1613,9 @@ class AorCtrl(AorCtrlFrame):
         self.cbx_lists.Bind(wx.EVT_MOUSEWHEEL, do_nothing)
         self.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.open_menu, self.edit_list.list)
         self.edit_list.memory.Bind(dv.EVT_DATAVIEW_ITEM_CONTEXT_MENU, self.on_memory_context_menu)
+        self.edit_list.memory.Bind(dv.EVT_DATAVIEW_ITEM_ACTIVATED, self.on_memory_activate)
+        self.edit_list.memory.Bind(wx.EVT_LEFT_DCLICK, self.on_memory_double_click)
+        self.bt_settings.Bind(wx.EVT_BUTTON, self.open_operation_settings)
         self.sql.Bind(wx.EVT_SLIDER, self.on_level_squelch_change)
         self.tuning_panel.tune_arrows.Bind(wx.EVT_BUTTON, self.on_move_frequency)
         self.Bind(wx.EVT_BUTTON, self.on_enter_freq, self.tuning_panel.tune_benter)
@@ -1320,10 +1703,12 @@ class AorCtrl(AorCtrlFrame):
         else:
             return
 
+        self.clear_vfo_channel()
         self.write_serial(func.encode("ascii"))
         self.write_serial('RX\r\n'.encode("ascii"))
 
     def on_auto(self, evt):
+        self.clear_vfo_channel()
         if self.ckbx_auto.IsChecked():
             self.write_serial('AU1\r\nRX\r\n'.encode("ascii"))
         else:
@@ -1333,6 +1718,7 @@ class AorCtrl(AorCtrlFrame):
         """Changes Attenuation ON/OFF
         """
         att = 1 if self.ckbx_att.IsChecked() else 0
+        self.clear_vfo_channel()
         self.write_serial(('AT%s\r\n' % att).encode("ascii"))
 
     def on_select_vfo(self, evt):
@@ -1361,6 +1747,8 @@ class AorCtrl(AorCtrlFrame):
                 comm.append('RX\r\n')
 
         towrite = ''.join(comm)
+        if not towrite.endswith('RX\r\n'):
+            towrite += 'RX\r\n'
         # print 'towrite ', towrite
         self.write_serial(towrite.encode("ascii"))
 
@@ -1448,6 +1836,10 @@ class AorCtrl(AorCtrlFrame):
         if match:
             kind = 'scan' if match.group(1) == 'M' else 'search'
             self.group_response[kind] = int(match.group(2))
+            if self.settings_dialog is not None:
+                self.settings_dialog.accept_context(kind, int(match.group(2)))
+            for parameter in re.findall(r'(?:[XS][AB][ +]?[0-9]{3}|[XS][D](?:[0-9]\.[0-9]|FF)|[XS]P[0-9]{2}|XM[0-8F])', text):
+                self.accept_operation_parameter(parameter)
             return
         kind = 'scan' if text.startswith('BM') else 'search'
         members = parse_group_members(text, kind)
@@ -1554,6 +1946,7 @@ class AorCtrl(AorCtrlFrame):
         mode = self.cbx_mode.GetSelection()
         if not 0 <= mode < len(GUI_MODE_TO_MD):
             return
+        self.clear_vfo_channel()
         self.write_serial(('MD%s\r\n' % GUI_MODE_TO_MD[mode]).encode("ascii"))
 
     def on_select_step(self, evt):
@@ -1562,6 +1955,7 @@ class AorCtrl(AorCtrlFrame):
         STnnn.nm<CR> Set the tuning step size in kHz
         """
         step = float(self.cbx_step.GetStringSelection())
+        self.clear_vfo_channel()
         self.write_serial(('ST%06.2f\r\n' % step).encode("ascii"))
 
     def on_enter_freq(self, evt):
@@ -1570,6 +1964,7 @@ class AorCtrl(AorCtrlFrame):
         freq = self.tuning_panel.freq
         if not 0.1 < freq < 3000:
             return
+        self.clear_vfo_channel()
         comm = 'RF%010.5f\r\n' % freq
         self.write_serial(comm.encode("ascii"))
         self.write_serial(b'RX\r\n')
@@ -1616,15 +2011,13 @@ class AorCtrl(AorCtrlFrame):
                     raise ValueError('Response must be text')
                 if self.bandscope is not None:
                     self.bandscope.capture_receiver(first)
+                temporary_context = self.monitor_muted
+                background = False
                 # print 'event text ', text
                 if first.startswith('LM'):
                     self.set_signal_level(first)
-                elif first.startswith('DB'):
-                    self.level_squelch_value = parse_level_squelch_response(first)
-                    self.level_squelch_pending = False
-                    self.sql.SetValue(self.level_squelch_value)
-                    self.sql_value.SetLabel('Off' if self.level_squelch_value == 0 else str(self.level_squelch_value))
-                    self.update_connection_ui()
+                elif first.startswith(('DA', 'DB', 'DD', 'DP', 'XA', 'XB', 'XD', 'XM', 'XP', 'SA', 'SB', 'SD', 'SP')):
+                    self.accept_operation_parameter(first)
                 elif first.startswith('AM '):
                     if self.bandscope is not None:
                         self.bandscope.set_status(first)
@@ -1683,7 +2076,7 @@ class AorCtrl(AorCtrlFrame):
                     self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
                     self.aor_status.SetStatusText('%s: %s, %s' %
                                                 (first[:2], fields[0][2:], display_frequency(protocol_frequency_hz(fields[2][2:]))))
-                elif first in ('GA0', 'GA1', 'MP0', 'MP1'):
+                elif first in ('GA0', 'GA1', 'MP0', 'MP1', 'MC0', 'MC1'):
                     # Acknowledgements are not a substitute for channel read-back.
                     continue
                 else:
@@ -1692,6 +2085,9 @@ class AorCtrl(AorCtrlFrame):
 
                 if first.startswith(('VA ', 'VB ', 'VF ', 'MR ', 'MS ', 'SM ', 'VS ', 'VV ')) or re.match(r'SR[A-Ta-t] RF', first):
                     self.on_memory_flag_status(first)
+                    if not temporary_context and not background:
+                        self.receive_context_status(first)
+                        self.update_operation_ui()
                 received_valid = True
             except (ValueError, IndexError, TypeError) as error:
                 if isinstance(first, str) and first.startswith('GR') and self.memory_select_read is not None:
@@ -1702,6 +2098,7 @@ class AorCtrl(AorCtrlFrame):
             self.start_monitoring()
             self.aor_status.SetStatusText('Select a VFO or list, or enter a frequency in MHz.')
             self.update_connection_ui()
+            self.show_now_receiving()
         self.maybe_load_initial_bank()
 
     def write_serial(self, data):
@@ -1859,6 +2256,7 @@ class AorCtrl(AorCtrlFrame):
                 self.connected and self.serial.is_open and self.alive.is_set() and
                 not self.filling_banks and self.memory_select_read is None and
                 self.memory_flag_edit is None and self.memory_rows[channel]['select'] is not None and
+                not self.monitor_muted and self.settings_dialog is None and
                 self.memory_rows[channel]['skip'] is not None and
                 self.active_operation is None and self.background_vfo is None and
                 (self.bandscope is None or (not self.bandscope.entered and self.bandscope.waiting is None)))
@@ -1889,7 +2287,7 @@ class AorCtrl(AorCtrlFrame):
             return
         self.memory_flag_edit = {'channel': channel, 'flag': flag,
                                  'desired': not self.memory_rows[channel][flag],
-                                 'phase': 'capture', 'restore': None}
+                                 'phase': 'capture', 'restore': None, 'restored': False}
         self.memory_flag_timer.StartOnce(10000)
         self.aor_status.SetStatusText('Reading receiver state before editing %s...' % channel)
         self.update_connection_ui()
@@ -1931,7 +2329,8 @@ class AorCtrl(AorCtrlFrame):
             edit['restore'] = ((text[:2] + '\r\n') if text.startswith(('VA ', 'VB ', 'VF ')) else
                                ('MR%s\r\n' % text.split()[1][2:])).encode('ascii')
             edit['phase'] = 'recall'
-            command = ('MR%s\r\nRX\r\n' % edit['channel']).encode('ascii')
+            self.monitor_muted = True
+            command = ('MC1\r\nMR%s\r\nRX\r\n' % edit['channel']).encode('ascii')
         elif text.startswith('MR ') and text.split()[1] == 'MX' + edit['channel']:
             entry = self.memory_rows[edit['channel']]
             fields = [field[2:] for field in text.split(None, 8)[1:]]
@@ -1943,6 +2342,9 @@ class AorCtrl(AorCtrlFrame):
                 command = ('%s%d\r\n' % ('GA' if edit['flag'] == 'select' else 'MP', edit['desired'])).encode('ascii')
                 if edit['flag'] == 'skip':
                     command += b'RX\r\n'
+                else:
+                    # GR is independent of M.RD: release audio before its list read-back.
+                    command += edit['restore'] + b'MC0\r\n'
             elif edit['phase'] == 'verify_skip':
                 self.finish_memory_flag_edit('%s Skip %s' %
                                              (edit['channel'], 'saved and verified' if entry['skip'] == edit['desired'] else 'verification failed'), verified=True)
@@ -1954,6 +2356,8 @@ class AorCtrl(AorCtrlFrame):
         if self.write_serial(command) != len(command):
             self.finish_memory_flag_edit('Serial write failed; memory flag was not verified.')
         elif edit['phase'] == 'verify_select':
+            edit['restored'] = True
+            self.monitor_muted = False
             self.read_memory_select_flags()
 
     def finish_memory_flag_edit(self, message, verified=False):
@@ -1964,10 +2368,15 @@ class AorCtrl(AorCtrlFrame):
         self.memory_flag_edit = None
         self.memory_select_read = None
         self.memory_flag_timer.Stop()
-        if edit is not None and edit['restore'] is not None and self.serial.is_open:
-            command = edit['restore'] + b'RX\r\n'
-            if self.write_serial(command) != len(command):
-                message += ' Receiver restoration failed.'
+        if edit is not None and edit['restore'] is not None and not edit.get('restored') and self.serial.is_open:
+            try:
+                if self.write_serial(edit['restore']) != len(edit['restore']):
+                    message += ' Receiver restoration failed.'
+            finally:
+                self.release_monitor_mute()
+                self.write_serial(b'RX\r\n')
+        else:
+            self.release_monitor_mute()
         self.aor_status.SetStatusText(message)
         self.update_connection_ui()
 
@@ -2272,6 +2681,8 @@ class AorCtrl(AorCtrlFrame):
             except serial.SerialException as error:
                 self.alive.clear()
                 print('Serial read error: %s' % error, file=sys.stderr)
+                if self.monitor_muted:
+                    wx.CallAfter(self.finish_memory_flag_edit, 'Serial read failed; restoring receiver/audio.')
                 return
             if not self.alive.is_set():
                 return
