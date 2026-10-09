@@ -72,13 +72,16 @@ class BandscopeWindow(wx.Frame):
         self.stop_requested = False
         self.pending_tune = None
         self.setting_command = b''
+        self.peak_value = None
+        self.peak_pending = False
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
         buttons = wx.BoxSizer(wx.HORIZONTAL)
         self.start_button = wx.Button(panel, label='Start')
         self.stop_button = wx.Button(panel, label='Stop')
         self.loop_checkbox = wx.CheckBox(panel, label='Loop')
-        for button in (self.start_button, self.stop_button, self.loop_checkbox):
+        self.peak_checkbox = wx.CheckBox(panel, label='Peak Hold')
+        for button in (self.start_button, self.stop_button, self.loop_checkbox, self.peak_checkbox):
             buttons.Add(button, 0, wx.ALL, 5)
         buttons.Add(wx.StaticText(panel, label='Span:'), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 10)
         self.span_choice = wx.Choice(panel, choices=BANDSCOPE_SPAN_LABELS)
@@ -113,6 +116,7 @@ class BandscopeWindow(wx.Frame):
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
         self.tune_button.Bind(wx.EVT_BUTTON, self.on_tune_marker)
+        self.peak_checkbox.Bind(wx.EVT_CHECKBOX, self.on_peak_hold)
         self.span_choice.Bind(wx.EVT_CHOICE, self.on_span)
         self.centre_button.Bind(wx.EVT_BUTTON, self.on_centre)
         self.centre_input.Bind(wx.EVT_TEXT_ENTER, self.on_centre)
@@ -121,6 +125,7 @@ class BandscopeWindow(wx.Frame):
                 (self.start_button, 'Read one sweep, then restore audio; Loop repeats until Stop.'),
                 (self.stop_button, 'Finish any pending sweep and restore the previous receiver state/audio.'),
                 (self.loop_checkbox, 'Keep analyser mode active and repeat completed sweeps until Stop.'),
+                (self.peak_checkbox, 'Enable scanner bandscope peak hold; read back the PH state.'),
                 (self.tune_button, 'Finish any pending sweep, restore audio, tune the active VFO to MF, then read RX.'),
                 (self.span_choice, 'Set the bandscope width and clear the previous trace.'),
                 (self.centre_input, 'Enter the bandscope centre frequency in MHz.'),
@@ -178,6 +183,7 @@ class BandscopeWindow(wx.Frame):
         self.start_button.Enable(enabled and self.available())
         self.stop_button.Enable(self.available())
         self.loop_checkbox.Enable(self.available())
+        self.peak_checkbox.Enable(enabled and self.available() and self.peak_value is not None and not self.peak_pending)
         self.tune_button.Enable(self.available() and self.status is not None and self.waiting != 'restore')
         settings_enabled = enabled and self.status is not None and self.available()
         self.span_choice.Enable(settings_enabled)
@@ -219,6 +225,24 @@ class BandscopeWindow(wx.Frame):
         selection = self.span_choice.GetSelection()
         if 0 <= selection < len(BANDSCOPE_SPAN_LABELS):
             self.change_setting(('SW%d\r\n' % (selection + 1)).encode('ascii'), invalidate=True)
+
+    def on_peak_hold(self, event):
+        desired = self.peak_checkbox.GetValue()
+        self.peak_checkbox.SetValue(bool(self.peak_value))
+        if self.waiting is not None or not self.available() or self.peak_value is None or self.peak_pending:
+            return
+        self.peak_pending = True
+        self.change_setting(('PH%d\r\nPH\r\n' % desired).encode('ascii'))
+
+    def set_peak_hold(self, text):
+        if re.fullmatch(r'PH[01]', text) is None:
+            raise ValueError('Invalid peak hold response')
+        self.peak_value = text == 'PH1'
+        self.peak_pending = False
+        self.peak_checkbox.SetValue(self.peak_value)
+        if self.status is not None:
+            self.status['peak_hold'] = self.peak_value
+        self.set_controls_enabled(self.waiting is None)
 
     def on_centre(self, event):
         if self.waiting is not None or not self.available():
@@ -285,7 +309,9 @@ class BandscopeWindow(wx.Frame):
         self.waiting = 'status'
         self.entered = True
         # The first AM enters; the second obtains the documented status.
-        self.send(b'AM\r\n' + self.setting_command + b'AM\r\n')
+        self.peak_pending = True
+        peak_query = b'' if b'PH\r\n' in self.setting_command else b'PH\r\n'
+        self.send(b'AM\r\n' + self.setting_command + b'AM\r\n' + peak_query)
 
     def set_status(self, text):
         status = parse_bandscope_status(text)
@@ -293,6 +319,7 @@ class BandscopeWindow(wx.Frame):
             self.entered = True
             self.waiting = 'status'
             self.restore_command = self.controller.normal_vfo_command()
+            self.send(b'PH\r\n')
         if self.waiting != 'status':
             return
         if self.status is None or any(self.status[field] != status[field] for field in ('centre_hz', 'span_code')):
@@ -300,6 +327,9 @@ class BandscopeWindow(wx.Frame):
             self.trace_status = None
             self.plot.Refresh()
         self.status = status
+        self.peak_value = status['peak_hold']
+        self.peak_pending = False
+        self.peak_checkbox.SetValue(self.peak_value)
         self.span_choice.SetSelection(status['span_code'] - 1)
         self.centre_input.ChangeValue('%.6f' % (status['centre_hz'] / 1000000))
         self.info.SetLabel('Centre: %.6f MHz    Span: %g MHz    Marker: %.6f MHz%s' %
@@ -406,6 +436,9 @@ class BandscopeWindow(wx.Frame):
         self.restore_receiver(query=False)
         self.waiting = None
         self.sweep = None
+        self.peak_value = None
+        self.peak_pending = False
+        self.peak_checkbox.SetValue(False)
         self.set_controls_enabled(True)
         self.message.SetLabel('Disconnected.')
 
@@ -867,6 +900,9 @@ class AorCtrl(AorCtrlFrame):
         self.level_squelch_value = None
         self.level_squelch_pending = False
         self.level_squelch_requested = None
+        self.receiver_switches = {'NL': None, 'AF': None}
+        self.receiver_switch_pending = set()
+        self.afc_mode = None
         self.search_banks = {}
         self.search_bank_rows = {}
         self.search_bank_dialog = None
@@ -1001,13 +1037,11 @@ class AorCtrl(AorCtrlFrame):
         for digit in range(10):
             getattr(self.tuning_panel, 'tune_b%d' % digit).SetToolTip(
                 'Append %d to the frequency entry in MHz.' % digit)
-        # These existing controls have no application handler.
         for control, tip in (
-                (self.ckbx_nl, 'Noise limiter control is not implemented.'),
-                (self.ckbx_afc, 'Automatic frequency control is not implemented.'),
+                (self.ckbx_nl, 'Noise limiter; effective in AM and SSB modes.'),
+                (self.ckbx_afc, 'Automatic frequency control; available in NFM, SFM, WAM, AM and NAM.'),
                 ):
             control.SetToolTip(tip)
-            control.Disable()
         for control, tip in (
                 (self.cbx_lists, 'Read stored channels, stored ranges (Search Banks), Selected Channels (Select Scan), pass frequencies or local logs.'),
                 (self.cbx_scan, 'Scan Group: Memory Banks linked together for memory scanning. Read group 0-9; 0 is fixed LINK OFF.'),
@@ -1030,6 +1064,7 @@ class AorCtrl(AorCtrlFrame):
     def update_connection_ui(self):
         port_open = self.serial.is_open and self.alive.is_set()
         ready = port_open and self.connected
+        self.update_receiver_switch_ui()
         state = 'Connected' if ready else 'Connecting'
         self.aor_status.SetStatusText(
             '%s: %s @ %s baud' % (state, self.serial.port, self.serial.baudrate)
@@ -1085,6 +1120,37 @@ class AorCtrl(AorCtrlFrame):
         self.bandscope.Raise()
         if self.bandscope.waiting is None and self.bandscope.available():
             self.bandscope.request_status()
+
+    def update_receiver_switch_ui(self):
+        ready = self.connected and self.serial.is_open and self.alive.is_set()
+        self.ckbx_nl.Enable(ready and self.receiver_switches['NL'] is not None and 'NL' not in self.receiver_switch_pending)
+        self.ckbx_afc.Enable(ready and self.afc_mode in (1, 2, 6, 7, 8) and
+                             self.receiver_switches['AF'] is not None and 'AF' not in self.receiver_switch_pending)
+
+    def on_receiver_switch(self, event):
+        control = event.GetEventObject()
+        key = 'NL' if control is self.ckbx_nl else 'AF'
+        desired = control.GetValue()
+        control.SetValue(bool(self.receiver_switches[key]))
+        if not control.IsEnabled():
+            return
+        self.receiver_switch_pending.add(key)
+        self.update_receiver_switch_ui()
+        command = ('%s%d\r\n%s\r\n' % (key, desired, key)).encode('ascii')
+        if self.write_serial(command) != len(command):
+            self.receiver_switch_pending.discard(key)
+            self.aor_status.SetStatusText('%s write failed; state was not verified.' % key)
+            self.update_receiver_switch_ui()
+
+    def set_receiver_switch(self, text):
+        if re.fullmatch(r'(NL|AF)[01]', text) is None:
+            raise ValueError('Invalid noise limiter / AFC response')
+        key = text[:2]
+        value = text[2] == '1'
+        self.receiver_switches[key] = value
+        self.receiver_switch_pending.discard(key)
+        (self.ckbx_nl if key == 'NL' else self.ckbx_afc).SetValue(value)
+        self.update_receiver_switch_ui()
 
     def operation_selection(self):
         operation = self.operation_choice.GetSelection()
@@ -1324,6 +1390,8 @@ class AorCtrl(AorCtrlFrame):
             # A moving RX cursor is not a new squelch-open/paused-channel event.
             self.operation_signal_open = False
         self.receiver_status = state
+        self.afc_mode = state['mode']
+        self.update_receiver_switch_ui()
         if text.startswith(('MS ', 'SM ', 'VS ', 'VV ')) or re.match(r'SR[A-Ta-t] RF', text):
             if self.active_operation is None:
                 self.active_operation = ('Memory Scan', 'Current Bank') if memory else ('Frequency Search', 'Search Bank')
@@ -1476,6 +1544,11 @@ class AorCtrl(AorCtrlFrame):
         self.level_squelch_pending = False
         self.level_squelch_requested = None
         self.level_squelch_value = None
+        self.receiver_switches = {'NL': None, 'AF': None}
+        self.receiver_switch_pending.clear()
+        self.afc_mode = None
+        self.ckbx_nl.SetValue(False)
+        self.ckbx_afc.SetValue(False)
         self.sql_value.SetLabel('---')
         self.memory_flag_timer.Stop()
         self.memory_select_read = None
@@ -1523,6 +1596,9 @@ class AorCtrl(AorCtrlFrame):
         self.lm_pending = False
         self.level_squelch_pending = True
         self.write_serial(b'DB\r\n')
+        self.receiver_switch_pending.update(('NL', 'AF'))
+        if self.write_serial(b'NL\r\nAF\r\n') != 8:
+            self.receiver_switch_pending.clear()
         if self.write_serial(b'LC1\r\n') == 5:
             self.lc_enabled = True
             self.lm_timer.Start(250)
@@ -1623,6 +1699,8 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_BUTTON, self.on_select_list, self.bt_refresh)
         self.Bind(wx.EVT_CHECKBOX, self.on_auto, self.ckbx_auto)
         self.Bind(wx.EVT_CHECKBOX, self.on_enter_att, self.ckbx_att)
+        self.Bind(wx.EVT_CHECKBOX, self.on_receiver_switch, self.ckbx_nl)
+        self.Bind(wx.EVT_CHECKBOX, self.on_receiver_switch, self.ckbx_afc)
         self.Bind(wx.EVT_COMBOBOX, self.on_select_mode, self.cbx_mode)
         self.Bind(wx.EVT_COMBOBOX, self.on_select_step, self.cbx_step)
         self.Bind(wx.EVT_RADIOBOX, self.on_select_vfo, self.rb_vfos)
@@ -1948,6 +2026,8 @@ class AorCtrl(AorCtrlFrame):
             return
         self.clear_vfo_channel()
         self.write_serial(('MD%s\r\n' % GUI_MODE_TO_MD[mode]).encode("ascii"))
+        self.afc_mode = GUI_MODE_TO_MD[mode]
+        self.update_receiver_switch_ui()
 
     def on_select_step(self, evt):
         """Set step on RX
@@ -2016,6 +2096,11 @@ class AorCtrl(AorCtrlFrame):
                 # print 'event text ', text
                 if first.startswith('LM'):
                     self.set_signal_level(first)
+                elif first.startswith(('NL', 'AF')):
+                    self.set_receiver_switch(first)
+                elif first.startswith('PH'):
+                    if self.bandscope is not None:
+                        self.bandscope.set_peak_hold(first)
                 elif first.startswith(('DA', 'DB', 'DD', 'DP', 'XA', 'XB', 'XD', 'XM', 'XP', 'SA', 'SB', 'SD', 'SP')):
                     self.accept_operation_parameter(first)
                 elif first.startswith('AM '):
@@ -2668,6 +2753,9 @@ class AorCtrl(AorCtrlFrame):
         self.cbx_mode.SetSelection(MD_TO_GUI_MODE[int(mode)])
         # att
         self.ckbx_att.SetValue(int(att))
+        if not self.monitor_muted:
+            self.afc_mode = int(mode)
+            self.update_receiver_switch_ui()
 
         self.lb_vfo.Hide()
         self.lb_vfo.Show()
