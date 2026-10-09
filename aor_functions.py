@@ -353,6 +353,28 @@ def search_step_hz(value):
     return int(step)
 
 
+def make_memory_channel_command(channel, frequency, auto, mode, step, attenuation, name):
+    """AR8600 MX: RF and TM are mandatory; omit MD/ST for scanner Auto."""
+    if re.fullmatch(r'[A-Ja-j][0-9]{2}', channel) is None:
+        raise ValueError('Choose a memory channel A00-J99 or a00-j99')
+    frequency_hz = receiver_frequency_hz(frequency)
+    if mode not in range(9):
+        raise ValueError('Choose a valid modulation mode')
+    if len(name) > 12 or any(not 32 <= ord(char) <= 126 for char in name):
+        raise ValueError('Use at most 12 printable ASCII characters for the name')
+    command = 'MX%s RF%010d AU%d' % (channel, frequency_hz, bool(auto))
+    if not auto:
+        command += ' ST%06d MD%d' % (search_step_hz(step), mode)
+    return (command + ' AT%d TM%s\r\n' % (bool(attenuation), name)).encode('ascii')
+
+
+def memory_channel_read_command(channel):
+    """MA starts at 00; advance only as far as the requested channel's block."""
+    if re.fullmatch(r'[A-Ja-j][0-9]{2}', channel) is None:
+        raise ValueError('Invalid memory channel')
+    return ('MA%s\r\n' % channel[0] + 'MA\r\n' * (int(channel[1:]) // 10)).encode('ascii')
+
+
 def search_parameters(lower, upper, step, mode_code):
     lower_hz, upper_hz = receiver_frequency_hz(lower), receiver_frequency_hz(upper)
     if lower_hz >= upper_hz:

@@ -58,6 +58,21 @@ class MemoryTableModel(dv.DataViewIndexListModel):
         self.channels.append(channel)
         self.RowAppended()
 
+    def insert(self, channel):
+        row = sum(existing < channel for existing in self.channels)
+        self.channels.insert(row, channel)
+        for index, identifier in enumerate(self.channels):
+            self.controller.memory_rows[identifier]['row'] = index
+        self.RowInserted(row)
+
+    def remove(self, channel):
+        row = self.channels.index(channel)
+        self.channels.pop(row)
+        del self.controller.memory_rows[channel]
+        for index, identifier in enumerate(self.channels):
+            self.controller.memory_rows[identifier]['row'] = index
+        self.RowDeleted(row)
+
 
 class EditListCtrl(wx.ListCtrl,
                    listmix.ListCtrlAutoWidthMixin):
