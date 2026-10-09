@@ -2,7 +2,51 @@ __author__ = 'joaquin'
 
 import sys
 import wx
+import wx.dataview as dv
 import wx.lib.mixins.listctrl as listmix
+
+
+class MemoryTableModel(dv.DataViewIndexListModel):
+    """Native toggle cells backed only by confirmed scanner state."""
+    def __init__(self, controller):
+        super().__init__(0)
+        self.controller = controller
+        self.channels = []
+
+    def GetColumnCount(self):
+        return 9
+
+    def GetColumnType(self, col):
+        return 'bool' if col in (1, 2) else 'string'
+
+    def GetValueByRow(self, row, col):
+        value = self.controller.memory_row_values(self.channels[row])[col]
+        return bool(value) if col in (1, 2) else value
+
+    def HasValue(self, item, col):
+        if not item.IsOk():
+            return False
+        if col not in (1, 2):
+            return True
+        channel = self.channels[self.GetRow(item)]
+        return self.controller.memory_rows[channel]['select' if col == 1 else 'skip'] is not None
+
+    def IsEnabledByRow(self, row, col):
+        return col not in (1, 2) or self.controller.memory_flags_editable(self.channels[row])
+
+    def SetValueByRow(self, value, row, col):
+        if col in (1, 2) and self.IsEnabledByRow(row, col):
+            self.controller.toggle_memory_flag(self.channels[row], 'select' if col == 1 else 'skip')
+        # The native renderer must wait for scanner read-back, not commit locally.
+        return False
+
+    def clear(self):
+        self.channels.clear()
+        self.Reset(0)
+
+    def append(self, channel):
+        self.channels.append(channel)
+        self.RowAppended()
 
 
 class EditListCtrl(wx.ListCtrl,
@@ -33,10 +77,9 @@ class EditListCtrl(wx.ListCtrl,
 class EditListCtrlPanel(wx.Panel):
     def __init__(self, parent):
         wx.Panel.__init__(self, parent, -1, style=wx.WANTS_CHARS)
-        new_id = wx.NewId()
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        self.list = EditListCtrl(self, new_id,
+        self.list = EditListCtrl(self, wx.ID_ANY,
                                  style=wx.LC_REPORT
                                  | wx.BORDER_NONE
                                  | wx.LC_VRULES
@@ -46,6 +89,28 @@ class EditListCtrlPanel(wx.Panel):
         sizer.Add(self.list, 1, wx.EXPAND)
         self.SetSizer(sizer)
         self.SetAutoLayout(True)
+
+    def create_memory_view(self, controller):
+        self.memory_model = MemoryTableModel(controller)
+        self.memory = dv.DataViewCtrl(self, style=dv.DV_ROW_LINES | dv.DV_VERT_RULES | dv.DV_SINGLE)
+        self.memory.AssociateModel(self.memory_model)
+        for index, (label, width) in enumerate((('Channel', 65), ('Selected', 70), ('Skip', 50),
+                                               ('Frequency', 130), ('Step', 90), ('Auto', 45),
+                                               ('Mode', 55), ('Att', 40), ('Name', 150))):
+            if index in (1, 2):
+                self.memory.AppendToggleColumn(label, index, mode=dv.DATAVIEW_CELL_ACTIVATABLE, width=width)
+            else:
+                self.memory.AppendTextColumn(label, index, width=width)
+        self.memory.SetToolTip('Selected: Include this memory channel in Lists -> SELECTED CHANNELS (AR8600 Select Scan).\n'
+                               'Skip: Skip this memory channel during Stored Channels scanning (AR8600 memory PASS flag).\n'
+                               'Blank or disabled toggles are awaiting scanner state/read-back.')
+        self.memory.Hide()
+        self.GetSizer().Add(self.memory, 1, wx.EXPAND)
+
+    def show_memory(self, show):
+        self.list.Show(not show)
+        self.memory.Show(show)
+        self.Layout()
 
 
 class DummyFrame(wx.Frame):

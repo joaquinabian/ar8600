@@ -162,7 +162,7 @@ def format_activity_row(activity):
     """Format the existing in-memory LC1 record for the read-only log view."""
     frequency, duration = activity['frequency_hz'], activity['duration']
     return (activity['timestamp'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-            '---' if frequency is None else format(frequency / 1000000, '.6f'),
+            '---' if frequency is None else display_frequency(frequency),
             '%s %s' % (activity['source'], activity['source_id']),
             str(activity['level']), 'OPEN' if activity['squelch_open'] else 'CLOSED',
             '---' if duration is None else '%.2f s' % duration)
@@ -243,6 +243,34 @@ def format_step(x):
     max step   = 0.10000
     """
     return x
+
+
+def protocol_frequency_hz(value):
+    value = str(value)
+    return Decimal(value) * (1000000 if '.' in value else 1)
+
+
+def display_frequency(hz):
+    hz = Decimal(str(hz))
+    return ('%.3f kHz' % (hz / 1000)) if hz < 3000000 else ('%.6f MHz' % (hz / 1000000))
+
+
+def display_step(hz):
+    hz = Decimal(str(hz))
+    value, unit = (hz, 'Hz') if hz < 1000 else (hz / 1000, 'kHz')
+    return '%s %s' % (format(value.normalize(), 'f'), unit)
+
+
+def protocol_step_hz(value):
+    value = str(value).rstrip('+')
+    return Decimal(value) * (1000 if '.' in value else 1)
+
+
+def parse_level_squelch_response(text):
+    match = re.fullmatch(r'DB[ +]?([0-9]{3})', text)
+    if match is None or int(match.group(1)) > 255:
+        raise ValueError('Invalid DB level squelch response')
+    return int(match.group(1))
 
 
 def receiver_frequency_hz(value):

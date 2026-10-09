@@ -1,4 +1,5 @@
 import wx
+import wx.dataview as dv
 import sys
 import serial_conf_dialog
 import serial
@@ -8,7 +9,9 @@ import time
 from collections import deque
 from datetime import datetime
 from aor_control_frame import AorCtrlFrame
-from aor_functions import (do_nothing, format_frequency, parse_lm_response, parse_lc_response,
+from aor_functions import (do_nothing, format_frequency, display_frequency, display_step,
+                           protocol_frequency_hz, protocol_step_hz, parse_level_squelch_response,
+                           parse_lm_response, parse_lc_response,
                            parse_select_scan_response, parse_pass_frequency_response,
                            make_pass_frequency_command, format_activity_row,
                            parse_bandscope_status, BandscopeSweep, bandscope_frequency,
@@ -22,10 +25,9 @@ GUI_MODE_TO_MD = (0, 1, 6, 7, 2, 8, 3, 4, 5)
 MD_TO_GUI_MODE = {code: index for index, code in enumerate(GUI_MODE_TO_MD)}
 
 
-menu_titles = ["Set", "Edit"]
-menu_title_by_id = {}
-for title_ in menu_titles:
-    menu_title_by_id[wx.NewId()] = title_
+DEBUG_SERIAL = False
+LIST_LABELS = {'SEARCH BANKS': 'STORED RANGES', 'SELECT SCAN': 'SELECTED CHANNELS',
+               'PASS FREQS': 'PASS FREQS', 'LOG VIEW': 'LOG VIEW', 'DATABASE': 'DATABASE'}
 
 
 # Create an own event type, so that GUI updates can be delegated
@@ -472,7 +474,8 @@ class BandscopeWindow(wx.Frame):
 class GroupDialog(wx.Dialog):
     """Read back the scanner's membership; Save is an explicit replacement."""
     def __init__(self, controller, kind, group):
-        super().__init__(controller, title='%s Group %d' % (kind.title(), group), size=(350, 440))
+        label = 'Linked Memory Banks' if kind == 'scan' else 'Linked Ranges'
+        super().__init__(controller, title='%s (%s Group %d)' % (label, kind.title(), group), size=(370, 440))
         self.controller, self.kind, self.group = controller, kind, group
         self.confirmed_members = None
         self.expected_members = None
@@ -600,7 +603,7 @@ class GroupDialog(wx.Dialog):
 
 class SearchBankDialog(wx.Dialog):
     def __init__(self, controller, bank):
-        super().__init__(controller, title='Create / Edit Search Bank')
+        super().__init__(controller, title='Create / Edit Stored Range (Search Bank)')
         self.controller = controller
         self.bank = wx.Choice(self, choices=list('ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst'))
         self.bank.SetStringSelection(bank)
@@ -613,7 +616,7 @@ class SearchBankDialog(wx.Dialog):
         self.name.SetMaxLength(12)
         grid = wx.FlexGridSizer(0, 2, 6, 8)
         for label, control, tip in (
-                ('Search Bank', self.bank, 'Stored Search Bank to create or edit; A-T or a-t.'),
+                ('Stored Range', self.bank, 'AR8600 Search Bank to create or edit; A-T or a-t.'),
                 ('Lower MHz', self.lower, 'Lower limit of this stored frequency range.'),
                 ('Upper MHz', self.upper, 'Upper limit, greater than Lower.'),
                 ('Step kHz', self.step, 'Manual tuning step; Auto follows the scanner bandplan.'),
@@ -702,6 +705,11 @@ class AorCtrl(AorCtrlFrame):
         self.vfo_status = {}
         self.background_vfo = None
         self.memory_banks = {}
+        self.last_memory_bank = None
+        self.initial_bank_load_pending = False
+        self.level_squelch_value = None
+        self.level_squelch_pending = False
+        self.level_squelch_requested = None
         self.search_banks = {}
         self.search_bank_rows = {}
         self.search_bank_dialog = None
@@ -719,7 +727,6 @@ class AorCtrl(AorCtrlFrame):
         self.memory_rows = {}
         self.memory_select_read = None
         self.memory_flag_edit = None
-        self.list_item_clicked = None
         self.alive = threading.Event()
         self.lm_pending = False
         self.lc_enabled = False
@@ -732,12 +739,15 @@ class AorCtrl(AorCtrlFrame):
         self.pass_context = 'V'
         self.bandscope = None
         AorCtrlFrame.__init__(self, *args, **kwds)
+        self.edit_list.create_memory_view(self)
 
         self.create_monitor_controls()
         self.lm_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_lm_timer, self.lm_timer)
         self.memory_flag_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_memory_flag_timeout, self.memory_flag_timer)
+        self.level_squelch_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_level_squelch_timer, self.level_squelch_timer)
         self.__set_properties()
         self.__attach_events()           # register events
         view_menu = wx.Menu()
@@ -799,7 +809,7 @@ class AorCtrl(AorCtrlFrame):
                 (self.search_bank_choice, 'Search Bank: a stored frequency range with its search parameters. Read the selected bank.'),
                 (self.bt_start, 'Start the selected operation and source using its scanner commands.'),
                 (self.bt_mkpassfreq, 'Add a frequency to the selected AR8600 pass-frequency list.'),
-                (self.edit_list.list, 'Memory channels: double-click Select Scan / Skip Scan to toggle, or right-click for actions. [x] enabled; [ ] disabled; [?] awaiting scanner confirmation.'),
+                (self.edit_list.list, 'View the selected list; right-click a pass frequency or stored range for actions.'),
                 (self.activity_list, 'View the most recent receiver activity; LOG VIEW shows the full in-memory log.'),
                 (self.signal_gauge, 'Raw AR8600 signal level (0-255), without S-unit or dBm calibration.'),
                 (self.signal_text, 'Raw AR8600 signal level (0-255).'),
@@ -820,12 +830,11 @@ class AorCtrl(AorCtrlFrame):
         for control, tip in (
                 (self.ckbx_nl, 'Noise limiter control is not implemented.'),
                 (self.ckbx_afc, 'Automatic frequency control is not implemented.'),
-                (self.sql, 'Squelch adjustment is not implemented; the current state is shown below.'),
                 ):
             control.SetToolTip(tip)
             control.Disable()
         for control, tip in (
-                (self.cbx_lists, 'Read a Memory Bank (stored individual channels), Search Bank (stored range), Select Scan (selected channels), or local log.'),
+                (self.cbx_lists, 'Read stored channels, stored ranges (Search Banks), Selected Channels (Select Scan), pass frequencies or local logs.'),
                 (self.cbx_scan, 'Scan Group: Memory Banks linked together for memory scanning. Read group 0-9; 0 is fixed LINK OFF.'),
                 (self.bt_scgrp, 'View linked Memory Banks; edit membership for Scan Groups 1-9.'),
                 (self.cbx_search, 'Search Group: Search Banks linked together for frequency searching. Read group 0-9; 0 is fixed LINK OFF.'),
@@ -840,6 +849,8 @@ class AorCtrl(AorCtrlFrame):
                 ):
             control.SetToolTip(tip)
         self.update_connection_ui()
+        self.sql.SetToolTip('Signal-level squelch threshold for VFO and frequency-range searching; 0 disables it.')
+        self.sql_value.SetToolTip('Scanner-confirmed level squelch threshold; Off means DB000.')
 
     def update_connection_ui(self):
         port_open = self.serial.is_open and self.alive.is_set()
@@ -866,6 +877,8 @@ class AorCtrl(AorCtrlFrame):
         self.cbx_lists.Enable(self.memory_flag_edit is None)
         self.operation_choice.Enable(self.memory_flag_edit is None)
         self.source_choice.Enable(self.memory_flag_edit is None)
+        self.sql.Enable(ready and self.level_squelch_value is not None and not self.level_squelch_pending and self.memory_flag_edit is None)
+        self.edit_list.memory.Refresh()
         view = self.current_list_view()
         self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view == 'LOG VIEW')
         if self.memory_flag_edit is not None:
@@ -891,17 +904,20 @@ class AorCtrl(AorCtrlFrame):
             self.bandscope.request_status()
 
     def operation_selection(self):
-        return self.operation_choice.GetStringSelection(), self.source_choice.GetStringSelection()
+        operation = self.operation_choice.GetSelection()
+        source = self.source_choice.GetSelection()
+        return (('Memory Scan', ('Current Bank', 'Scan Group', 'Select Scan')[source]) if operation == 0 else
+                ('Frequency Search', ('Range', 'Search Bank', 'Search Group')[source]))
 
     def update_operation_ui(self):
         operation, source = self.operation_selection()
         ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_flag_edit is None
         tips = {'Current Bank': 'Memory Bank: a stored collection of individual memory channels. Scan only the selected bank.',
-                'Scan Group': 'Scan Group: a set of Memory Banks linked together for memory scanning.',
-                'Select Scan': 'Select Scan: a special list of selected individual memory channels; memory pass flags are ignored.',
+                'Scan Group': 'AR8600 Scan Group: several Memory Banks linked for scanning.',
+                'Select Scan': 'AR8600 Select Scan: only memory channels explicitly selected; memory PASS flags are ignored.',
                 'Range': 'Search between two VFO frequency limits without creating a stored Search Bank.',
-                'Search Bank': 'Search Bank: a stored frequency range with its search parameters.',
-                'Search Group': 'Search Group: a set of Search Banks linked together for frequency searching.'}
+                'Search Bank': 'AR8600 Search Bank: a saved frequency-search range.',
+                'Search Group': 'AR8600 Search Group: several Search Banks linked together.'}
         self.source_choice.SetToolTip(tips[source])
         idle = self.active_operation is None
         panels = (self.memory_source_panel, self.scan_source_panel, self.range_source_panel,
@@ -924,7 +940,7 @@ class AorCtrl(AorCtrlFrame):
         self.Layout()
 
     def on_operation_changed(self, event):
-        choices = ['Current Bank', 'Scan Group', 'Select Scan'] if self.operation_choice.GetSelection() == 0 else ['Range', 'Search Bank', 'Search Group']
+        choices = ['Current Memory Bank', 'Linked Memory Banks', 'Selected Channels'] if self.operation_choice.GetSelection() == 0 else ['Manual Range', 'Stored Range', 'Linked Ranges']
         self.source_choice.SetItems(choices)
         self.source_choice.SetSelection(0)
         self.on_source_changed(event)
@@ -939,10 +955,10 @@ class AorCtrl(AorCtrlFrame):
         elif source == 'Search Group':
             self.request_group('search')
         elif source == 'Search Bank':
-            self.cbx_lists.SetStringSelection('SEARCH BANKS')
+            self.select_list_view('SEARCH BANKS')
             self.on_select_list(None)
         elif source == 'Select Scan':
-            self.cbx_lists.SetStringSelection('SELECT SCAN')
+            self.select_list_view('SELECT SCAN')
             self.on_select_list(None)
 
     def operation_memory_bank(self):
@@ -975,11 +991,11 @@ class AorCtrl(AorCtrlFrame):
         if not self.connected or not self.serial.is_open:
             return
         if self.current_list_view() != 'SEARCH BANKS':
-            self.cbx_lists.SetStringSelection('SEARCH BANKS')
+            self.select_list_view('SEARCH BANKS')
             self.search_bank_rows.clear()
             self.filling_banks = False
             self.pending_memory_channels.clear()
-            self.prepare_list((('Search Bank', 85), ('Lower MHz', 100), ('Upper MHz', 100), ('Step kHz', 70),
+            self.prepare_list((('Stored Range', 85), ('Lower', 125), ('Upper', 125), ('Step', 100),
                                ('Auto', 45), ('Mode', 55), ('ATT', 40), ('Name', 130)))
         bank = self.search_bank_choice.GetClientData(self.search_bank_choice.GetSelection())
         self.write_serial(('SR%s\r\n' % bank).encode('ascii'))
@@ -1031,6 +1047,45 @@ class AorCtrl(AorCtrlFrame):
         self.alive.set()
         self.thread.start()
 
+    def maybe_load_initial_bank(self):
+        if (not self.initial_bank_load_pending or not self.connected or self.background_vfo is not None or
+                len(self.memory_banks) != 20):
+            return
+        self.initial_bank_load_pending = False
+        bank = self.last_memory_bank
+        if bank not in self.memory_banks or not self.memory_banks[bank]['channels']:
+            named = [entry for identifier, entry in sorted(self.memory_banks.items(), key=lambda pair: (pair[0].upper(), pair[0].islower()))
+                     if entry['channels'] and entry['name'].strip() and entry['name'].strip() != identifier]
+            preferred = next((entry for entry in named if entry['name'].strip().casefold() == 'fm radio'), None)
+            bank = (preferred or (named[0] if named else {})).get('bank')
+        if bank is None:
+            return
+        for index in range(5, self.cbx_lists.GetCount()):
+            if self.cbx_lists.GetClientData(index)['bank'] == bank:
+                self.cbx_lists.SetSelection(index)
+                self.on_select_list(None)
+                break
+
+    def on_level_squelch_change(self, event):
+        if not self.connected or not self.serial.is_open or self.level_squelch_pending:
+            return
+        self.level_squelch_requested = self.sql.GetValue()
+        self.level_squelch_timer.StartOnce(250)
+
+    def on_level_squelch_timer(self, event):
+        value = self.level_squelch_requested
+        self.level_squelch_requested = None
+        if value is None or not self.connected or not self.serial.is_open or value == self.level_squelch_value:
+            return
+        self.level_squelch_pending = True
+        self.sql.SetValue(self.level_squelch_value)
+        self.update_connection_ui()
+        command = ('DB%03d\r\nDB\r\n' % value).encode('ascii')
+        if self.write_serial(command) != len(command):
+            self.level_squelch_pending = False
+            self.aor_status.SetStatusText('Level Squelch write failed; value was not verified.')
+            self.update_connection_ui()
+
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
         if self.memory_flag_edit is not None and self.memory_flag_edit['restore'] is not None and self.serial.is_open:
@@ -1042,6 +1097,12 @@ class AorCtrl(AorCtrlFrame):
         self.active_operation = None
         self.filling_banks = False
         self.pending_memory_channels.clear()
+        self.initial_bank_load_pending = False
+        self.level_squelch_timer.Stop()
+        self.level_squelch_pending = False
+        self.level_squelch_requested = None
+        self.level_squelch_value = None
+        self.sql_value.SetLabel('---')
         self.memory_flag_timer.Stop()
         self.memory_select_read = None
         self.memory_flag_edit = None
@@ -1072,7 +1133,7 @@ class AorCtrl(AorCtrlFrame):
         sizer.Add(wx.StaticText(panel, label='Recent activity'), 0, wx.LEFT | wx.BOTTOM, 5)
         self.activity_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL,
                                          size=(-1, 130))
-        for index, (label, width) in enumerate((('Time', 155), ('Frequency MHz', 120),
+        for index, (label, width) in enumerate((('Time', 155), ('Frequency', 130),
                                                ('Source', 100), ('Level', 55),
                                                ('Duration', 80), ('Squelch', 85))):
             self.activity_list.InsertColumn(index, label, width=width)
@@ -1086,6 +1147,8 @@ class AorCtrl(AorCtrlFrame):
         if self.lm_timer.IsRunning() or not self.connected or not self.serial.is_open:
             return
         self.lm_pending = False
+        self.level_squelch_pending = True
+        self.write_serial(b'DB\r\n')
         if self.write_serial(b'LC1\r\n') == 5:
             self.lc_enabled = True
             self.lm_timer.Start(250)
@@ -1149,7 +1212,7 @@ class AorCtrl(AorCtrlFrame):
         row = self.activity_list.InsertItem(self.activity_list.GetItemCount(),
                                             activity['timestamp'].strftime('%H:%M:%S.%f')[:-3])
         frequency = activity['frequency_hz']
-        values = ('---' if frequency is None else format(frequency / 1000000, '.6f'),
+        values = ('---' if frequency is None else display_frequency(frequency),
                   '%s %s' % (activity['source'], activity['source_id']),
                   str(activity['level']),
                   '---' if activity['duration'] is None else '%.2f s' % activity['duration'],
@@ -1169,7 +1232,8 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_TOOL, self.on_tool)
         self.cbx_lists.Bind(wx.EVT_MOUSEWHEEL, do_nothing)
         self.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.open_menu, self.edit_list.list)
-        self.edit_list.list.Bind(wx.EVT_LEFT_DCLICK, self.on_memory_flag_double_click)
+        self.edit_list.memory.Bind(dv.EVT_DATAVIEW_ITEM_CONTEXT_MENU, self.on_memory_context_menu)
+        self.sql.Bind(wx.EVT_SLIDER, self.on_level_squelch_change)
         self.tuning_panel.tune_arrows.Bind(wx.EVT_BUTTON, self.on_move_frequency)
         self.Bind(wx.EVT_BUTTON, self.on_enter_freq, self.tuning_panel.tune_benter)
         self.Bind(wx.EVT_COMBOBOX, self.on_select_list, self.cbx_lists)
@@ -1204,8 +1268,6 @@ class AorCtrl(AorCtrlFrame):
                 self.close_serial()
             else:
                 self.connect()
-        else:
-            print('some other tool pressed')
 
     def open_menu(self, event):
         """"""
@@ -1221,7 +1283,7 @@ class AorCtrl(AorCtrlFrame):
             if entry is None:
                 return
             menu = wx.Menu()
-            edit = menu.Append(wx.ID_ANY, 'Edit Search Bank...')
+            edit = menu.Append(wx.ID_ANY, 'Edit Stored Range...')
             edit.Enable(self.connected and self.serial.is_open)
             menu.Bind(wx.EVT_MENU, lambda evt: self.open_search_bank(bank=bank), id=edit.GetId())
             self.edit_list.list.PopupMenu(menu)
@@ -1243,22 +1305,6 @@ class AorCtrl(AorCtrlFrame):
             self.edit_list.list.PopupMenu(menu)
             menu.Destroy()
             return
-        self.list_item_clicked = event.GetText()
-        x, y = event.GetPoint()
-
-        menu = wx.Menu()
-        for (id_, title) in menu_title_by_id.items():
-            menu.Append(id_, title)
-            menu.Bind(wx.EVT_MENU, self.menu_selection_cb, id=id_)
-        self.edit_list.list.PopupMenu(menu, (x+10, y))
-        menu.Destroy()
-
-    def menu_selection_cb(self, event):
-        # do something
-        operation = menu_title_by_id[event.GetId()]
-        target = self.list_item_clicked
-        print('Perform "%s" on "%s."' % (operation, target))
-
     def on_move_frequency(self, evt):
         obj = evt.GetEventObject()
         name = obj.GetLabel()
@@ -1362,7 +1408,7 @@ class AorCtrl(AorCtrlFrame):
             return
         if source == 'Select Scan' or (source is None and self.current_list_view() == 'SELECT SCAN'):
             sent = self.write_serial(b'SM\r\n') == 4
-            self.aor_status.SetStatusText('Select Scan start requested')
+            self.aor_status.SetStatusText('Selected Channels start requested')
             return sent
         else:
             bank = self.choose_start_bank('scan')
@@ -1378,7 +1424,13 @@ class AorCtrl(AorCtrlFrame):
         return self.cbx_lists.GetClientData(index) if index != wx.NOT_FOUND and self.cbx_lists.HasClientObjectData() else None
 
     def current_list_view(self):
-        return '' if self.selected_memory_bank() is not None else self.cbx_lists.GetStringSelection()
+        if self.selected_memory_bank() is not None:
+            return ''
+        label = self.cbx_lists.GetStringSelection()
+        return next((key for key, display in LIST_LABELS.items() if display == label), label)
+
+    def select_list_view(self, key):
+        self.cbx_lists.SetStringSelection(LIST_LABELS[key])
 
     def request_group(self, kind):
         if not self.connected or not self.serial.is_open or self.group_loading[kind] is not None:
@@ -1455,7 +1507,7 @@ class AorCtrl(AorCtrlFrame):
         banks = [bank for bank in sorted(definitions, key=lambda b: (b.upper(), b.islower()))
                  if kind == 'scan' or not definitions[bank]['empty']]
         if not banks:
-            self.aor_status.SetStatusText('Read Memory Banks / SEARCH BANKS first, then choose a starting bank.')
+            self.aor_status.SetStatusText('Read Memory Banks / STORED RANGES first, then choose a starting bank.')
             return None
         dialog = wx.SingleChoiceDialog(self, 'Select a starting bank (group 0 is LINK OFF):',
                                         '%s Group' % kind.title(), banks)
@@ -1479,7 +1531,7 @@ class AorCtrl(AorCtrlFrame):
             return
         bank = bank or (None if create else self.selected_search_bank())
         if bank is None and not create:
-            self.aor_status.SetStatusText('Choose SEARCH BANKS and select a row to edit.')
+            self.aor_status.SetStatusText('Choose STORED RANGES and select a row to edit.')
             return
         if bank is None:
             bank = next((b for b, entry in self.search_banks.items() if entry['empty']), 'A')
@@ -1494,7 +1546,7 @@ class AorCtrl(AorCtrlFrame):
             command = ('SS%s\r\nRX\r\n' % bank).encode('ascii')
             return self.write_serial(command) == len(command)
         else:
-            self.aor_status.SetStatusText('Choose SEARCH BANKS and select a populated row to start.')
+            self.aor_status.SetStatusText('Choose STORED RANGES and select a populated row to start.')
 
     def on_select_mode(self, evt):
         """Set mode on RX
@@ -1527,8 +1579,10 @@ class AorCtrl(AorCtrlFrame):
             self.aor_status.SetStatusText('Wait for the memory-channel flag read-back before loading another list.')
             return
         if self.selected_memory_bank() is not None:
+            self.last_memory_bank = self.selected_memory_bank()['bank']
             self.sync_memory_choices(self.selected_memory_bank())
         selection = self.current_list_view()
+        self.edit_list.show_memory(self.selected_memory_bank() is not None)
         self.update_connection_ui()
         if selection not in ('LOG VIEW', 'DATABASE') and not (
                 self.connected and self.serial.is_open and self.alive.is_set()):
@@ -1536,7 +1590,6 @@ class AorCtrl(AorCtrlFrame):
             return
         self.filling_banks = False
         self.pending_memory_channels.clear()
-        print(selection)
         if selection == 'SEARCH BANKS':
             self.get_search_banks()
         elif selection == 'SELECT SCAN':
@@ -1566,6 +1619,12 @@ class AorCtrl(AorCtrlFrame):
                 # print 'event text ', text
                 if first.startswith('LM'):
                     self.set_signal_level(first)
+                elif first.startswith('DB'):
+                    self.level_squelch_value = parse_level_squelch_response(first)
+                    self.level_squelch_pending = False
+                    self.sql.SetValue(self.level_squelch_value)
+                    self.sql_value.SetLabel('Off' if self.level_squelch_value == 0 else str(self.level_squelch_value))
+                    self.update_connection_ui()
                 elif first.startswith('AM '):
                     if self.bandscope is not None:
                         self.bandscope.set_status(first)
@@ -1600,7 +1659,7 @@ class AorCtrl(AorCtrlFrame):
                     self.validate_fields(fields[1:6], ('RF', 'ST', 'AU', 'MD', 'AT'))
                     if len(fields) != 7 or not fields[6].startswith('TT'):
                         raise ValueError('Invalid active Search Bank status')
-                    self.aor_status.SetStatusText('Searching bank %s: %s MHz' % (first[2], format_frequency(fields[1][2:])))
+                    self.aor_status.SetStatusText('Stored Range %s: %s' % (first[2], display_frequency(protocol_frequency_hz(fields[1][2:]))))
                 elif first.startswith('SR'):
                     self.set_search_banks(first)
                 elif first.startswith('GR'):
@@ -1610,8 +1669,8 @@ class AorCtrl(AorCtrlFrame):
                 elif first.startswith('SM '):
                     fields = first.split(None, 8)[1:]
                     self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
-                    self.aor_status.SetStatusText('Select Scan: %s, %s MHz' %
-                                                (fields[0][2:], format_frequency(fields[2][2:])))
+                    self.aor_status.SetStatusText('Selected Channels: %s, %s' %
+                                                (fields[0][2:], display_frequency(protocol_frequency_hz(fields[2][2:]))))
                 elif first.startswith('MW'):
                     self.set_memory_banks_list(first)
                 elif first.startswith('MX'):
@@ -1622,8 +1681,8 @@ class AorCtrl(AorCtrlFrame):
                 elif first.startswith(('MR ', 'MS ')):
                     fields = first.split(None, 8)[1:]
                     self.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
-                    self.aor_status.SetStatusText('%s: %s, %s MHz' %
-                                                (first[:2], fields[0][2:], format_frequency(fields[2][2:])))
+                    self.aor_status.SetStatusText('%s: %s, %s' %
+                                                (first[:2], fields[0][2:], display_frequency(protocol_frequency_hz(fields[2][2:]))))
                 elif first in ('GA0', 'GA1', 'MP0', 'MP1'):
                     # Acknowledgements are not a substitute for channel read-back.
                     continue
@@ -1643,6 +1702,7 @@ class AorCtrl(AorCtrlFrame):
             self.start_monitoring()
             self.aor_status.SetStatusText('Select a VFO or list, or enter a frequency in MHz.')
             self.update_connection_ui()
+        self.maybe_load_initial_bank()
 
     def write_serial(self, data):
         try:
@@ -1685,10 +1745,10 @@ class AorCtrl(AorCtrlFrame):
                     raise ValueError('Invalid memory channel')
 
     def log_new(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print("log_new")
+        pass
 
     def log_open(self, event):  # wxGlade: AorCtrlFrame.<event_handler>
-        print("log_open")
+        pass
 
     # noinspection PyPep8Naming
     def OnExit(self, event):
@@ -1738,6 +1798,7 @@ class AorCtrl(AorCtrlFrame):
             self.connected = False
             self.update_connection_ui()
             self.memory_banks.clear()
+            self.initial_bank_load_pending = True
             self.group_loading = {'scan': None, 'search': None}
             self.group_response = {'scan': None, 'search': None}
             self.write_serial('RX\r\n'.encode("ascii"))
@@ -1759,13 +1820,8 @@ class AorCtrl(AorCtrlFrame):
         self.last = None
         self.memory_rows.clear()
         self.memory_select_read = None
-        self.edit_list.list.ClearAll()
-        # set column names
-        column_headers = ['Channel', 'Select Scan', 'Skip Scan', 'FREQ', 'ST', 'AUTO', 'MODE', 'ATT', 'NAME']
-        for column, label in enumerate(column_headers):
-            self.edit_list.list.InsertColumn(column, label)
-        self.edit_list.list.SetColumnWidth(1, 95)
-        self.edit_list.list.SetColumnWidth(2, 90)
+        self.edit_list.memory_model.clear()
+        self.edit_list.show_memory(True)
 
         channel_count = channels
         blocks = (channel_count + 9) // 10
@@ -1779,13 +1835,15 @@ class AorCtrl(AorCtrlFrame):
 
     def show_memory_flags(self, channel):
         entry = self.memory_rows[channel]
-        metadata = self.selected_memory_bank()
-        if metadata is None or metadata['bank'] != channel[0]:
-            return
-        def checked(value):
-            return '[?]' if value is None else ('[x]' if value else '[ ]')
-        values = [channel, checked(entry['select']), checked(entry['skip'])] + entry['fields'][2:]
-        self.edit_list.list.fill_line(entry['row'], values)
+        if entry['row'] < len(self.edit_list.memory_model.channels):
+            self.edit_list.memory_model.RowChanged(entry['row'])
+
+    def memory_row_values(self, channel):
+        entry = self.memory_rows[channel]
+        fields = entry['fields']
+        return [channel, entry['select'], entry['skip'], display_frequency(protocol_frequency_hz(fields[2])),
+                display_step(protocol_step_hz(fields[3])), 'On' if fields[4] == '1' else 'Off',
+                self.cbx_mode.GetString(MD_TO_GUI_MODE[int(fields[5])]), 'On' if fields[6] == '1' else 'Off', fields[7]]
 
     def read_memory_select_flags(self):
         """GR supplies tags missing from MA; the following RX bounds the list."""
@@ -1805,26 +1863,23 @@ class AorCtrl(AorCtrlFrame):
                 self.active_operation is None and self.background_vfo is None and
                 (self.bandscope is None or (not self.bandscope.entered and self.bandscope.waiting is None)))
 
-    def on_memory_flag_double_click(self, event):
-        row, flags, column = self.edit_list.list.HitTestSubItem(event.GetPosition())
-        if self.selected_memory_bank() is not None and row != wx.NOT_FOUND and column in (1, 2):
-            self.toggle_memory_flag(self.edit_list.list.GetItemText(row), 'select' if column == 1 else 'skip')
-        else:
-            event.Skip()
+    def on_memory_context_menu(self, event):
+        if event.GetItem().IsOk():
+            self.open_memory_flag_menu(self.edit_list.memory_model.GetRow(event.GetItem()))
 
     def open_memory_flag_menu(self, row):
-        channel = self.edit_list.list.GetItemText(row)
+        channel = self.edit_list.memory_model.channels[row]
         entry = self.memory_rows.get(channel)
         if entry is None:
             return
         menu = wx.Menu()
-        for flag, label in (('select', 'Include in Select Scan'), ('skip', 'Skip in Memory Scan')):
+        for flag, label in (('select', 'Include in Selected Channels'), ('skip', 'Skip during Stored Channels scanning')):
             item = menu.AppendCheckItem(wx.ID_ANY, label)
             item.Check(bool(entry[flag]))
             item.Enable(self.memory_flags_editable(channel))
             menu.Bind(wx.EVT_MENU, lambda evt, flag=flag: self.toggle_memory_flag(channel, flag), id=item.GetId())
         try:
-            self.edit_list.list.PopupMenu(menu)
+            self.edit_list.memory.PopupMenu(menu)
         finally:
             menu.Destroy()
 
@@ -1856,16 +1911,16 @@ class AorCtrl(AorCtrlFrame):
                 edit = self.memory_flag_edit
                 if edit is not None and edit['phase'] == 'verify_select':
                     actual = edit['channel'] in snapshot['channels']
-                    self.finish_memory_flag_edit('%s Select Scan %s' %
+                    self.finish_memory_flag_edit('%s Selected %s' %
                                                  (edit['channel'], 'saved and verified' if actual == edit['desired'] else 'verification failed'), verified=True)
             else:
                 for channel, entry in self.memory_rows.items():
                     entry['select'] = None
                     self.show_memory_flags(channel)
                 if self.memory_flag_edit is not None:
-                    self.finish_memory_flag_edit('Select Scan read-back failed; flag could not be verified.')
+                    self.finish_memory_flag_edit('Selected Channels read-back failed; flag could not be verified.')
                 else:
-                    self.aor_status.SetStatusText('Select Scan flags unavailable: incomplete or malformed GR list. Refresh to retry.')
+                    self.aor_status.SetStatusText('Selected flags unavailable: incomplete or malformed GR list. Refresh to retry.')
         edit = self.memory_flag_edit
         if edit is None:
             return
@@ -1889,7 +1944,7 @@ class AorCtrl(AorCtrlFrame):
                 if edit['flag'] == 'skip':
                     command += b'RX\r\n'
             elif edit['phase'] == 'verify_skip':
-                self.finish_memory_flag_edit('%s Skip Scan %s' %
+                self.finish_memory_flag_edit('%s Skip %s' %
                                              (edit['channel'], 'saved and verified' if entry['skip'] == edit['desired'] else 'verification failed'), verified=True)
                 return
             else:
@@ -1924,16 +1979,17 @@ class AorCtrl(AorCtrlFrame):
         self.finish_memory_flag_edit('Memory flag read-back failed or timed out; state was not assumed. Refresh to retry.')
 
     def prepare_list(self, columns):
+        self.edit_list.show_memory(False)
         self.edit_list.list.ClearAll()
         for index, (label, width) in enumerate(columns):
             self.edit_list.list.InsertColumn(index, label, width=width)
 
     def get_select_scan(self):
         self.select_scan_rows.clear()
-        self.prepare_list((('Slot', 45), ('Channel', 65), ('Frequency MHz', 115),
-                           ('Step kHz', 70), ('Auto', 45), ('Mode', 55),
+        self.prepare_list((('Slot', 45), ('Channel', 65), ('Frequency', 140),
+                           ('Step', 100), ('Auto', 45), ('Mode', 55),
                            ('ATT', 40), ('Name', 130)))
-        self.aor_status.SetStatusText('Select Scan: Refresh reads entries; Scan Start starts Select Scan')
+        self.aor_status.SetStatusText('Selected Channels: Refresh reads membership; Stored Channels / Selected Channels starts it.')
         if self.serial.is_open:
             self.write_serial(b'GR\r\n')
 
@@ -1951,21 +2007,21 @@ class AorCtrl(AorCtrlFrame):
         if self.current_list_view() != 'SELECT SCAN':
             return
         if entry['channel'] is None:
-            self.aor_status.SetStatusText('Select Scan: %d tagged channels' % len(self.select_scan_rows))
+            self.aor_status.SetStatusText('Selected Channels: %d tagged channels' % len(self.select_scan_rows))
             return
         slot = entry['slot']
         if slot not in self.select_scan_rows:
             self.select_scan_rows[slot] = self.edit_list.list.InsertItem(
                 self.edit_list.list.GetItemCount(), slot)
-        values = (slot, entry['channel'], format(entry['frequency_hz'] / 1000000, '.6f'),
-                  format(entry['step_khz'].normalize(), 'f'), entry['auto'],
+        values = (slot, entry['channel'], display_frequency(entry['frequency_hz']),
+                  display_step(entry['step_khz'] * 1000), entry['auto'],
                   self.cbx_mode.GetString(MD_TO_GUI_MODE[entry['mode']]),
                   entry['attenuation'], entry['name'])
         self.edit_list.list.fill_line(self.select_scan_rows[slot], values)
 
     def get_pass_frequencies(self):
         self.pass_frequency_rows.clear()
-        self.prepare_list((('Slot', 55), ('Context', 115), ('Frequency MHz', 140), ('State', 80)))
+        self.prepare_list((('Slot', 55), ('Context', 115), ('Frequency', 140), ('State', 80)))
         self.aor_status.SetStatusText('Pass frequencies: %s. Refresh chooses bank / VFO; right-click removes bank entries' %
                                      self.pass_context)
         if self.serial.is_open:
@@ -1983,7 +2039,7 @@ class AorCtrl(AorCtrlFrame):
         self.pass_frequency_rows[slot] = entry
         frequency = entry['frequency_hz']
         self.edit_list.list.fill_line(row, (slot, 'VFO' if self.pass_context == 'V' else 'Bank %s' % self.pass_context,
-                                           '---' if frequency is None else format(frequency / 1000000, '.6f'),
+                                           '---' if frequency is None else display_frequency(frequency),
                                            'Empty' if frequency is None else 'Pass'))
 
     def on_choose_pass_context(self, evt):
@@ -2026,7 +2082,7 @@ class AorCtrl(AorCtrlFrame):
             self.get_pass_frequencies()
 
     def show_log_view(self):
-        self.prepare_list((('Time', 180), ('Frequency MHz', 120), ('Source', 100),
+        self.prepare_list((('Time', 180), ('Frequency', 140), ('Source', 100),
                            ('Level', 50), ('State', 70), ('Duration', 80)))
         for activity in self.activity_events:
             row = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), '')
@@ -2044,11 +2100,13 @@ class AorCtrl(AorCtrlFrame):
         self.pending_memory_channels.clear()
         self.row = 0
         self.search_bank_rows.clear()
+        self.edit_list.show_memory(False)
         self.edit_list.list.ClearAll()
         # set column names
-        column_headers = ['Search Bank', 'Lower MHz', 'Upper MHz', 'Step kHz', 'AUTO', 'MODE', 'ATT', 'NAME']
-        for column, label in enumerate(column_headers):
-            self.edit_list.list.InsertColumn(column, label)
+        column_headers = (('Stored Range', 85), ('Lower', 125), ('Upper', 125), ('Step', 100),
+                          ('Auto', 45), ('Mode', 55), ('Att', 40), ('Name', 130))
+        for column, (label, width) in enumerate(column_headers):
+            self.edit_list.list.InsertColumn(column, label, width=width)
 
         towrite = []
         comm = 'SR%%\r\n'
@@ -2074,7 +2132,7 @@ class AorCtrl(AorCtrlFrame):
         self.memory_banks[bank] = {'bank': bank, 'channels': count, 'name': name.strip()}
         self.cbx_lists.Clear()
         for view in ('SEARCH BANKS', 'SELECT SCAN', 'PASS FREQS', 'LOG VIEW', 'DATABASE'):
-            self.cbx_lists.Append(view)
+            self.cbx_lists.Append(LIST_LABELS[view])
         for identifier in sorted(self.memory_banks, key=lambda b: (b.upper(), b.islower())):
             metadata = self.memory_banks[identifier]
             label = metadata['name'] if metadata['name'] and metadata['name'] != identifier else '%s:%d' % (identifier, metadata['channels'])
@@ -2084,6 +2142,7 @@ class AorCtrl(AorCtrlFrame):
         if previous is None:
             self.cbx_lists.SetSelection(previous_index if 0 <= previous_index < 5 else wx.NOT_FOUND)
         self.sync_memory_choices()
+        self.maybe_load_initial_bank()
 
     def set_memory_banks(self, item):
         """initializes and fills memory Bank ListControl
@@ -2104,8 +2163,9 @@ class AorCtrl(AorCtrlFrame):
             return
         if columns[0] == self.last:
             return
-        row = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), columns[0])
+        row = len(self.edit_list.memory_model.channels)
         self.memory_rows[columns[0]] = {'row': row, 'fields': columns, 'select': None, 'skip': columns[1] == '1'}
+        self.edit_list.memory_model.append(columns[0])
         self.show_memory_flags(columns[0])
 
         self.last = columns[0]
@@ -2147,8 +2207,8 @@ class AorCtrl(AorCtrlFrame):
             if entry['empty']:
                 values = (bank, '---', '---', '---', '---', '---', '---', '')
             else:
-                values = (bank, '%.6f' % (entry['lower_hz'] / 1000000), '%.6f' % (entry['upper_hz'] / 1000000),
-                          format(entry['step_khz'], 'f'), str(int(entry['auto'])),
+                values = (bank, display_frequency(entry['lower_hz']), display_frequency(entry['upper_hz']),
+                          display_step(entry['step_khz'] * 1000), str(int(entry['auto'])),
                           self.cbx_mode.GetString(MD_TO_GUI_MODE[entry['mode']]), entry['attenuation'] or '---', entry['name'])
             self.edit_list.list.fill_line(self.search_bank_rows[bank], values)
         if bank in (self.edit_bank_pending, self.bank_write_pending):
@@ -2181,7 +2241,7 @@ class AorCtrl(AorCtrlFrame):
         self.rb_vfos.SetSelection(vfx)
         # step
         if '.' in step:
-            print('step with dot')
+            pass
             # in megaherz
         else:
             # in kilos
@@ -2231,7 +2291,8 @@ class AorCtrl(AorCtrlFrame):
             if not textline.startswith('LM'):
                 textline = textline.strip()
             if textline:
-                print('text < %s >' % [textline])
+                if DEBUG_SERIAL:
+                    print('Serial RX: %r' % textline, file=sys.stderr)
                 event = SerialRxEvent(self.GetId(), [textline])
                 self.GetEventHandler().AddPendingEvent(event)
 

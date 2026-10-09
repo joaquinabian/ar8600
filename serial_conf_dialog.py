@@ -48,7 +48,6 @@ class SerialConfigDialog(wx.Dialog):
             self.ports.append(portname)
             if self.serial.portstr == portname:
                 preferred_index = n
-        print(self.ports)
         if preferred_index != -1:
             self.combo_box_port.SetSelection(preferred_index)
         elif self.serial.port is not None:
@@ -193,7 +192,6 @@ class SerialConfigDialog(wx.Dialog):
 
         for name, value in settings.items():
             setattr(self.serial, name, value)
-        print(self.serial.parity)
         self.EndModal(wx.ID_OK)
 
     def OnCancel(self, events):

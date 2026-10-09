@@ -26,7 +26,6 @@ class TuningPanel(MyPanel):
     def on_arrows(self, evt):
         obj = evt.GetEventObject()
         name = obj.GetLabel()
-        print('xx ', name)
         evt.Skip(True)
 
     def on_enter(self, evt):
