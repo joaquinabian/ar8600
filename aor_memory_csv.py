@@ -67,13 +67,10 @@ def read_csv(path, bank):
                         raise ValueError(flag + ' must be 0 or 1')
                     flags[flag] = int(value)
                 name = record['Name']
-                # Validate with the existing MX helper. Include all fields even for Auto:
-                # import verifies the supplied Mode/Step instead of silently ignoring them.
+                # Let the existing MX helper omit ST/MD when scanner Auto is enabled.
                 command = make_memory_channel_command(channel, format(Decimal(frequency) / 1000000, 'f'),
-                                                      False, MODES.index(mode), format(Decimal(step) / 1000, 'f'),
+                                                      flags['Auto'], MODES.index(mode), format(Decimal(step) / 1000, 'f'),
                                                       flags['Att'], name)
-                if flags['Auto']:
-                    command = command.replace(b' AU0 ', b' AU1 ', 1)
                 rows[channel] = dict(flags, Frequency=frequency, Step=step, Mode=MODES.index(mode),
                                      Name=name.rstrip(), command=command,
                                      extra={column: record[column] for column in extras})
@@ -123,6 +120,7 @@ class BankImport:
         self.wm = {}
         self.error = None
         self.timer = wx.Timer(controller)
+        self.verify_later = None
         controller.Bind(wx.EVT_TIMER, self.on_timeout, self.timer)
         self.index = 0
         self.channels = sorted(plan['rows'])
@@ -342,6 +340,15 @@ class BankImport:
                                        (self.bank, self.channel, self.index + 1, len(self.channels)))
         if not self.send(self.plan['rows'][self.channel]['command']):
             return
+        self.phase = 'settle_write'
+        self.verify_later = wx.CallLater(150, self.read_written_channel, self.channel)
+
+    def read_written_channel(self, channel):
+        self.verify_later = None
+        if self.phase != 'settle_write' or self.error is not None or self.c.memory_bank_transfer is not self:
+            return
+        if channel != self.channel:
+            return
         self.phase = 'verify_write'
         self.fields = None
         self.remaining = {'%s%02d' % (self.bank, number) for number in range((int(self.channel[1:]) // 10 + 1) * 10)}
@@ -406,6 +413,9 @@ class BankImport:
         self.cleanup()
 
     def cleanup(self):
+        if self.verify_later is not None:
+            self.verify_later.Stop()
+            self.verify_later = None
         if self.c.memory_inventory is not None:
             self.c.memory_inventory['on_error'] = None
             self.c.finish_memory_inventory('Import: restoring receiver/protection...')
@@ -442,6 +452,9 @@ class BankImport:
         self.fail('Timeout during %s%s%s' % (self.phase, ' ' + self.channel if hasattr(self, 'channel') else '', detail))
 
     def finish(self, message, success=False):
+        if self.verify_later is not None:
+            self.verify_later.Stop()
+            self.verify_later = None
         self.timer.Stop()
         self.c.Unbind(wx.EVT_TIMER, source=self.timer)
         if self.restore_needed and not self.restored and self.c.serial.is_open:

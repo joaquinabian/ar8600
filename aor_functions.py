@@ -365,7 +365,7 @@ def make_memory_channel_command(channel, frequency, auto, mode, step, attenuatio
     command = 'MX%s RF%010d AU%d' % (channel, frequency_hz, bool(auto))
     if not auto:
         command += ' ST%06d MD%d' % (search_step_hz(step), mode)
-    return (command + ' AT%d TM%s\r\n' % (bool(attenuation), name)).encode('ascii')
+    return (command + ' AT%d TM%s\r\n' % (bool(attenuation), name.ljust(12))).encode('ascii')
 
 
 def memory_channel_read_command(channel):
