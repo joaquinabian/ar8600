@@ -1115,6 +1115,11 @@ class AorCtrl(AorCtrlFrame):
 
         self.aor_status.SetFieldsCount(2)
         self.aor_status.SetStatusWidths([-1, 260])
+        self.memory_import_error = False
+        self.status_background = self.aor_status.GetBackgroundColour()
+        if not self.status_background.IsOk():
+            self.status_background = wx.SystemSettings.GetColour(wx.SYS_COLOUR_BTNFACE)
+        self.aor_status.Bind(wx.EVT_PAINT, self.on_status_paint)
         self.aor_status.SetStatusText('Choose Serial Config, then Connect.')
         for control, tip in (
                 (self.rb_vfos, 'Select the active receiver VFO.'),
@@ -1479,10 +1484,44 @@ class AorCtrl(AorCtrlFrame):
         self.vfo_channel = None
         self.show_now_receiving()
 
+    def show_memory_import_result(self, message, failed=False, success=False):
+        if failed:
+            self.memory_import_error = True
+            self.aor_status.Refresh()
+        elif success:
+            self.clear_memory_import_error()
+        self.aor_status.SetStatusText(message)
+
+    def clear_memory_import_error(self):
+        if self.memory_import_error and self.memory_bank_transfer is None:
+            self.memory_import_error = False
+            self.aor_status.Refresh()
+
+    def on_status_paint(self, event):
+        if not self.memory_import_error:
+            event.Skip()
+            return
+        # Native Windows status bars cannot colour individual fields. Paint the
+        # existing bar while an import error is shown; retain native painting otherwise.
+        bar = self.aor_status
+        dc = wx.PaintDC(bar)
+        dc.SetBackground(wx.Brush(self.status_background))
+        dc.Clear()
+        dc.SetFont(bar.GetFont())
+        dc.SetTextForeground(wx.SystemSettings.GetColour(wx.SYS_COLOUR_BTNTEXT))
+        dc.SetPen(wx.Pen(wx.SystemSettings.GetColour(wx.SYS_COLOUR_BTNSHADOW)))
+        for index in range(bar.GetFieldsCount()):
+            rect = bar.GetFieldRect(index)
+            dc.SetBrush(wx.Brush(wx.Colour(255, 220, 220) if index == 0 else self.status_background))
+            dc.DrawRectangle(rect)
+            label = wx.Control.Ellipsize(bar.GetStatusText(index), dc, wx.ELLIPSIZE_END, max(1, rect.width - 8))
+            dc.DrawText(label, rect.x + 4, rect.y + max(0, (rect.height - dc.GetTextExtent(label)[1]) // 2))
+
     def receive_context_status(self, text):
         """Only called for validated active RX statuses, never cached/background VFOs."""
         if self.monitor_muted:
             return
+        self.clear_memory_import_error()
         memory = text.startswith(('MR ', 'MS ', 'SM '))
         fields = text.split(None, 8)[1:] if memory else text.split(None, 6)[1:] if re.match(r'SR[A-Ta-t] RF', text) else text.split()[1:]
         if text.startswith(('VS ', 'VV ')):
@@ -2518,7 +2557,7 @@ class AorCtrl(AorCtrlFrame):
             plan = read_csv(path, self.memory_banks[bank])
         except (OSError, ValueError, csv.Error) as error:
             wx.MessageBox(str(error), 'Invalid Memory Bank CSV', wx.OK | wx.ICON_ERROR, self)
-            self.aor_status.SetStatusText('Import rejected; no scanner writes: %s' % error)
+            self.show_memory_import_result('Import rejected; no scanner writes: %s' % error, failed=True)
             return
         BankImport(self, plan).start()
 
@@ -2556,6 +2595,7 @@ class AorCtrl(AorCtrlFrame):
                     writer.writerow(row)
             os.replace(temporary_path, snapshot['path'])
             temporary_path = None
+            self.clear_memory_import_error()
             self.aor_status.SetStatusText('Export complete: bank %s, %d populated channels. %s' %
                                          (bank, len(snapshot['rows']), snapshot['path']))
         except (OSError, ValueError, csv.Error) as error:
@@ -2727,6 +2767,8 @@ class AorCtrl(AorCtrlFrame):
         self.memory_inventory = None
         self.inventory_timer.Stop()
         self.update_connection_ui()
+        if message.startswith(('Export complete', 'Memory Bank read complete')):
+            self.clear_memory_import_error()
         self.aor_status.SetStatusText(message)
         if inventory is not None and inventory.get('on_error') is not None and message.startswith(('Export failed', 'Export cancelled')):
             inventory['on_error'](message)
@@ -2937,6 +2979,8 @@ class AorCtrl(AorCtrlFrame):
                 self.memory_channel_dialog.show_channel(pending['fields'])
             self.memory_channel_dialog.set_pending(False)
             self.memory_channel_dialog.message.SetLabel(message)
+        if 'saved and verified' in message or 'deleted and verified' in message:
+            self.clear_memory_import_error()
         self.aor_status.SetStatusText(message)
         self.show_now_receiving()
         self.update_connection_ui()
@@ -3087,6 +3131,8 @@ class AorCtrl(AorCtrlFrame):
                 self.write_serial(b'RX\r\n')
         else:
             self.release_monitor_mute()
+        if verified and 'saved and verified' in message:
+            self.clear_memory_import_error()
         self.aor_status.SetStatusText(message)
         self.update_connection_ui()
         if self.memory_channel_pending is not None and self.memory_channel_pending['phase'] == 'preserve':

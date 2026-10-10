@@ -55,8 +55,8 @@ def read_csv(path, bank):
                     raise ValueError('Duplicate Channel ' + channel)
                 if int(channel[1:]) >= bank['channels']:
                     raise ValueError('Channel %s is outside target capacity %d' % (channel, bank['channels']))
-                frequency = receiver_frequency_hz(format(quantity(record['Frequency'], 'MHz') / 1000000, 'f'))
                 step = search_step_hz(format(quantity(record['Step'], 'kHz') / 1000, 'f'))
+                frequency = receiver_frequency_hz(format(quantity(record['Frequency'], 'MHz') / 1000000, 'f'))
                 mode = record['Mode'].strip().upper()
                 if mode not in MODES:
                     raise ValueError('Invalid Mode: ' + mode)
@@ -101,6 +101,8 @@ def mismatch(channel, expected, fields, selected):
                   Auto=int(fields[4]), Mode=int(fields[5]), Att=int(fields[6]), Skip=int(fields[1]),
                   Selected=int(channel in selected), Name=fields[7].rstrip())
     for field in ('Frequency', 'Step', 'Auto', 'Mode', 'Att', 'Skip', 'Selected', 'Name'):
+        if field == 'Frequency' and expected['Step'] == 8330 and abs(actual[field] - expected[field]) <= 50:
+            continue
         if actual[field] != expected[field]:
             return '%s: %s expected %r, received %r' % (channel, field, expected[field], actual[field])
     return None
@@ -468,7 +470,9 @@ class BankImport:
             if self.original.startswith(('VA ', 'VB ', 'VF ')):
                 self.c.set_vfo_text(self.original, {'VA': 0, 'VB': 1, 'VF': 2}[self.original[:2]])
             self.c.receive_context_status(self.original)
-        self.c.aor_status.SetStatusText(message)
+        failed = (self.error is not None or message.startswith('Import failed') or
+                  'could not be verified' in message or 'verification failed' in message)
+        self.c.show_memory_import_result(message, failed=failed, success=success)
         if message.startswith('Import failed') or 'could not be verified' in message or 'verification failed' in message:
             import sys
             print(message, file=sys.stderr)

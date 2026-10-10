@@ -19,7 +19,10 @@ for spreadsheet compatibility. Normal CSV quoting applies.
   bank letter. Duplicate channel numbers after this override are rejected.
 - Frequency: an explicit Hz/kHz/MHz value, such as `93.500000 MHz` or
   `500.000 kHz`. Bare numbers mean MHz. The existing receiver frequency range
-  and 50 Hz resolution validation apply.
+  and 50 Hz resolution validation apply for every step, including `8.33 kHz`.
+  The parsed CSV frequency is written unchanged; no frequency normalization is
+  performed. Read-back must match exactly, except that `8.33 kHz` channels
+  allow an absolute frequency difference of at most 50 Hz.
 - Step: an explicit Hz/kHz/MHz value; bare numbers mean kHz. Existing tuning
   step validation applies, including the special `8.33 kHz` step.
 - Auto, Att, Skip, Selected: `0` or `1`.
