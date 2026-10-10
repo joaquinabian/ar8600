@@ -96,7 +96,7 @@ class AorCtrlFrame(wx.Frame):
         self.bt_mkpassfreq.Hide()
         self.sql = wx.Slider(self.panel_1, wx.ID_ANY, 0, 0, 255, style=wx.SL_HORIZONTAL)
         self.sql_value = wx.StaticText(self.panel_1, label="---", size=(40, -1))
-        self.sizer_18_staticbox = wx.StaticBox(self.panel_1, wx.ID_ANY, "Level Squelch")
+        self.sizer_18_staticbox = wx.StaticBox(self.panel_1, wx.ID_ANY, "Squelch")
         self.panel_2 = wx.Panel(self.panel_1, wx.ID_ANY)
         self.edit_list = EditListCtrlPanel(self)
         # Leave room for the expanded Search section and the existing activity log.

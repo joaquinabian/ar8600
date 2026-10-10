@@ -26,6 +26,9 @@ from aor_functions import (search_parameters, make_search_bank_command, parse_se
                            make_memory_channel_command, memory_channel_read_command)
 from aor_functions import receiver_frequency_hz, search_step_hz
 from aor_memory_csv import read_csv, export_record, COLUMNS as MEMORY_CSV_COLUMNS, BankImport
+from current_bank_scan import CurrentBankScan
+from command_console import CommandConsole
+from keyboard_focus import MainKeyboardFocus
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -34,6 +37,7 @@ MD_TO_GUI_MODE = {code: index for index, code in enumerate(GUI_MODE_TO_MD)}
 
 
 DEBUG_SERIAL = False
+SQUELCH_TOOLTIP = 'Signal threshold for opening the squelch or stopping the scan. 0 disables it.'
 LIST_LABELS = {'SEARCH BANKS': 'STORED RANGES', 'SELECT SCAN': 'SELECTED CHANNELS',
                'PASS FREQS': 'PASS FREQS', 'LOG VIEW': 'LOG VIEW', 'DATABASE': 'DATABASE'}
 
@@ -48,13 +52,14 @@ class SerialRxEvent(wx.PyCommandEvent):
     """"""
     eventType = SERIALRX
 
-    def __init__(self, win_id, data):
+    def __init__(self, win_id, data, raw_lines=None):
         wx.PyCommandEvent.__init__(self, self.eventType, win_id)
         self.data = data
+        self.raw_lines = data if raw_lines is None else raw_lines
 
     # noinspection PyMethodOverriding
     def Clone(self):
-        return self.__class__(self.GetId(), self.data)
+        return self.__class__(self.GetId(), self.data, self.raw_lines)
 
 
 class BandscopeWindow(wx.Frame):
@@ -903,7 +908,7 @@ class OperationSettingsDialog(wx.Dialog):
     def update(self):
         complete = self.context_confirmed and set(self.values) == set(self.controls)
         self.context_label.SetLabel('Scan Group 0 — factory defaults, read only' if self.family == 'X' and self.group == 0 else
-                                   'Applies to Manual Range / VFO (DB also controls Level Squelch)' if self.family == 'D' else
+                                   'Applies to Manual Range / VFO (also controls Squelch)' if self.family == 'D' else
                                    'Applies to %s group %s%s' %
                                    ('Linked Memory Banks' if self.family == 'X' else 'Linked Ranges',
                                     self.group, ' - fixed, read-only' if self.group == 0 else ''))
@@ -990,6 +995,15 @@ class AorCtrl(AorCtrlFrame):
         self.level_squelch_value = None
         self.level_squelch_pending = False
         self.level_squelch_requested = None
+        self.level_readback_timer = None
+        self.scan_levels = {}
+        self.current_scan_level = None
+        self.temporary_scan = None
+        self.scan_recovery = None
+        self.scan_lifecycle_action = None
+        self.scan_level_context = None
+        self.level_vfo_context = False
+        self.scan_call_later = wx.CallLater
         self.receiver_switches = {'NL': None, 'AF': None}
         self.receiver_switch_pending = set()
         self.afc_mode = None
@@ -1025,6 +1039,8 @@ class AorCtrl(AorCtrlFrame):
         self.receiver_status = None
         self.receiving_channel = None
         self.vfo_channel = None
+        self.database_station = None
+        self.command_console = None
         self.operation_signal_open = False
         self.alive = threading.Event()
         self.lm_pending = False
@@ -1079,9 +1095,11 @@ class AorCtrl(AorCtrlFrame):
         tools_menu = wx.Menu()
         self.inventory_action = tools_menu.Append(wx.ID_ANY, 'Export Memory Inventory...')
         database_settings = tools_menu.Append(wx.ID_ANY, 'Frequency Database Settings...')
+        console_action = tools_menu.Append(wx.ID_ANY, 'AR8600 Command Console...')
         self.GetMenuBar().Append(tools_menu, 'Tools')
         self.Bind(wx.EVT_MENU, self.on_export_memory_inventory, id=self.inventory_action.GetId())
         self.Bind(wx.EVT_MENU, self.edit_list.database.on_database_settings, id=database_settings.GetId())
+        self.Bind(wx.EVT_MENU, self.on_command_console, id=console_action.GetId())
         self.import_bank_action = self.mfile.Append(wx.ID_ANY, 'Import Memory Bank CSV...')
         self.export_bank_action = self.mfile.Append(wx.ID_ANY, 'Export Memory Bank CSV...')
         self.Bind(wx.EVT_MENU, self.on_import_memory_csv, id=self.import_bank_action.GetId())
@@ -1089,6 +1107,7 @@ class AorCtrl(AorCtrlFrame):
         database_action = self.mfile.Append(wx.ID_ANY, 'Open Frequency Database CSV...')
         self.Bind(wx.EVT_MENU, self.on_open_frequency_database, id=database_action.GetId())
         self.setup_usability()
+        self.keyboard_focus = MainKeyboardFocus(self, self.sql)
 
     def setup_usability(self):
         toolbar = self.GetToolBar()
@@ -1185,8 +1204,8 @@ class AorCtrl(AorCtrlFrame):
                 ):
             control.SetToolTip(tip)
         self.update_connection_ui()
-        self.sql.SetToolTip('Signal-level squelch threshold for VFO and frequency-range searching; 0 disables it.')
-        self.sql_value.SetToolTip('Scanner-confirmed level squelch threshold; Off means DB000.')
+        self.sql.SetToolTip(SQUELCH_TOOLTIP)
+        self.sql_value.SetToolTip(SQUELCH_TOOLTIP)
 
     def update_connection_ui(self):
         port_open = self.serial.is_open and self.alive.is_set()
@@ -1214,11 +1233,12 @@ class AorCtrl(AorCtrlFrame):
         self.cbx_lists.Enable(self.memory_channel_pending is None and self.memory_inventory is None and self.memory_bank_transfer is None)
         self.operation_choice.Enable(self.memory_inventory is None and self.memory_bank_transfer is None)
         self.source_choice.Enable(self.memory_inventory is None and self.memory_bank_transfer is None)
-        self.sql.Enable(ready and self.memory_inventory is None and self.memory_bank_transfer is None and self.level_squelch_value is not None and not self.level_squelch_pending)
+        self.update_level_ui()
         self.bt_settings.Enable(ready and self.active_operation is None)
         if not port_open:
             self.receiver_status = None
             self.vfo_channel = None
+            self.database_station = None
             self.show_now_receiving()
         pending = self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None
         if pending != self.memory_flag_cells_pending:
@@ -1243,8 +1263,28 @@ class AorCtrl(AorCtrlFrame):
         self.panel_1.Layout()
         if self.bandscope is not None:
             self.bandscope.set_controls_enabled(self.bandscope.waiting is None)
+        if self.command_console is not None:
+            self.command_console.update_connection()
+
+    def on_command_console(self, event):
+        if self.command_console is None:
+            self.command_console = CommandConsole(self)
+        self.command_console.Show()
+        self.command_console.Raise()
+
+    def mirror_console_line(self, prefix, line):
+        console = getattr(self, 'command_console', None)
+        if console is not None:
+            console.append(prefix, line)
+
+    def post_console_receive(self, line):
+        if self.command_console is not None:
+            self.GetEventHandler().AddPendingEvent(SerialRxEvent(self.GetId(), [], [line]))
 
     def on_bandscope(self, event):
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(lambda: self.on_bandscope(None))
+            return
         if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None:
             self.aor_status.SetStatusText('Wait for the memory-channel flag read-back before opening bandscope.')
             return
@@ -1303,7 +1343,7 @@ class AorCtrl(AorCtrlFrame):
                 'Search Bank': 'AR8600 Search Bank: a saved frequency-search range.',
                 'Search Group': 'AR8600 Search Group: several Search Banks linked together.'}
         self.source_choice.SetToolTip(tips[source])
-        idle = self.active_operation is None
+        idle = self.active_operation is None and (self.temporary_scan is None or self.temporary_scan.phase == 'ready')
         panels = (self.memory_source_panel, self.scan_source_panel, self.range_source_panel,
                   self.bank_source_panel, self.search_source_panel)
         selected = {('Memory Scan', 'Current Bank'): self.memory_source_panel,
@@ -1317,7 +1357,7 @@ class AorCtrl(AorCtrlFrame):
         for kind, control in (('scan', self.cbx_scan), ('search', self.cbx_search)):
             panel = self.scan_source_panel if kind == 'scan' else self.search_source_panel
             control.Enable(ready and idle and panel is selected and self.group_loading[kind] is None)
-        self.bt_start.Enable(ready and idle)
+        self.bt_start.Enable(ready and idle and not self.level_squelch_pending and self.level_squelch_requested is None)
         self.bt_stop.Enable(ready)
         self.bt_settings.Enable(ready and idle)
         if self.settings_dialog is not None:
@@ -1337,13 +1377,16 @@ class AorCtrl(AorCtrlFrame):
         self.on_source_changed(event)
 
     def on_source_changed(self, event):
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(lambda: self.on_source_changed(None))
+            return
+        self.level_vfo_context = False
+        self.refresh_level_context()
         self.update_operation_ui()
         if not self.connected or not self.serial.is_open or self.active_operation is not None:
             return
         operation, source = self.operation_selection()
-        if source == 'Scan Group':
-            self.request_group('scan')
-        elif source == 'Search Group':
+        if source == 'Search Group':
             self.request_group('search')
         elif source == 'Search Bank':
             self.select_list_view('SEARCH BANKS')
@@ -1368,6 +1411,9 @@ class AorCtrl(AorCtrlFrame):
                 self.memory_bank_choice.SetSelection(index)
 
     def on_memory_source_changed(self, event):
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(lambda: self.on_memory_source_changed(None))
+            return
         metadata = self.operation_memory_bank()
         if metadata is None:
             return
@@ -1396,6 +1442,8 @@ class AorCtrl(AorCtrlFrame):
         if not self.connected or not self.serial.is_open or self.active_operation is not None or self.memory_channel_pending is not None:
             return
         operation, source = self.operation_selection()
+        self.level_vfo_context = False
+        self.refresh_level_context(query=False)
         started = False
         if operation == 'Memory Scan':
             if source == 'Current Bank':
@@ -1403,8 +1451,8 @@ class AorCtrl(AorCtrlFrame):
                 if metadata is None:
                     self.aor_status.SetStatusText('Choose a Memory Bank to scan.')
                     return
-                command = ('GM0\r\nMS%s\r\nRX\r\n' % metadata['bank']).encode('ascii')
-                started = self.write_serial(command) == len(command)
+                self.prepare_current_bank_scan(metadata)
+                return
             else:
                 started = self.on_select_scan_start(event, source=source)
         elif source == 'Range':
@@ -1422,6 +1470,9 @@ class AorCtrl(AorCtrlFrame):
             self.update_operation_ui()
 
     def on_operation_stop(self, event):
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(self.enter_vfo_level_context)
+            return
         if not self.connected or not self.serial.is_open:
             return
         # Range Search has cached VFO settings to restore; other sources leave
@@ -1435,6 +1486,7 @@ class AorCtrl(AorCtrlFrame):
         self.receiver_status = None
         self.show_now_receiving()
         self.update_operation_ui()
+        self.enter_vfo_level_context()
 
     def open_operation_settings(self, event):
         if self.settings_dialog is not None:
@@ -1444,8 +1496,23 @@ class AorCtrl(AorCtrlFrame):
             return
         operation, source = self.operation_selection()
         family = 'X' if operation == 'Memory Scan' else 'D' if source == 'Range' else 'S'
+        if operation == 'Memory Scan' and self.level_vfo_context:
+            self.level_vfo_context = False
+            self.refresh_level_context()
+        if source == 'Current Bank':
+            if self.temporary_scan is None:
+                metadata = self.operation_memory_bank()
+                if metadata is None:
+                    self.aor_status.SetStatusText('Choose a Memory Bank first.')
+                    return
+                self.prepare_current_bank_scan(metadata, ready=lambda: self.open_operation_settings(None))
+                return
+            if self.temporary_scan.phase != 'ready':
+                return
         group = (0 if source == 'Current Bank' else int(self.cbx_scan.GetValue()) if source == 'Scan Group' else
                  int(self.cbx_search.GetValue()) if source == 'Search Group' else None)
+        if source == 'Current Bank':
+            group = self.temporary_scan.group
         self.settings_dialog = OperationSettingsDialog(self, family, group)
         self.settings_dialog.Show()
         self.settings_dialog.read()
@@ -1455,12 +1522,157 @@ class AorCtrl(AorCtrlFrame):
         key, value = parse_operation_parameter(text)
         if key == 'DB':
             self.level_squelch_value = value
+        elif key == 'XB':
+            group = self.group_response['scan']
+            if group is not None:
+                self.scan_levels[group] = value
+                if self.temporary_scan is not None and self.temporary_scan.group == group:
+                    self.current_scan_level = value
+        context = self.level_context()
+        if key == context[0] and (key == 'DB' or self.group_response['scan'] == context[1]):
             self.level_squelch_pending = False
-            self.sql.SetValue(value)
-            self.sql_value.SetLabel('Off' if value == 0 else str(value))
-            self.update_connection_ui()
+            if self.level_readback_timer is not None:
+                self.level_readback_timer.Stop()
+        self.update_level_ui()
+        self.update_operation_ui()
         if self.settings_dialog is not None:
             self.settings_dialog.accept(key, value)
+
+    def report_scan_error(self, message):
+        self.aor_status.SetStatusText(message)
+        print(message, file=sys.stderr)
+
+    def prepare_current_bank_scan(self, metadata, ready=None):
+        if self.temporary_scan is not None:
+            if self.temporary_scan.phase == 'ready' and self.temporary_scan.target == metadata['bank']:
+                if ready is None:
+                    self.temporary_scan.begin_scan()
+                else:
+                    ready()
+            return
+        if (self.filling_banks or self.memory_select_read is not None or self.memory_flag_edit is not None or
+                self.memory_inventory is not None or self.memory_bank_transfer is not None or
+                self.settings_dialog is not None or any(self.group_loading.values()) or
+                any(self.group_dialogs.values()) or self.bandscope is not None and self.bandscope.pauses_lm):
+            self.aor_status.SetStatusText('Wait for the current scanner read/edit before preparing a bank scan.')
+            return
+        if self.level_squelch_requested is not None:
+            self.level_squelch_timer.Stop()
+            self.current_scan_level = self.level_squelch_requested
+            self.level_squelch_requested = None
+        self.temporary_scan = CurrentBankScan(self, metadata, self.current_scan_level, ready)
+        self.temporary_scan.start()
+        self.update_connection_ui()
+
+    def restore_temporary_scan(self, callback=None, disconnecting=False):
+        scan = self.temporary_scan
+        if scan is None:
+            if callback is not None:
+                callback()
+            return
+        def restored():
+            self.scan_lifecycle_action = None
+            if (disconnecting and self.temporary_scan is not None and
+                    self.temporary_scan.phase == 'restore_failed'):
+                # Transport loss must not trap the user in an unclosable GUI.
+                # Keep the original snapshot in RAM for one recovery attempt
+                # on the next connection; report the unverified restoration.
+                self.scan_recovery = self.temporary_scan
+                self.temporary_scan = None
+                self.report_scan_error('Scan Group restoration was NOT verified; original state held only in this session for reconnect recovery.')
+            if self.temporary_scan is None and callback is not None:
+                callback()
+        # One deferred close/disconnect/source action, never several concurrent restores.
+        if self.scan_lifecycle_action is not None:
+            if disconnecting and callback is not None:
+                # A later close/disconnect supersedes a pending source change
+                # or reconnect initialization, without repeating restoration.
+                self.scan_lifecycle_action = callback
+                scan.finish_callback = restored
+            return
+        self.scan_lifecycle_action = callback or (lambda: None)
+        scan.restore(restored)
+
+    def level_context(self):
+        operation, source = self.operation_selection()
+        if getattr(self, 'level_vfo_context', False) or operation != 'Memory Scan':
+            return ('DB', None)
+        if source == 'Current Bank':
+            return ('XB', self.temporary_scan.group if self.temporary_scan is not None else None)
+        return ('XB', int(self.cbx_scan.GetValue()))
+
+    def displayed_level(self):
+        key, group = self.level_context()
+        if key == 'XB' and group is None:
+            return None  # No scanner-confirmed group exists yet.
+        if key == 'XB' and group is not None and self.group_response['scan'] != group:
+            return None
+        return self.level_squelch_value if key == 'DB' else self.scan_levels.get(group)
+
+    def update_level_ui(self):
+        key, group = self.level_context()
+        value = None if self.level_squelch_pending else self.displayed_level()
+        self.sizer_18_staticbox.SetLabel('Squelch')
+        self.sql.SetToolTip(SQUELCH_TOOLTIP)
+        self.sql_value.SetToolTip(SQUELCH_TOOLTIP)
+        self.sql_value.SetLabel('---' if value is None else 'Off' if value == 0 else str(value))
+        if self.level_squelch_requested is None:
+            # Unknown/read-pending is not the previous context's threshold.
+            self.sql.SetValue(0 if value is None else value)
+        scan_busy = self.temporary_scan is not None and self.temporary_scan.busy
+        enabled = (self.connected and self.serial.is_open and self.alive.is_set() and
+                        self.memory_inventory is None and self.memory_bank_transfer is None and
+                        not self.level_squelch_pending and not scan_busy and
+                        value is not None and
+                        not (key == 'XB' and self.group_loading['scan'] is not None) and
+                        not (key == 'XB' and group == 0))
+        keyboard = getattr(self, 'keyboard_focus', None)
+        if keyboard is None:
+            self.sql.Enable(enabled)
+        else:
+            keyboard.enable_slider(enabled)
+
+    def refresh_level_context(self, query=True):
+        context = self.level_context()
+        if context != self.scan_level_context:
+            if self.level_readback_timer is not None:
+                self.level_readback_timer.Stop()
+            self.level_squelch_timer.Stop()
+            self.level_squelch_requested = None
+            self.level_squelch_pending = False
+            self.scan_level_context = context
+        if not query or not self.connected or not self.serial.is_open:
+            self.update_level_ui()
+            return
+        key, group = context
+        if key == 'DB':
+            self.level_squelch_value = None
+            self.level_squelch_pending = True
+            self.update_level_ui()
+            self.write_serial(b'DB\r\n')
+            self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+        elif group is not None and self.temporary_scan is not None:
+            if not self.temporary_scan.busy and self.group_response['scan'] == group:
+                self.scan_levels.pop(group, None)
+                self.level_squelch_pending = True
+                self.update_level_ui()
+                self.write_serial(b'XB\r\n')
+                self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+            else:
+                self.update_level_ui()
+        elif group is not None and self.active_operation is None:
+            self.request_group('scan')
+        else:
+            self.update_level_ui()
+
+    def enter_vfo_level_context(self):
+        self.level_vfo_context = True
+        self.refresh_level_context()
+
+    def show_scan_frequency(self, frequency_hz):
+        # A scan cursor is a temporary DISPLAY, never a VFO cache update.
+        label = (self.lb_vfa, self.lb_vfb, self.lb_vfo)[self.rb_vfos.GetSelection()]
+        label.SetLabel(format_frequency('%010d' % int(frequency_hz)))
 
     def show_now_receiving(self):
         previous = self.receiving_channel
@@ -1482,6 +1694,11 @@ class AorCtrl(AorCtrlFrame):
             if channel:
                 text = channel + (' — ' + name if name else '')
                 self.receiving_channel = channel
+            elif (getattr(self, 'database_station', None) is not None and
+                  self.database_station['confirmed'] and
+                  all(state.get(key) is None or state[key] == value
+                      for key, value in self.database_station['expected'].items())):
+                text = self.database_station['station']
             else:
                 text = '—'
         self.now_text.SetLabel(text)
@@ -1492,8 +1709,9 @@ class AorCtrl(AorCtrlFrame):
                 self.show_memory_flags(channel)
 
     def clear_vfo_channel(self):
-        """A manual receiver change ends the explicit memory-to-VFO association."""
+        """A manual change ends explicit memory/database-to-VFO provenance."""
         self.vfo_channel = None
+        self.database_station = None
         self.show_now_receiving()
 
     def show_memory_import_result(self, message, failed=False, success=False):
@@ -1544,6 +1762,12 @@ class AorCtrl(AorCtrlFrame):
                  'step_hz': protocol_step_hz(values['ST']), 'mode': int(values['MD']),
                  'auto': int(values['AU']), 'attenuator': int(values['AT']),
                  'channel': values.get('MX'), 'name': values.get('TM', values.get('TT', ''))}
+        station = getattr(self, 'database_station', None)
+        if station is not None:
+            if state['channel'] is not None or any(state[key] != value for key, value in station['expected'].items()):
+                self.database_station = None
+            else:
+                station['confirmed'] = True
         identity = self.vfo_channel
         if identity is not None:
             if any(state[key] != value for key, value in identity['expected'].items()):
@@ -1559,6 +1783,8 @@ class AorCtrl(AorCtrlFrame):
             # A moving RX cursor is not a new squelch-open/paused-channel event.
             self.operation_signal_open = False
         self.receiver_status = state
+        if text.startswith(('MS ', 'SM ')):
+            self.show_scan_frequency(state['frequency_hz'])
         self.afc_mode = state['mode']
         self.update_receiver_switch_ui()
         if text.startswith(('MS ', 'SM ', 'VS ', 'VV ')) or re.match(r'SR[A-Ta-t] RF', text):
@@ -1591,6 +1817,13 @@ class AorCtrl(AorCtrlFrame):
             elif self.receiver_status is not None and (self.receiver_status['context'], self.receiver_status['frequency_hz']) == (context, activity['frequency_hz']):
                 state.update(mode=self.receiver_status['mode'], step_hz=self.receiver_status['step_hz'])
             self.receiver_status = state
+            station = getattr(self, 'database_station', None)
+            if station is not None and station['confirmed'] and (
+                    channel is not None or any(state.get(key) is not None and state[key] != value
+                                               for key, value in station['expected'].items())):
+                self.database_station = None
+            if self.active_operation is not None and self.active_operation[0] == 'Memory Scan':
+                self.show_scan_frequency(state['frequency_hz'])
             if state['mode'] is None or channel and not was_open and self.active_operation is not None:
                 # One RX on an LC1 open supplies details absent from LC; no new polling.
                 self.write_serial(b'RX\r\n')
@@ -1642,15 +1875,22 @@ class AorCtrl(AorCtrlFrame):
             self.release_monitor_mute()
             if self.serial.is_open:
                 self.write_serial(b'RX\r\n')
+                self.enter_vfo_level_context()
 
     def release_monitor_mute(self):
-        if self.monitor_muted and self.serial.is_open:
-            if self.write_serial(b'MC0\r\n') != 5:
-                print('Could not release temporary monitor mute (MC0)', file=sys.stderr)
-                self.aor_status.SetStatusText('MC0 failed: temporary squelch mute could not be released. See serial diagnostics.')
-                return False
-        self.monitor_muted = False
-        return True
+        released = True
+        try:
+            if self.monitor_muted:
+                released = self.serial.is_open and self.write_serial(b'MC0\r\n') == 5
+        except (serial.SerialException, OSError) as error:
+            released = False
+            print('MC0 release error: %s' % error, file=sys.stderr)
+        finally:
+            self.monitor_muted = False
+        if not released:
+            print('Could not release temporary monitor mute (MC0)', file=sys.stderr)
+            self.aor_status.SetStatusText('MC0 failed: temporary squelch mute could not be released. See serial diagnostics.')
+        return released
 
     def tune_database_record(self, record):
         if not self.connected or not self.serial.is_open or not self.alive.is_set():
@@ -1675,17 +1915,31 @@ class AorCtrl(AorCtrlFrame):
         except (ValueError, IndexError) as error:
             self.aor_status.SetStatusText('Database station could not be tuned: %s' % error)
             return
-        command = self.normal_vfo_command() + ('AU0\r\nRF%010d\r\nMD%d\r\nST%06d\r\n' %
+        context = self.normal_vfo_command()
+        command = context + ('AU0\r\nRF%010d\r\nMD%d\r\nST%06d\r\n' %
                                               (frequency, mode, step)).encode('ascii')
         self.clear_vfo_channel()
+        self.database_station = {'station': record.values['Station'], 'confirmed': False,
+                                 'expected': {'context': {b'VA\r\n': 'VFO-A', b'VB\r\n': 'VFO-B', b'VF\r\n': 'VFO'}[context],
+                                              'frequency_hz': frequency, 'mode': mode, 'step_hz': step, 'auto': 0}}
         self.monitor_muted = True
         try:
             if self.write_serial(b'MC1\r\n' + command) != len(command) + 5:
+                self.database_station = None
                 self.aor_status.SetStatusText('Database tuning write failed; requesting actual receiver state.')
+        except (serial.SerialException, OSError) as error:
+            self.database_station = None
+            print('Database tuning write error: %s' % error, file=sys.stderr)
+            self.aor_status.SetStatusText('Database tuning write failed; requesting actual receiver state.')
         finally:
-            self.release_monitor_mute()
-            if self.serial.is_open:
-                self.write_serial(b'RX\r\n')
+            released = False
+            try:
+                released = self.release_monitor_mute()
+            finally:
+                if self.serial.is_open:
+                    if self.write_serial(b'RX\r\n') != 4 and released:
+                        self.aor_status.SetStatusText('Database RX read-back failed; tuning was not confirmed.')
+                    self.enter_vfo_level_context()
 
     def start_thread(self):
         """Start the receiver thread"""
@@ -1714,27 +1968,53 @@ class AorCtrl(AorCtrlFrame):
                 break
 
     def on_level_squelch_change(self, event):
-        if not self.connected or not self.serial.is_open or self.level_squelch_pending:
+        if (not self.connected or not self.serial.is_open or self.level_squelch_pending or
+                self.displayed_level() is None):
             return
         self.level_squelch_requested = self.sql.GetValue()
         self.level_squelch_timer.StartOnce(250)
+        self.update_operation_ui()
 
     def on_level_squelch_timer(self, event):
         value = self.level_squelch_requested
         self.level_squelch_requested = None
-        if value is None or not self.connected or not self.serial.is_open or value == self.level_squelch_value:
+        if value is None or not self.connected or not self.serial.is_open or value == self.displayed_level():
+            self.update_operation_ui()
+            return
+        key, group = self.level_context()
+        if key == 'XB' and group is None:
+            # Do not accept an edit until a real group value has been read.
+            self.update_level_ui()
+            self.update_operation_ui()
+            return
+        if key == 'XB' and (group == 0 or self.temporary_scan is not None and self.temporary_scan.busy):
+            return
+        if self.displayed_level() is None:
+            self.aor_status.SetStatusText('Wait for the current squelch read-back.')
             return
         self.level_squelch_pending = True
-        self.sql.SetValue(self.level_squelch_value)
+        self.sql.SetValue(self.displayed_level())
         self.update_connection_ui()
-        command = ('DB%03d\r\nDB\r\n' % value).encode('ascii')
+        command = operation_parameter_command(key, value) + (key + '\r\n').encode('ascii')
         if self.write_serial(command) != len(command):
             self.level_squelch_pending = False
-            self.aor_status.SetStatusText('Level Squelch write failed; value was not verified.')
+            self.aor_status.SetStatusText('Squelch write failed; value was not verified.')
             self.update_connection_ui()
+        else:
+            self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+
+    def on_level_readback_timeout(self):
+        if self.level_squelch_pending:
+            self.level_squelch_pending = False
+            self.report_scan_error('%s level read-back timed out; value was not assumed.' % self.level_context()[0])
+            self.update_level_ui()
+            self.update_operation_ui()
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(self.stop_thread, disconnecting=True)
+            return
         self.cancel_startup_connect()
         if self.memory_bank_transfer is not None:
             self.memory_bank_transfer.abort_disconnect()
@@ -1758,9 +2038,12 @@ class AorCtrl(AorCtrlFrame):
         self.pending_memory_channels.clear()
         self.initial_bank_load_pending = False
         self.level_squelch_timer.Stop()
+        if self.level_readback_timer is not None:
+            self.level_readback_timer.Stop()
         self.level_squelch_pending = False
         self.level_squelch_requested = None
         self.level_squelch_value = None
+        self.scan_levels.clear()
         self.receiver_switches = {'NL': None, 'AF': None}
         self.receiver_switch_pending.clear()
         self.afc_mode = None
@@ -1811,7 +2094,7 @@ class AorCtrl(AorCtrlFrame):
         if self.lm_timer.IsRunning() or not self.connected or not self.serial.is_open:
             return
         self.lm_pending = False
-        self.level_squelch_pending = True
+        self.level_squelch_pending = self.level_context()[0] == 'DB'
         self.write_serial(b'DB\r\n')
         self.receiver_switch_pending.update(('NL', 'AF'))
         if self.write_serial(b'NL\r\nAF\r\n') != 8:
@@ -1819,6 +2102,9 @@ class AorCtrl(AorCtrlFrame):
         if self.write_serial(b'LC1\r\n') == 5:
             self.lc_enabled = True
             self.lm_timer.Start(250)
+        self.refresh_level_context(query=False)
+        if self.level_context()[0] == 'XB' and self.level_context()[1] is not None:
+            self.request_group('scan')
 
     def stop_monitoring(self):
         self.lm_timer.Stop()
@@ -1943,8 +2229,7 @@ class AorCtrl(AorCtrlFrame):
             self.set_port()
         elif evt.GetId() == self.connect_tool_id:
             if self.serial.is_open:
-                self.stop_thread()
-                self.close_serial()
+                self.disconnect()
             else:
                 self.connect()
 
@@ -2019,6 +2304,7 @@ class AorCtrl(AorCtrlFrame):
 
     def on_select_vfo(self, evt):
         """Select working vfo"""
+        self.enter_vfo_level_context()
         selection = self.rb_vfos.GetSelection()
         if selection in self.vfo_status:
             self.set_vfo_text(self.vfo_status[selection], selection)
@@ -2124,6 +2410,14 @@ class AorCtrl(AorCtrlFrame):
         prefix = 'GM' if kind == 'scan' else 'GS'
         self.group_loading[kind] = group
         self.group_response[kind] = None
+        if kind == 'scan':
+            self.level_vfo_context = False
+            self.refresh_level_context(query=False)
+            self.scan_levels.pop(group, None)
+            if self.level_context()[0] == 'XB':
+                self.level_squelch_pending = True
+                self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+        self.update_level_ui()
         self.write_serial(('%s%d\r\n%s\r\n' % (prefix, group, prefix)).encode('ascii'))
         self.update_connection_ui()
 
@@ -2266,6 +2560,8 @@ class AorCtrl(AorCtrlFrame):
         comm = 'RF%010.5f\r\n' % freq
         self.write_serial(comm.encode("ascii"))
         self.write_serial(b'RX\r\n')
+        if self.active_operation is None:
+            self.enter_vfo_level_context()
 
     def on_select_list(self, evt):
         if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None:
@@ -2275,6 +2571,8 @@ class AorCtrl(AorCtrlFrame):
             self.last_memory_bank = self.selected_memory_bank()['bank']
             self.sync_memory_choices(self.selected_memory_bank())
         selection = self.current_list_view()
+        if selection == 'DATABASE' and self.active_operation is None:
+            self.enter_vfo_level_context()
         self.edit_list.show_memory(self.selected_memory_bank() is not None)
         self.update_connection_ui()
         if selection not in ('LOG VIEW', 'DATABASE') and not (
@@ -2306,12 +2604,17 @@ class AorCtrl(AorCtrlFrame):
 
     def on_serial_read(self, event):
         """Handle input from the serial port."""
+        for line in getattr(event, 'raw_lines', event.data):
+            self.mirror_console_line('<', line)
         received_valid = False
         startup_readback = False
         for first in event.data:
             try:
                 if not isinstance(first, str):
                     raise ValueError('Response must be text')
+                if self.temporary_scan is not None and self.temporary_scan.receive(first):
+                    received_valid = True
+                    continue
                 if self.memory_bank_transfer is not None and self.memory_bank_transfer.receive(first):
                     received_valid = True
                     continue
@@ -2418,7 +2721,9 @@ class AorCtrl(AorCtrlFrame):
                 if isinstance(first, str) and first.startswith('GR') and self.memory_select_read is not None:
                     self.memory_select_read['invalid'] = True
                 print('Ignored malformed scanner response %r: %s' % (first, error), file=sys.stderr)
-        if received_valid and (not self.startup_connect_pending or startup_readback) and self.serial.is_open and self.alive.is_set() and not self.connected:
+        if (received_valid and self.temporary_scan is None and
+                (not self.startup_connect_pending or startup_readback) and
+                self.serial.is_open and self.alive.is_set() and not self.connected):
             self.cancel_startup_connect()
             self.connected = True
             self.start_monitoring()
@@ -2428,6 +2733,16 @@ class AorCtrl(AorCtrlFrame):
         self.maybe_load_initial_bank()
 
     def write_serial(self, data):
+        scan = self.temporary_scan
+        if scan is not None and not scan.sending:
+            # Other group/MA writers could corrupt the snapshot or verification.
+            # During an active scan, allow normal receiver controls and live XB.
+            commands = [command for command in data.split(b'\r\n') if command]
+            if (scan.busy and any(command != b'LM' for command in commands) or
+                    any(command.startswith((b'GM', b'BM', b'MA')) for command in commands) and
+                    not (scan.phase == 'ready' and self.settings_dialog is not None)):
+                self.aor_status.SetStatusText('Wait for temporary scan-group restoration before changing scanner context.')
+                return
         if self.memory_bank_transfer is not None and not self.memory_bank_transfer.sending and any(
                 re.fullmatch(rb'RX|TB|GR|LM|MA[A-Ja-j]?', command) is None
                 for command in data.split(b'\r\n') if command):
@@ -2439,11 +2754,24 @@ class AorCtrl(AorCtrlFrame):
             self.aor_status.SetStatusText('Inventory export is read-only; wait for it to finish before changing scanner settings.')
             return
         try:
-            return self.serial.write(data)
+            written = self.serial.write(data)
+            if written:
+                for command in data[:written].decode('ascii', errors='backslashreplace').split('\r\n'):
+                    if command:
+                        self.mirror_console_line('>', command)
+                if getattr(self, 'database_station', None) is not None and not self.monitor_muted:
+                    if any(re.fullmatch(rb'RF.+|MD.+|ST.+|AU[01]|AT[01]|VA|VB|VF|MR.+|MS.*|SM|VS|VV.*|SS.+|AM', command)
+                           for command in data[:written].split(b'\r\n')):
+                        self.database_station = None
+                        self.show_now_receiving()
+            return written
         except serial.SerialException as error:
             print('Serial write error: %s' % error, file=sys.stderr)
 
     def close_serial(self):
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(self.disconnect, disconnecting=True)
+            return
         self.cancel_startup_connect()
         self.stop_monitoring()
         self.connected = False
@@ -2491,6 +2819,11 @@ class AorCtrl(AorCtrlFrame):
 
     def on_close(self, event):
         """Called on application shutdown."""
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(lambda: self.on_close(None), disconnecting=True)
+            if event is not None and event.CanVeto():
+                event.Veto()
+            return
         self.stop_thread()               # stop reader thread
         self.close_serial()             # cleanup
         self.Destroy()                  # close windows, exit app
@@ -2499,6 +2832,9 @@ class AorCtrl(AorCtrlFrame):
         """Show the port settings dialog. The reader thread is stopped for the
            settings change.
         """
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(self.set_port, disconnecting=True)
+            return
         self.stop_thread()
         self.close_serial()
 
@@ -2532,6 +2868,9 @@ class AorCtrl(AorCtrlFrame):
 
     def connect(self, silent=False):
         """Use the same initialization and read-back for manual/startup connections."""
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(lambda: self.connect(silent=silent), disconnecting=True)
+            return
         self.stop_thread()
         self.close_serial()
 
@@ -2563,13 +2902,27 @@ class AorCtrl(AorCtrlFrame):
             )
             self.connected = False
             self.update_connection_ui()
-            self.memory_banks.clear()
-            self.initial_bank_load_pending = True
-            self.group_loading = {'scan': None, 'search': None}
-            self.group_response = {'scan': None, 'search': None}
-            self.write_serial('RX\r\n'.encode("ascii"))
-            self.write_serial('TB\r\n'.encode("ascii"))
-            self.write_serial('TB\r\n'.encode("ascii"))
+            if self.scan_recovery is not None:
+                self.temporary_scan, self.scan_recovery = self.scan_recovery, None
+                self.restore_temporary_scan(self.initialize_receiver)
+            else:
+                self.initialize_receiver()
+
+    def initialize_receiver(self):
+        self.memory_banks.clear()
+        self.initial_bank_load_pending = True
+        self.group_loading = {'scan': None, 'search': None}
+        self.group_response = {'scan': None, 'search': None}
+        self.write_serial(b'RX\r\n')
+        self.write_serial(b'TB\r\n')
+        self.write_serial(b'TB\r\n')
+
+    def disconnect(self):
+        if self.temporary_scan is not None:
+            self.restore_temporary_scan(self.disconnect, disconnecting=True)
+            return
+        self.stop_thread()
+        self.close_serial()
 
     def get_memory_banks(self):
         """
@@ -3564,7 +3917,9 @@ class AorCtrl(AorCtrlFrame):
             except serial.SerialException as error:
                 self.alive.clear()
                 print('Serial read error: %s' % error, file=sys.stderr)
-                if self.memory_bank_transfer is not None:
+                if self.temporary_scan is not None:
+                    wx.CallAfter(self.temporary_scan.fail, 'Serial read failed; attempting original Scan Group restoration.')
+                elif self.memory_bank_transfer is not None:
                     wx.CallAfter(self.memory_bank_transfer.fail, 'Serial read error: %s' % error)
                 elif self.memory_inventory is not None:
                     wx.CallAfter(self.finish_memory_inventory, 'Export failed: serial read error: %s' % error)
@@ -3575,12 +3930,18 @@ class AorCtrl(AorCtrlFrame):
                 return
             if not self.alive.is_set():
                 return
+            # Diagnostic copy retains framing whitespace and filtered replies;
+            # event.data below remains exactly the normal parser's input.
+            raw_line = textline.decode('ascii', errors='backslashreplace').rstrip('\r\n')
             if not textline.strip():
+                if textline:
+                    self.post_console_receive(raw_line)
                 continue
             if not textline.endswith(b'\n'):
                 print('Ignored partial scanner response: %r' % textline, file=sys.stderr)
                 if self.memory_bank_transfer is not None:
                     wx.CallAfter(self.memory_bank_transfer.fail, 'Partial scanner response: %r' % textline)
+                self.post_console_receive(raw_line)
                 continue
             try:
                 textline = textline.decode("ascii")
@@ -3588,10 +3949,13 @@ class AorCtrl(AorCtrlFrame):
                 print('Ignored non-ASCII scanner response: %s' % error, file=sys.stderr)
                 if self.memory_bank_transfer is not None:
                     wx.CallAfter(self.memory_bank_transfer.fail, 'Non-ASCII scanner response: %s' % error)
+                self.post_console_receive(raw_line)
                 continue
             if textline == '?\r\n':
-                if self.memory_bank_transfer is not None:
-                    self.GetEventHandler().AddPendingEvent(SerialRxEvent(self.GetId(), ['?']))
+                if self.memory_bank_transfer is not None or self.temporary_scan is not None:
+                    self.GetEventHandler().AddPendingEvent(SerialRxEvent(self.GetId(), ['?'], [raw_line]))
+                else:
+                    self.post_console_receive(raw_line)
                 continue
             textline = textline.rstrip('\r\n')
             if not textline.startswith('LM'):
@@ -3599,7 +3963,7 @@ class AorCtrl(AorCtrlFrame):
             if textline:
                 if DEBUG_SERIAL:
                     print('Serial RX: %r' % textline, file=sys.stderr)
-                event = SerialRxEvent(self.GetId(), [textline])
+                event = SerialRxEvent(self.GetId(), [textline], [raw_line])
                 self.GetEventHandler().AddPendingEvent(event)
 
 
