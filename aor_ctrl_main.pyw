@@ -24,6 +24,7 @@ from aor_functions import (search_parameters, make_search_bank_command, parse_se
                            parse_operation_parameter, operation_parameter_command,
                            SCAN_FILTER_MODES, SCAN_FILTER_CODES,
                            make_memory_channel_command, memory_channel_read_command)
+from aor_memory_csv import read_csv, export_record, COLUMNS as MEMORY_CSV_COLUMNS, BankImport
 
 
 # GUI order: WFM, NFM, SFM, WAM, AM, NAM, USB, LSB, CW.
@@ -144,7 +145,7 @@ class BandscopeWindow(wx.Frame):
 
     def available(self):
         return (self.controller.connected and self.controller.serial.is_open and self.controller.alive.is_set()
-                and self.controller.memory_inventory is None)
+                and self.controller.memory_inventory is None and self.controller.memory_bank_transfer is None)
 
     def send(self, data):
         if self.controller.write_serial(data) == len(data):
@@ -1010,6 +1011,8 @@ class AorCtrl(AorCtrlFrame):
         self.memory_channel_dialog = None
         self.memory_channel_pending = None
         self.memory_inventory = None
+        self.memory_bank_transfer = None
+        self.memory_csv_metadata = {}
         self.memory_select_read = None
         self.memory_flag_edit = None
         self.memory_flag_cells_pending = False
@@ -1069,6 +1072,10 @@ class AorCtrl(AorCtrlFrame):
         self.inventory_action = tools_menu.Append(wx.ID_ANY, 'Export Memory Inventory...')
         self.GetMenuBar().Append(tools_menu, 'Tools')
         self.Bind(wx.EVT_MENU, self.on_export_memory_inventory, id=self.inventory_action.GetId())
+        self.import_bank_action = self.mfile.Append(wx.ID_ANY, 'Import Memory Bank CSV...')
+        self.export_bank_action = self.mfile.Append(wx.ID_ANY, 'Export Memory Bank CSV...')
+        self.Bind(wx.EVT_MENU, self.on_import_memory_csv, id=self.import_bank_action.GetId())
+        self.Bind(wx.EVT_MENU, self.on_export_memory_csv, id=self.export_bank_action.GetId())
         self.setup_usability()
 
     def setup_usability(self):
@@ -1186,17 +1193,17 @@ class AorCtrl(AorCtrlFrame):
                         self.tuning_panel.tune_benter, self.tuning_panel.tune_frev,
                         self.tuning_panel.tune_rev, self.tuning_panel.tune_forw,
                         self.tuning_panel.tune_ffor):
-            control.Enable(ready and self.memory_inventory is None)
-        self.cbx_lists.Enable(self.memory_channel_pending is None and self.memory_inventory is None)
-        self.operation_choice.Enable()
-        self.source_choice.Enable()
-        self.sql.Enable(ready and self.memory_inventory is None and self.level_squelch_value is not None and not self.level_squelch_pending)
+            control.Enable(ready and self.memory_inventory is None and self.memory_bank_transfer is None)
+        self.cbx_lists.Enable(self.memory_channel_pending is None and self.memory_inventory is None and self.memory_bank_transfer is None)
+        self.operation_choice.Enable(self.memory_inventory is None and self.memory_bank_transfer is None)
+        self.source_choice.Enable(self.memory_inventory is None and self.memory_bank_transfer is None)
+        self.sql.Enable(ready and self.memory_inventory is None and self.memory_bank_transfer is None and self.level_squelch_value is not None and not self.level_squelch_pending)
         self.bt_settings.Enable(ready and self.active_operation is None)
         if not port_open:
             self.receiver_status = None
             self.vfo_channel = None
             self.show_now_receiving()
-        pending = self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None
+        pending = self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None
         if pending != self.memory_flag_cells_pending:
             self.memory_flag_cells_pending = pending
             # Tell the model that only the flag cells' editability changed.
@@ -1204,22 +1211,24 @@ class AorCtrl(AorCtrlFrame):
                 self.edit_list.memory_model.RowChanged(row)
         view = self.current_list_view()
         self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view == 'LOG VIEW')
-        if self.memory_inventory is not None and view != 'LOG VIEW':
+        if (self.memory_inventory is not None or self.memory_bank_transfer is not None) and view != 'LOG VIEW':
             self.bt_refresh.Disable()
         self.bt_start.Enable(ready)
         self.update_operation_ui()
-        self.memory_bank_choice.Enable(self.memory_channel_pending is None and self.memory_inventory is None)
+        self.memory_bank_choice.Enable(self.memory_channel_pending is None and self.memory_inventory is None and self.memory_bank_transfer is None)
         self.inventory_action.Enable(self.memory_inventory_available())
+        self.import_bank_action.Enable(self.memory_inventory_available() and bool(self.memory_banks))
+        self.export_bank_action.Enable(self.memory_inventory_available() and self.selected_memory_bank() is not None)
         self.bt_newchannel.Show(self.selected_memory_bank() is not None)
         self.bt_newchannel.Enable(self.memory_channel_available() and bool(self.memory_empty_channels))
-        self.bt_mkpassfreq.Enable(ready and view == 'PASS FREQS')
+        self.bt_mkpassfreq.Enable(ready and view == 'PASS FREQS' and self.memory_bank_transfer is None)
         self.bt_mkpassfreq.Show(view == 'PASS FREQS')
         self.panel_1.Layout()
         if self.bandscope is not None:
             self.bandscope.set_controls_enabled(self.bandscope.waiting is None)
 
     def on_bandscope(self, event):
-        if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None:
+        if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None:
             self.aor_status.SetStatusText('Wait for the memory-channel flag read-back before opening bandscope.')
             return
         if self.bandscope is None:
@@ -1231,7 +1240,7 @@ class AorCtrl(AorCtrlFrame):
             self.bandscope.request_status()
 
     def update_receiver_switch_ui(self):
-        ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_inventory is None
+        ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_inventory is None and self.memory_bank_transfer is None
         self.ckbx_nl.Enable(ready and self.receiver_switches['NL'] is not None and 'NL' not in self.receiver_switch_pending)
         self.ckbx_afc.Enable(ready and self.afc_mode in (1, 2, 6, 7, 8) and
                              self.receiver_switches['AF'] is not None and 'AF' not in self.receiver_switch_pending)
@@ -1269,7 +1278,7 @@ class AorCtrl(AorCtrlFrame):
 
     def update_operation_ui(self):
         operation, source = self.operation_selection()
-        ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_inventory is None
+        ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_inventory is None and self.memory_bank_transfer is None
         tips = {'Current Bank': 'Memory Bank: a stored collection of individual memory channels. Scan only the selected bank.',
                 'Scan Group': 'AR8600 Scan Group: several Memory Banks linked for scanning.',
                 'Select Scan': 'AR8600 Select Scan: only memory channels explicitly selected; memory PASS flags are ignored.',
@@ -1552,6 +1561,9 @@ class AorCtrl(AorCtrlFrame):
         self.tune_memory_channel(channel)
 
     def tune_memory_channel(self, channel):
+        if self.memory_inventory is not None or self.memory_bank_transfer is not None:
+            self.aor_status.SetStatusText('Wait for the Memory Bank transfer to finish before tuning a channel.')
+            return
         if (not self.connected or not self.serial.is_open or not self.alive.is_set() or
                 self.filling_banks or self.memory_select_read is not None or self.memory_flag_edit is not None or
                 self.memory_channel_pending is not None or
@@ -1637,6 +1649,8 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        if self.memory_bank_transfer is not None:
+            self.memory_bank_transfer.abort_disconnect()
         if self.memory_inventory is not None:
             self.finish_memory_inventory('Export cancelled: receiver disconnected.')
         if self.memory_channel_pending is not None:
@@ -2167,7 +2181,7 @@ class AorCtrl(AorCtrlFrame):
         self.write_serial(b'RX\r\n')
 
     def on_select_list(self, evt):
-        if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None:
+        if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None:
             self.aor_status.SetStatusText('Wait for the memory-channel flag read-back before loading another list.')
             return
         if self.selected_memory_bank() is not None:
@@ -2206,6 +2220,9 @@ class AorCtrl(AorCtrlFrame):
             try:
                 if not isinstance(first, str):
                     raise ValueError('Response must be text')
+                if self.memory_bank_transfer is not None and self.memory_bank_transfer.receive(first):
+                    received_valid = True
+                    continue
                 if self.memory_inventory is not None and self.receive_memory_inventory_line(first):
                     received_valid = True
                     continue
@@ -2314,6 +2331,11 @@ class AorCtrl(AorCtrlFrame):
         self.maybe_load_initial_bank()
 
     def write_serial(self, data):
+        if self.memory_bank_transfer is not None and not self.memory_bank_transfer.sending and any(
+                re.fullmatch(rb'RX|TB|GR|LM|MA[A-Ja-j]?', command) is None
+                for command in data.split(b'\r\n') if command):
+            self.aor_status.SetStatusText('Wait for the Memory Bank import to finish before changing scanner settings.')
+            return
         if self.memory_inventory is not None and any(
                 re.fullmatch(rb'RX|TB|GR|LM|MA[A-Ja-j]?', command) is None
                 for command in data.split(b'\r\n') if command):
@@ -2469,8 +2491,82 @@ class AorCtrl(AorCtrlFrame):
         if self.write_serial(b'GR\r\nRX\r\n') != 8:
             self.on_memory_flag_timeout(None)
 
-    def memory_inventory_available(self):
+    def on_import_memory_csv(self, event):
+        if not self.memory_inventory_available() or not self.memory_banks:
+            self.aor_status.SetStatusText('Connect and wait for current scanner operations before importing.')
+            return
+        dialog = wx.FileDialog(self, 'Import Memory Bank CSV', wildcard='CSV files (*.csv)|*.csv',
+                               style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            path = dialog.GetPath()
+        finally:
+            dialog.Destroy()
+        banks = sorted(self.memory_banks, key=lambda bank: (bank.upper(), bank.islower()))
+        labels = ['%s — %s (capacity %d)' % (bank, self.memory_banks[bank]['name'] or '(unnamed)',
+                                           self.memory_banks[bank]['channels']) for bank in banks]
+        target = wx.SingleChoiceDialog(self, 'Choose the one bank to replace. CSV Bank letters will be overridden.',
+                                       'Import Memory Bank CSV — target bank', labels)
+        try:
+            if target.ShowModal() != wx.ID_OK:
+                return
+            bank = banks[target.GetSelection()]
+        finally:
+            target.Destroy()
+        try:
+            plan = read_csv(path, self.memory_banks[bank])
+        except (OSError, ValueError, csv.Error) as error:
+            wx.MessageBox(str(error), 'Invalid Memory Bank CSV', wx.OK | wx.ICON_ERROR, self)
+            self.aor_status.SetStatusText('Import rejected; no scanner writes: %s' % error)
+            return
+        BankImport(self, plan).start()
+
+    def on_export_memory_csv(self, event):
+        metadata = self.selected_memory_bank()
+        if not self.memory_inventory_available() or metadata is None:
+            self.aor_status.SetStatusText('Select a Memory Bank and wait for current operations before exporting.')
+            return
+        dialog = wx.FileDialog(self, 'Export Memory Bank CSV', defaultFile='AR8600_bank_%s.csv' % metadata['bank'],
+                               wildcard='CSV files (*.csv)|*.csv', style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            path = dialog.GetPath()
+        finally:
+            dialog.Destroy()
+        self.start_memory_inventory(path, bank=metadata['bank'],
+                                    on_complete=lambda snapshot: self.write_memory_bank_csv(snapshot))
+
+    def write_memory_bank_csv(self, snapshot):
+        bank = snapshot['bank']
+        metadata = self.memory_csv_metadata.get(bank, {'columns': [], 'channels': {}})
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', newline='', encoding='utf-8-sig', delete=False,
+                                             dir=os.path.dirname(os.path.abspath(snapshot['path'])),
+                                             prefix='.ar8600_bank_', suffix='.tmp') as output:
+                temporary_path = output.name
+                writer = csv.DictWriter(output, fieldnames=list(MEMORY_CSV_COLUMNS) + metadata['columns'])
+                writer.writeheader()
+                channels = sorted(snapshot['rows'])
+                for channel in channels or [None]:
+                    row = export_record(snapshot['banks'][bank], snapshot['rows'].get(channel), snapshot['selected'])
+                    row.update(metadata['channels'].get(channel, {}))
+                    writer.writerow(row)
+            os.replace(temporary_path, snapshot['path'])
+            temporary_path = None
+            self.aor_status.SetStatusText('Export complete: bank %s, %d populated channels. %s' %
+                                         (bank, len(snapshot['rows']), snapshot['path']))
+        except (OSError, ValueError, csv.Error) as error:
+            self.aor_status.SetStatusText('Export failed: %s' % error)
+        finally:
+            if temporary_path is not None:
+                os.unlink(temporary_path)
+
+    def memory_inventory_available(self, owner=None):
         return (self.connected and self.serial.is_open and self.alive.is_set() and self.memory_inventory is None and
+                (self.memory_bank_transfer is None or owner is self.memory_bank_transfer) and
                 not self.filling_banks and self.memory_select_read is None and self.memory_flag_edit is None and
                 self.memory_channel_pending is None and self.background_vfo is None and not self.monitor_muted and
                 self.active_operation is None and self.settings_dialog is None and
@@ -2490,15 +2586,20 @@ class AorCtrl(AorCtrlFrame):
             dialog.Destroy()
         self.start_memory_inventory(path)
 
-    def start_memory_inventory(self, path):
-        if not self.memory_inventory_available():
+    def start_memory_inventory(self, path, bank=None, on_complete=None, on_error=None, owner=None):
+        if not self.memory_inventory_available(owner):
             self.aor_status.SetStatusText('Export could not start: receiver is disconnected or busy.')
+            if on_error is not None:
+                on_error('Receiver is disconnected or busy.')
             return
         self.memory_inventory = {'path': path, 'phase': 'banks', 'banks': {}, 'rows': {}, 'selected': set(),
                                  'slots': {}, 'context': None, 'order': sorted('ABCDEFGHIJabcdefghij',
-                                  key=lambda bank: (bank.upper(), bank.islower())), 'index': 0}
+                                  key=lambda bank: (bank.upper(), bank.islower())), 'index': 0,
+                                 'bank': bank, 'on_complete': on_complete, 'on_error': on_error}
+        if bank is not None:
+            self.memory_inventory['order'] = [bank]
         self.update_connection_ui()
-        self.aor_status.SetStatusText('Export: reading all 20 memory bank names and capacities...')
+        self.aor_status.SetStatusText('Reading all 20 Memory Bank names and capacities...')
         self.send_memory_inventory(b'RX\r\nTB\r\nTB\r\n')
 
     def send_memory_inventory(self, command):
@@ -2551,11 +2652,12 @@ class AorCtrl(AorCtrlFrame):
             blocks = (capacity + 9) // 10
             inventory['phase'] = 'channels'
             inventory['remaining'] = {'%s%02d' % (bank, number) for number in range(blocks * 10)}
-            self.aor_status.SetStatusText('Export: reading bank %s (%d/20)...' % (bank, inventory['index']))
+            self.aor_status.SetStatusText('Reading Memory Bank %s (%d/%d)...' %
+                                         (bank, inventory['index'], len(inventory['order'])))
             self.send_memory_inventory(memory_channel_read_command('%s%02d' % (bank, capacity - 1)))
             return
         inventory['phase'] = 'selected'
-        self.aor_status.SetStatusText('Export: reading Selected membership and confirming receiver context...')
+        self.aor_status.SetStatusText('Reading Selected membership and confirming receiver context...')
         self.send_memory_inventory(b'GR\r\nRX\r\n')
 
     def receive_memory_inventory_context(self, text):
@@ -2570,12 +2672,17 @@ class AorCtrl(AorCtrlFrame):
         slots = inventory['slots']
         if not slots or set(slots) != set(range(max(slots) + 1)):
             self.finish_memory_inventory('Export failed: incomplete Selected membership read-back.')
-        elif not inventory['selected'].issubset(inventory['rows']):
+        elif not {channel for channel in inventory['selected'] if inventory['bank'] is None or channel[0] == inventory['bank']}.issubset(inventory['rows']):
             self.finish_memory_inventory('Export failed: Selected membership differs from channel inventory; retry the export.')
         elif text != inventory['context']:
             self.finish_memory_inventory('Export failed: receiver context changed while reading; retry the export.')
         else:
-            self.write_memory_inventory_csv()
+            callback = inventory['on_complete']
+            if callback is None:
+                self.write_memory_inventory_csv()
+            else:
+                self.finish_memory_inventory('Memory Bank read complete.')
+                callback(inventory)
 
     def write_memory_inventory_csv(self):
         inventory = self.memory_inventory
@@ -2616,16 +2723,20 @@ class AorCtrl(AorCtrlFrame):
                     print('Could not remove inventory temporary file: %s' % error, file=sys.stderr)
 
     def finish_memory_inventory(self, message):
+        inventory = self.memory_inventory
         self.memory_inventory = None
         self.inventory_timer.Stop()
         self.update_connection_ui()
         self.aor_status.SetStatusText(message)
+        if inventory is not None and inventory.get('on_error') is not None and message.startswith(('Export failed', 'Export cancelled')):
+            inventory['on_error'](message)
 
     def memory_channel_available(self):
         return (self.selected_memory_bank() is not None and self.connected and self.serial.is_open and
                 self.alive.is_set() and not self.filling_banks and self.memory_select_read is None and
                 self.memory_channel_pending is None and self.memory_flag_edit is None and
                 self.memory_inventory is None and
+                self.memory_bank_transfer is None and
                 not self.monitor_muted and self.active_operation is None and self.background_vfo is None and
                 self.settings_dialog is None and
                 (self.bandscope is None or not self.bandscope.entered and self.bandscope.waiting is None))
@@ -2840,6 +2951,7 @@ class AorCtrl(AorCtrlFrame):
                 not self.filling_banks and self.memory_select_read is None and
                 self.memory_flag_edit is None and self.memory_rows[channel]['select'] is not None and
                 self.memory_inventory is None and
+                self.memory_bank_transfer is None and
                 (self.memory_channel_pending is None or preserving and self.memory_channel_pending['phase'] == 'preserve') and
                 not self.monitor_muted and self.settings_dialog is None and
                 self.memory_rows[channel]['skip'] is not None and
@@ -3298,7 +3410,9 @@ class AorCtrl(AorCtrlFrame):
             except serial.SerialException as error:
                 self.alive.clear()
                 print('Serial read error: %s' % error, file=sys.stderr)
-                if self.memory_inventory is not None:
+                if self.memory_bank_transfer is not None:
+                    wx.CallAfter(self.memory_bank_transfer.fail, 'Serial read error: %s' % error)
+                elif self.memory_inventory is not None:
                     wx.CallAfter(self.finish_memory_inventory, 'Export failed: serial read error: %s' % error)
                 elif self.memory_channel_pending is not None and self.memory_flag_edit is None:
                     wx.CallAfter(self.finish_memory_channel_edit, 'Serial read failed; channel state was not verified.')
@@ -3311,13 +3425,19 @@ class AorCtrl(AorCtrlFrame):
                 continue
             if not textline.endswith(b'\n'):
                 print('Ignored partial scanner response: %r' % textline, file=sys.stderr)
+                if self.memory_bank_transfer is not None:
+                    wx.CallAfter(self.memory_bank_transfer.fail, 'Partial scanner response: %r' % textline)
                 continue
             try:
                 textline = textline.decode("ascii")
             except UnicodeDecodeError as error:
                 print('Ignored non-ASCII scanner response: %s' % error, file=sys.stderr)
+                if self.memory_bank_transfer is not None:
+                    wx.CallAfter(self.memory_bank_transfer.fail, 'Non-ASCII scanner response: %s' % error)
                 continue
             if textline == '?\r\n':
+                if self.memory_bank_transfer is not None:
+                    self.GetEventHandler().AddPendingEvent(SerialRxEvent(self.GetId(), ['?']))
                 continue
             textline = textline.rstrip('\r\n')
             if not textline.startswith('LM'):
