@@ -121,6 +121,9 @@ class BankImport:
         self.error = None
         self.timer = wx.Timer(controller)
         self.verify_later = None
+        self.retry_later = None
+        self.verify_read_retried = False
+        self.cleanup_read_retried = False
         controller.Bind(wx.EVT_TIMER, self.on_timeout, self.timer)
         self.index = 0
         self.channels = sorted(plan['rows'])
@@ -196,9 +199,20 @@ class BankImport:
 
     def receive(self, text):
         if text == '?':
+            if self.phase in ('verify_write', 'cleanup'):
+                if self.retry_later is not None:
+                    return True  # Drain the rejected attempt before resending its queries.
+                allowance = 'verify_read_retried' if self.phase == 'verify_write' else 'cleanup_read_retried'
+                if not getattr(self, allowance):
+                    setattr(self, allowance, True)
+                    channel = self.channel if self.phase == 'verify_write' else None
+                    self.retry_later = wx.CallLater(200, self.retry_verification_read, self.phase, channel)
+                    return True
             self.fail('AR8600 returned ? for bank %s during %s%s; command %r' %
                       (self.bank, self.phase, ' ' + self.channel if hasattr(self, 'channel') else '', self.last_command))
             return True
+        if self.retry_later is not None and text.startswith(('MX', 'WP', 'WM', 'VA ', 'VB ', 'VF ', 'MR ')):
+            return True  # Do not combine a partial rejected read with its retry.
         if self.c.memory_inventory is not None:
             return False
         try:
@@ -248,6 +262,20 @@ class BankImport:
             self.fail(str(error))
             return True
         return False
+
+    def retry_verification_read(self, phase, channel):
+        self.retry_later = None
+        if self.phase != phase or self.c.memory_bank_transfer is not self:
+            return
+        if phase == 'verify_write':
+            if self.error is not None or channel != self.channel:
+                return
+            self.fields = None
+            self.remaining = {'%s%02d' % (self.bank, number) for number in range((int(channel[1:]) // 10 + 1) * 10)}
+            self.send(memory_channel_read_command(channel))
+        else:
+            self.wp, self.wm = None, {}
+            self.send(b'WP\r\nWM\r\nWM\r\nRX\r\n')
 
     def context(self, text):
         if self.phase in ('capture_protection', 'unprotect', 'cleanup'):
@@ -335,6 +363,7 @@ class BankImport:
             self.read_bank(self.verify_bank)
             return
         self.channel = self.channels[self.index]
+        self.verify_read_retried = False
         self.phase = 'write'
         self.c.aor_status.SetStatusText('Import %s: writing %s (%d/%d)...' %
                                        (self.bank, self.channel, self.index + 1, len(self.channels)))
@@ -413,6 +442,9 @@ class BankImport:
         self.cleanup()
 
     def cleanup(self):
+        if self.retry_later is not None:
+            self.retry_later.Stop()
+            self.retry_later = None
         if self.verify_later is not None:
             self.verify_later.Stop()
             self.verify_later = None
@@ -452,6 +484,9 @@ class BankImport:
         self.fail('Timeout during %s%s%s' % (self.phase, ' ' + self.channel if hasattr(self, 'channel') else '', detail))
 
     def finish(self, message, success=False):
+        if self.retry_later is not None:
+            self.retry_later.Stop()
+            self.retry_later = None
         if self.verify_later is not None:
             self.verify_later.Stop()
             self.verify_later = None
