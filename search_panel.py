@@ -146,8 +146,32 @@ class EditListCtrlPanel(wx.Panel):
         event.Skip()
 
     def show_memory(self, show):
+        if hasattr(self, 'database'):
+            self.database.Hide()
+            self.database.set_active(False)
+            self.SetMinSize((-1, 180))
         self.list.Show(not show)
         self.memory.Show(show)
+        self.Layout()
+
+    def create_database_view(self, controller):
+        from frequency_database import FrequencyDatabasePanel
+        self.database = FrequencyDatabasePanel(self, controller)
+        self.database.Hide()
+        self.GetSizer().Add(self.database, 1, wx.EXPAND)
+
+    def show_database(self):
+        self.list.Hide()
+        self.memory.Hide()
+        self.database.Show()
+        self.database.set_active(True)
+        self.SetMinSize((-1, 320))
+        frame = self.GetParent()
+        minimum = frame.GetSizer().GetMinSize()
+        client = frame.GetClientSize()
+        if client.height < minimum.height:
+            frame.SetClientSize((max(client.width, minimum.width), minimum.height))
+        frame.Layout()
         self.Layout()
 
 

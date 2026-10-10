@@ -24,6 +24,7 @@ from aor_functions import (search_parameters, make_search_bank_command, parse_se
                            parse_operation_parameter, operation_parameter_command,
                            SCAN_FILTER_MODES, SCAN_FILTER_CODES,
                            make_memory_channel_command, memory_channel_read_command)
+from aor_functions import receiver_frequency_hz, search_step_hz
 from aor_memory_csv import read_csv, export_record, COLUMNS as MEMORY_CSV_COLUMNS, BankImport
 
 
@@ -1035,6 +1036,7 @@ class AorCtrl(AorCtrlFrame):
         self.bandscope = None
         AorCtrlFrame.__init__(self, *args, **kwds)
         self.edit_list.create_memory_view(self)
+        self.edit_list.create_database_view(self)
         self.bt_newchannel = wx.Button(self.panel_1, label='New Channel...')
         self.bt_mkpassfreq.GetContainingSizer().Add(self.bt_newchannel, 0, wx.EXPAND | wx.ALL, 3)
         self.bt_newchannel.SetToolTip('Create a channel in an unused location of the displayed Memory Bank.')
@@ -1065,9 +1067,12 @@ class AorCtrl(AorCtrlFrame):
         self.__attach_events()           # register events
         view_menu = wx.Menu()
         bandscope_action = view_menu.Append(wx.ID_ANY, 'BAND SCOPE...')
+        details_action = view_menu.Append(wx.ID_ANY, 'Station Details')
         self.GetMenuBar().Append(view_menu, 'View')
         self.Bind(wx.EVT_MENU, self.on_bandscope, id=bandscope_action.GetId())
+        self.Bind(wx.EVT_MENU, self.edit_list.database.open_station_details, id=details_action.GetId())
         bandscope_action.SetHelp('Open the bandscope viewer; connect to read scanner data.')
+        details_action.SetHelp('Open a modeless window that follows the selected DATABASE transmission.')
         tools_menu = wx.Menu()
         self.inventory_action = tools_menu.Append(wx.ID_ANY, 'Export Memory Inventory...')
         self.GetMenuBar().Append(tools_menu, 'Tools')
@@ -1076,6 +1081,8 @@ class AorCtrl(AorCtrlFrame):
         self.export_bank_action = self.mfile.Append(wx.ID_ANY, 'Export Memory Bank CSV...')
         self.Bind(wx.EVT_MENU, self.on_import_memory_csv, id=self.import_bank_action.GetId())
         self.Bind(wx.EVT_MENU, self.on_export_memory_csv, id=self.export_bank_action.GetId())
+        database_action = self.mfile.Append(wx.ID_ANY, 'Open Frequency Database CSV...')
+        self.Bind(wx.EVT_MENU, self.on_open_frequency_database, id=database_action.GetId())
         self.setup_usability()
 
     def setup_usability(self):
@@ -1215,8 +1222,8 @@ class AorCtrl(AorCtrlFrame):
             for row in range(len(self.edit_list.memory_model.channels)):
                 self.edit_list.memory_model.RowChanged(row)
         view = self.current_list_view()
-        self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view == 'LOG VIEW')
-        if (self.memory_inventory is not None or self.memory_bank_transfer is not None) and view != 'LOG VIEW':
+        self.bt_refresh.Enable((ready and (bool(view) or self.selected_memory_bank() is not None) and view != 'DATABASE') or view in ('LOG VIEW', 'DATABASE'))
+        if (self.memory_inventory is not None or self.memory_bank_transfer is not None) and view not in ('LOG VIEW', 'DATABASE'):
             self.bt_refresh.Disable()
         self.bt_start.Enable(ready)
         self.update_operation_ui()
@@ -1639,6 +1646,41 @@ class AorCtrl(AorCtrlFrame):
                 return False
         self.monitor_muted = False
         return True
+
+    def tune_database_record(self, record):
+        if not self.connected or not self.serial.is_open or not self.alive.is_set():
+            self.aor_status.SetStatusText('Connect to tune a database station; database browsing works offline.')
+            return
+        if (self.memory_inventory is not None or self.memory_bank_transfer is not None or self.filling_banks or
+                self.memory_select_read is not None or self.memory_flag_edit is not None or
+                self.memory_channel_pending is not None or self.monitor_muted or self.active_operation is not None or
+                self.settings_dialog is not None or self.background_vfo is not None or
+                self.bandscope is not None and (self.bandscope.entered or self.bandscope.waiting is not None)):
+            self.aor_status.SetStatusText('Wait for the current scanner operation before tuning a database station.')
+            return
+        try:
+            if not record.values['Mode'] or record.step_hz is None:
+                raise ValueError('The database station needs both Mode and Step for tuning.')
+            frequency = receiver_frequency_hz(format(record.frequency_hz / 1000000, 'f'))
+            step = search_step_hz(format(record.step_hz / 1000, 'f'))
+            selection = self.cbx_mode.FindString(record.values['Mode'])
+            if selection == wx.NOT_FOUND:
+                raise ValueError('Unknown database modulation mode.')
+            mode = GUI_MODE_TO_MD[selection]
+        except (ValueError, IndexError) as error:
+            self.aor_status.SetStatusText('Database station could not be tuned: %s' % error)
+            return
+        command = self.normal_vfo_command() + ('AU0\r\nRF%010d\r\nMD%d\r\nST%06d\r\n' %
+                                              (frequency, mode, step)).encode('ascii')
+        self.clear_vfo_channel()
+        self.monitor_muted = True
+        try:
+            if self.write_serial(b'MC1\r\n' + command) != len(command) + 5:
+                self.aor_status.SetStatusText('Database tuning write failed; requesting actual receiver state.')
+        finally:
+            self.release_monitor_mute()
+            if self.serial.is_open:
+                self.write_serial(b'RX\r\n')
 
     def start_thread(self):
         """Start the receiver thread"""
@@ -2247,7 +2289,11 @@ class AorCtrl(AorCtrlFrame):
         elif selection == 'LOG VIEW':
             self.show_log_view()
         elif selection == 'DATABASE':
-            pass
+            self.edit_list.show_database()
+            if evt is not None and evt.GetEventObject() == self.bt_refresh:
+                database = self.edit_list.database
+                if database.path:
+                    database.open_csv(database.path)
         else:
             self.filling_banks = True
             self.get_memory_banks()
@@ -2529,6 +2575,23 @@ class AorCtrl(AorCtrlFrame):
         self.memory_flag_timer.StartOnce(10000)
         if self.write_serial(b'GR\r\nRX\r\n') != 8:
             self.on_memory_flag_timeout(None)
+
+    def on_open_frequency_database(self, event):
+        if self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.memory_inventory is not None or self.memory_bank_transfer is not None:
+            self.aor_status.SetStatusText('Wait for the current memory operation before opening a frequency database.')
+            return
+        database = self.edit_list.database
+        path = database.preferences.last_path
+        dialog = wx.FileDialog(self, 'Open Frequency Database CSV', defaultDir=os.path.dirname(path),
+                               defaultFile=os.path.basename(path), wildcard='CSV files (*.csv)|*.csv',
+                               style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        try:
+            if dialog.ShowModal() != wx.ID_OK or not database.open_csv(dialog.GetPath()):
+                return
+        finally:
+            dialog.Destroy()
+        self.select_list_view('DATABASE')
+        self.on_select_list(None)
 
     def on_import_memory_csv(self, event):
         if not self.memory_inventory_available() or not self.memory_banks:
