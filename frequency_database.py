@@ -48,6 +48,8 @@ def utc_minutes(value, end=False):
 
 def schedule_days(value):
     value = value.strip().lower()
+    if value == 'unknown':
+        return frozenset()  # Unrepresentable source qualifiers must not imply daily operation.
     if value in ('', '*', 'daily', 'all'):
         return frozenset(range(1, 8))
     if re.fullmatch(r'[1-7]+', value):

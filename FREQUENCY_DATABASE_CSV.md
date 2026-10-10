@@ -33,6 +33,9 @@ including names/notes containing commas or newlines.
   separated by spaces or commas, ranges such as `Mon-Fri`, or ISO weekday digits
   `1234567` (Monday=1, Sunday=7). Source schedules using Sunday=1 must be converted
   before importing. The application does not guess source-specific conventions.
+- Days `Unknown` retains an unrepresentable source schedule without claiming it
+  is daily: it does not highlight as on air or pass the On air now filter. The
+  original qualifier remains in Notes (for example, first Saturday or irregular).
 - ValidFrom/ValidTo: optional ISO dates `YYYY-MM-DD`, inclusive.
 - Band, Language, Target, TxSite, TxCountry, StationCountry, Notes, Source: text.
   Band and Language filter values come directly from the loaded CSV.
@@ -93,3 +96,68 @@ It selects the main GUI's active VFO, disables Auto to apply the explicit Mode/S
 and sends RF/MD/ST under the existing temporary MC1/MC0 protection, followed by RX.
 Scanner read-back updates the main GUI. It does not recall or write memories;
 attenuation is left unchanged.
+
+## Building the combined HFCC A26 + EiBi A26 database
+
+Run `python build_frequency_database.py` to download the
+[HFCC A26 operational ZIP](https://new.hfcc.org/data/a26/a26allx2.zip),
+[EiBi A26 CSV](http://eibispace.de/dx/sked-a26.csv) and
+[EiBi README/code tables](http://www.eibispace.de/dx/README.TXT).
+The output is `AR8600_FREQUENCY_DATABASE_A26.csv`, using the same 21 columns.
+It is generated locally and should not be committed. To reproduce a build
+without network access, supply `--zip`, `--eibi-csv` and `--eibi-readme` paths.
+
+HFCC supplies all its operational records, including the rich transmitter
+engineering data: power, azimuth, coordinates and resolved transmitter sites.
+EiBi extends broadcast coverage beyond HFCC, including LW/MW where present,
+and supplies station-country, language, target and schedule metadata. EiBi-only
+rows have no invented power, coordinates or azimuth. The code resolves field 8
+as transmitter-site code regardless of the misleading `Remarks` header. A blank
+site code indicates the documented home transmitter country, but cannot prove
+a particular site: the README also permits blanks for unknown sites.
+
+The generator excludes EiBi `P >= 90` utilities, `P=8` inactive entries and
+`P=4` winter-only entries from summer A26. Some published utility records lack
+the documented `P >= 90` marker; explicit utility language codes and service
+descriptions such as NAVY, VOLMET and FAX are also excluded and counted. It does
+not guess service type from a call sign. Non-broadcast LF/MF regions are outside
+scope; LW is 148.5-283.5 kHz and MW is 520-1710 kHz. Existing SW metre-band labels
+are retained, including out-of-band SW broadcasts.
+
+Blank Days means daily. Weekday lists/ranges convert to ISO weekdays, including
+ranges wrapping Sunday. UTC endpoints are preserved, including 0000-2400 and
+overnight ranges. Only `P=6` Start/Stop fields define validity dates: DDMM is
+interpreted within A26 (2026), advancing the end year for a crossing-year range.
+A single-date Days qualifier can narrow that documented interval. Other date
+fields, last-heard `[MMYY]` markers, persistence codes, DST/season qualifiers and
+unrepresentable monthly/irregular Days remain in Notes; no false validity dates
+or daily schedules are manufactured.
+
+Confirmed merging requires identical frequency, UTC start/end and weekdays,
+compatible validity dates, plus either normalized station identity or uniquely
+agreeing site and language metadata. Conflicting known transmitter sites or
+countries prevent merging even if station names match. Site matching ignores
+parenthetical reference annotations and kW labels, not geographic differences.
+An undated EiBi schedule cannot absorb a
+narrower HFCC validity interval. Both directions must be unique: multiple HFCC
+candidates or multiple EiBi matches stay separate. Station matching uses only
+spelling/abbreviation normalization and the explicit BBC/Worldservice alias,
+without fuzzy matching. HFCC engineering fields are retained; EiBi fills useful
+blank descriptive fields, including StationCountry. Source becomes
+`HFCC A26; EiBi A26`; all uncertain/unmatched EiBi records remain separate.
+
+EiBi-only normal broadcasts use AM, 9 kHz for LW/MW (10 kHz for explicitly
+identified American transmitters), and 5 kHz for SW. Explicit USB/LSB or digital
+annotations are preserved; unsupported digital modulation and unspecified steps
+remain blank rather than being falsely labelled AM. Existing HFCC receiver
+defaults are unchanged. Rows sort by numeric Frequency, UTCStart and Station.
+Diagnostics include input/exclusion/merge totals, unresolved codes and sample
+merged and EiBi-only records. A missing LW sample means none was supplied by
+the downloaded sources, not that LW data was fabricated.
+
+EiBi is compiled by Eike Bierwirth. Its README permits free download, use,
+copying, redistribution and inclusion in third-party software. Credit is retained
+in Source/Notes and this documentation; no additional attribution condition is
+asserted. Consult the [EiBi conditions of use](http://www.eibispace.de/dx/README.TXT)
+for the original terms and contact information. EiBi explicitly provides no
+guarantee that individual schedules or transmitter details are correct.
