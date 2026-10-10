@@ -1005,6 +1005,9 @@ class AorCtrl(AorCtrlFrame):
         self.search_restore_command = None
         self.active_operation = None
         self.connected = False
+        self.startup_started = False
+        self.startup_connect_pending = False
+        self.startup_connect_timer = None
         self.filling_banks = False
         self.pending_memory_channels = set()
         self.memory_rows = {}
@@ -1075,8 +1078,10 @@ class AorCtrl(AorCtrlFrame):
         details_action.SetHelp('Open a modeless window that follows the selected DATABASE transmission.')
         tools_menu = wx.Menu()
         self.inventory_action = tools_menu.Append(wx.ID_ANY, 'Export Memory Inventory...')
+        database_settings = tools_menu.Append(wx.ID_ANY, 'Frequency Database Settings...')
         self.GetMenuBar().Append(tools_menu, 'Tools')
         self.Bind(wx.EVT_MENU, self.on_export_memory_inventory, id=self.inventory_action.GetId())
+        self.Bind(wx.EVT_MENU, self.edit_list.database.on_database_settings, id=database_settings.GetId())
         self.import_bank_action = self.mfile.Append(wx.ID_ANY, 'Import Memory Bank CSV...')
         self.export_bank_action = self.mfile.Append(wx.ID_ANY, 'Export Memory Bank CSV...')
         self.Bind(wx.EVT_MENU, self.on_import_memory_csv, id=self.import_bank_action.GetId())
@@ -1730,6 +1735,7 @@ class AorCtrl(AorCtrlFrame):
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
+        self.cancel_startup_connect()
         if self.memory_bank_transfer is not None:
             self.memory_bank_transfer.abort_disconnect()
         if self.memory_inventory is not None:
@@ -2293,7 +2299,7 @@ class AorCtrl(AorCtrlFrame):
             if evt is not None and evt.GetEventObject() == self.bt_refresh:
                 database = self.edit_list.database
                 if database.path:
-                    database.open_csv(database.path)
+                    database.open_csv(database.path, remember=False)
         else:
             self.filling_banks = True
             self.get_memory_banks()
@@ -2301,6 +2307,7 @@ class AorCtrl(AorCtrlFrame):
     def on_serial_read(self, event):
         """Handle input from the serial port."""
         received_valid = False
+        startup_readback = False
         for first in event.data:
             try:
                 if not isinstance(first, str):
@@ -2401,13 +2408,18 @@ class AorCtrl(AorCtrlFrame):
                     if self.memory_inventory is not None:
                         self.receive_memory_inventory_context(first)
                 received_valid = True
+                # Startup must be confirmed by validated RX/TB read-back, not
+                # merely an open port or an unrelated acknowledgement.
+                if first.startswith(('VA ', 'VB ', 'VF ', 'MR ', 'MS ', 'SM ', 'VS ', 'VV ', 'MW ')) or re.match(r'SR[A-Ta-t] RF', first):
+                    startup_readback = True
             except (ValueError, IndexError, TypeError) as error:
                 if self.memory_inventory is not None and isinstance(first, str) and first.startswith(('MW', 'MX', 'GR')):
                     self.finish_memory_inventory('Export failed: malformed scanner response %r: %s' % (first, error))
                 if isinstance(first, str) and first.startswith('GR') and self.memory_select_read is not None:
                     self.memory_select_read['invalid'] = True
                 print('Ignored malformed scanner response %r: %s' % (first, error), file=sys.stderr)
-        if received_valid and self.serial.is_open and self.alive.is_set() and not self.connected:
+        if received_valid and (not self.startup_connect_pending or startup_readback) and self.serial.is_open and self.alive.is_set() and not self.connected:
+            self.cancel_startup_connect()
             self.connected = True
             self.start_monitoring()
             self.aor_status.SetStatusText('Select a VFO or list, or enter a frequency in MHz.')
@@ -2432,6 +2444,7 @@ class AorCtrl(AorCtrlFrame):
             print('Serial write error: %s' % error, file=sys.stderr)
 
     def close_serial(self):
+        self.cancel_startup_connect()
         self.stop_monitoring()
         self.connected = False
         try:
@@ -2493,18 +2506,50 @@ class AorCtrl(AorCtrlFrame):
         dialog_serial_cfg.ShowModal()
         dialog_serial_cfg.Destroy()
 
-    def connect(self):
-        """"""
+    def on_startup(self):
+        """Run once after the main window has been shown."""
+        if not self or self.startup_started:
+            return
+        self.startup_started = True
+        self.edit_list.database.load_startup_database()
+        if not self.serial.is_open:
+            self.connect(silent=True)
+
+    def cancel_startup_connect(self):
+        self.startup_connect_pending = False
+        if self.startup_connect_timer is not None:
+            self.startup_connect_timer.Stop()
+            self.startup_connect_timer = None
+
+    def on_startup_connect_timeout(self):
+        if not self.startup_connect_pending:
+            return
+        self.stop_thread()
+        self.close_serial()
+        message = 'No valid AR8600 response within 3 seconds; disconnected, offline use is available.'
+        self.aor_status.SetStatusText(message)
+        print(message, file=sys.stderr)
+
+    def connect(self, silent=False):
+        """Use the same initialization and read-back for manual/startup connections."""
         self.stop_thread()
         self.close_serial()
 
         try:
             self.serial.open()
-        except serial.SerialException as e:
-            dlg = wx.MessageDialog(None, str(e), "Serial Port Error", wx.OK | wx.ICON_ERROR)
-            dlg.ShowModal()
-            dlg.Destroy()
+        except (serial.SerialException, OSError) as e:
+            self.close_serial()
+            self.aor_status.SetStatusText('Disconnected: %s' % e)
+            if silent:
+                print('Startup serial connection unavailable: %s' % e, file=sys.stderr)
+            else:
+                dlg = wx.MessageDialog(None, str(e), "Serial Port Error", wx.OK | wx.ICON_ERROR)
+                dlg.ShowModal()
+                dlg.Destroy()
         else:
+            if silent:
+                self.startup_connect_pending = True
+                self.startup_connect_timer = wx.CallLater(3000, self.on_startup_connect_timeout)
             self.start_thread()
             self.SetTitle("Serial Terminal on %s [%s, %s%s%s%s%s]" % (
                 self.serial.portstr,
@@ -3565,6 +3610,7 @@ class MyApp(wx.App):
         frame_terminal = AorCtrl(None, -1, "")
         self.SetTopWindow(frame_terminal)
         frame_terminal.Show(1)
+        wx.CallAfter(frame_terminal.on_startup)
         return 1
 
 

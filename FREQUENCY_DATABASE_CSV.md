@@ -2,7 +2,12 @@
 
 Open a local UTF-8 CSV (an optional BOM is accepted) with **File -> Open Frequency
 Database CSV...**. The independent **Lists -> DATABASE** view works offline.
-No station data is bundled or downloaded. Refresh rereads the current local file.
+Startup loads the configured default CSV without selecting DATABASE. If no custom
+default is configured, or it cannot be loaded, it tries
+`data/default_frequency_database.csv` relative to the application location.
+This small bundled sample contains nine HFCC A26 transmissions with their original
+schedule validity dates; it is not a complete or automatically updated database.
+Refresh rereads the current local file. No downloading occurs at startup.
 
 Normalized columns, with exact case-sensitive names:
 
@@ -42,11 +47,16 @@ including names/notes containing commas or newlines.
 - Step: optional Hz/kHz/MHz value; bare numbers mean kHz. Existing step validation
   applies, including 8.33 kHz. Mode and Step are required only for double-click tuning.
 
-**Receiver Location...** stores coordinates and the last successfully opened CSV
-path in `AR8600/frequency_database.json` under wxPython's per-user configuration
+**Receiver Location...** stores coordinates in `AR8600/frequency_database.json`
+under wxPython's per-user configuration
 directory (normally `%APPDATA%` on Windows). This file is outside the repository.
-The remembered CSV opens when DATABASE is next shown. Clearing both receiver
-coordinates disables derived bearings and distances.
+`last_database_path` remembers the last manually opened file for the File dialog.
+`default_database_path` independently selects the startup database; an absent or
+empty value uses the bundled sample. Existing preference files remain compatible.
+**Tools -> Frequency Database Settings...** validates and loads a custom default
+before saving it, or clears that custom choice with **Use bundled database**.
+**File -> Open Frequency Database CSV...** loads for the current session without
+changing the default. Clearing both receiver coordinates disables geometry.
 
 RX bearing is the great-circle initial heading from receiver to transmitter.
 Distance uses a spherical Earth radius of 6371.0088 km. Beam offset is the

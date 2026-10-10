@@ -20,6 +20,7 @@ from aor_functions import display_step, search_step_hz
 CSV_FIELDS = ('Frequency', 'Station', 'UTCStart', 'UTCEnd', 'Days', 'Band', 'Language',
               'Target', 'TxSite', 'TxCountry', 'StationCountry', 'PowerKW', 'TxAzimuth',
               'TxLatitude', 'TxLongitude', 'Mode', 'Step', 'ValidFrom', 'ValidTo', 'Notes', 'Source')
+BUNDLED_DATABASE_PATH = Path(__file__).resolve().parent / 'data' / 'default_frequency_database.csv'
 MODE_NAMES = ('WFM', 'NFM', 'SFM', 'WAM', 'AM', 'NAM', 'USB', 'LSB', 'CW')
 WEEKDAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
 
@@ -232,7 +233,7 @@ def band_frequency_precisions(records):
 class DatabasePreferences:
     def __init__(self, path=None):
         self.path = Path(path) if path is not None else Path(wx.StandardPaths.Get().GetUserConfigDir()) / 'AR8600' / 'frequency_database.json'
-        self.location, self.last_path = None, ''
+        self.location, self.last_path, self.default_path = None, '', ''
         try:
             values = json.loads(self.path.read_text(encoding='utf-8'))
             if not isinstance(values, dict):
@@ -244,14 +245,18 @@ class DatabasePreferences:
                 self.location = (float(latitude), float(longitude))
             if isinstance(values.get('last_database_path'), str):
                 self.last_path = values['last_database_path']
+            if isinstance(values.get('default_database_path'), str):
+                self.default_path = values['default_database_path']
         except FileNotFoundError:
             pass
         except (OSError, ValueError, TypeError, KeyError, ArithmeticError) as error:
             print('Frequency database settings could not be read: %s' % error, file=sys.stderr)
 
-    def save(self, location, last_path):
+    def save(self, location, last_path, default_path=None):
+        if default_path is None:
+            default_path = self.default_path
         values = {'receiver_location': None if location is None else dict(zip(('latitude', 'longitude'), location)),
-                  'last_database_path': last_path}
+                  'last_database_path': last_path, 'default_database_path': default_path}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
@@ -261,10 +266,54 @@ class DatabasePreferences:
                 output.write('\n')
             os.replace(temporary, self.path)
             temporary = None
-            self.location, self.last_path = location, last_path
+            self.location, self.last_path, self.default_path = location, last_path, default_path
         finally:
             if temporary is not None:
                 os.unlink(temporary)
+
+
+class DatabaseSettingsDialog(wx.Dialog):
+    def __init__(self, panel):
+        super().__init__(panel, title='Frequency Database Settings')
+        self.panel = panel
+        self.path = wx.TextCtrl(self, value=panel.preferences.default_path or str(BUNDLED_DATABASE_PATH),
+                                size=(500, -1))
+        browse = wx.Button(self, label='Browse...')
+        bundled = wx.Button(self, label='Use bundled database')
+        self.message = wx.StaticText(self, label='The default loads at startup. File -> Open loads only for this session.')
+        self.path.SetToolTip('Default CSV loaded at startup; using the bundled database clears the custom default.')
+        layout = wx.BoxSizer(wx.VERTICAL)
+        layout.Add(wx.StaticText(self, label='Default Database path'), 0, wx.ALL, 8)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(self.path, 1, wx.RIGHT, 6)
+        row.Add(browse)
+        layout.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        layout.Add(bundled, 0, wx.ALL, 8)
+        layout.Add(self.message, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        layout.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALIGN_RIGHT | wx.ALL, 8)
+        self.SetSizerAndFit(layout)
+        browse.Bind(wx.EVT_BUTTON, self.on_browse)
+        bundled.Bind(wx.EVT_BUTTON, lambda event: self.path.SetValue(str(BUNDLED_DATABASE_PATH)))
+        self.Bind(wx.EVT_BUTTON, self.on_accept, id=wx.ID_OK)
+
+    def on_browse(self, event):
+        path = self.path.GetValue().strip()
+        dialog = wx.FileDialog(self, 'Choose default frequency database',
+                               defaultDir=os.path.dirname(path), defaultFile=os.path.basename(path),
+                               wildcard='CSV files (*.csv)|*.csv|All files (*.*)|*.*',
+                               style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                self.path.SetValue(dialog.GetPath())
+        finally:
+            dialog.Destroy()
+
+    def on_accept(self, event):
+        if self.panel.set_default_database(self.path.GetValue().strip()):
+            self.EndModal(wx.ID_OK)
+        else:
+            self.message.SetLabel('Could not accept this database. See the status area for details.')
+            self.Layout()
 
 
 class ReceiverLocationDialog(wx.Dialog):
@@ -419,7 +468,7 @@ class FrequencyDatabasePanel(wx.Panel):
         self.preferences = preferences or DatabasePreferences()
         self.records, self.path = [], ''
         self.active = False
-        self.remembered_loaded = False
+        self.startup_database_loaded = False
         self.filter_later = None
         self.details_window = None
         self.column_fit_pending = False
@@ -528,12 +577,21 @@ class FrequencyDatabasePanel(wx.Panel):
         if error:
             print(message, file=sys.stderr)
 
-    def open_csv(self, path):
+    def open_csv(self, path, remember=True):
         try:
             records = load_csv(path)
-        except (OSError, ValueError, csv.Error) as error:
+        except (OSError, ValueError, UnicodeError, csv.Error) as error:
             self.status('Frequency database could not be opened: %s' % error, error=True)
             return False
+        self.show_database(records, path)
+        if remember:
+            try:
+                self.preferences.save(self.preferences.location, self.path)
+            except OSError as error:
+                self.status('Loaded %d database rows; last path could not be saved: %s' % (len(records), error), error=True)
+        return True
+
+    def show_database(self, records, path):
         self.records, self.path = records, os.path.abspath(path)
         for record in records:
             record.geometry = receiver_geometry(self.preferences.location, record)
@@ -546,21 +604,44 @@ class FrequencyDatabasePanel(wx.Panel):
         self.measure_bounded_columns()
         self.fit_columns()
         self.update_clock()
-        self.remembered_loaded = True
+        self.startup_database_loaded = True
+        self.status('Frequency database: %d rows loaded from %s' % (len(records), self.path))
+
+    def load_startup_database(self):
+        if self.startup_database_loaded:
+            return
+        self.startup_database_loaded = True
+        paths = [self.preferences.default_path] if self.preferences.default_path else []
+        if str(BUNDLED_DATABASE_PATH) not in paths:
+            paths.append(str(BUNDLED_DATABASE_PATH))
+        for path in paths:
+            if self.open_csv(path, remember=False):
+                return
+        self.status('No startup frequency database could be loaded; DATABASE remains empty.', error=True)
+
+    def set_default_database(self, path):
+        path = os.path.abspath(path or BUNDLED_DATABASE_PATH)
         try:
-            self.preferences.save(self.preferences.location, self.path)
-        except OSError as error:
-            self.status('Loaded %d database rows; last path could not be saved: %s' % (len(records), error), error=True)
-        else:
-            self.status('Frequency database: %d rows loaded from %s' % (len(records), self.path))
+            records = load_csv(path)
+            default_path = '' if Path(path).resolve() == BUNDLED_DATABASE_PATH else path
+            self.preferences.save(self.preferences.location, self.preferences.last_path, default_path)
+        except (OSError, ValueError, UnicodeError, csv.Error) as error:
+            self.status('Default frequency database could not be saved: %s' % error, error=True)
+            return False
+        self.show_database(records, path)
         return True
+
+    def on_database_settings(self, event):
+        dialog = DatabaseSettingsDialog(self)
+        try:
+            dialog.ShowModal()
+        finally:
+            dialog.Destroy()
 
     def set_active(self, active):
         self.active = active
         if active:
-            if not self.remembered_loaded and self.preferences.last_path:
-                self.remembered_loaded = True
-                self.open_csv(self.preferences.last_path)
+            self.load_startup_database()
             self.apply_filters()
             self.fit_columns()
         self.update_clock()

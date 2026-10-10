@@ -1,0 +1,10 @@
+Frequency,Station,UTCStart,UTCEnd,Days,Band,Language,Target,TxSite,TxCountry,StationCountry,PowerKW,TxAzimuth,TxLatitude,TxLongitude,Mode,Step,ValidFrom,ValidTo,Notes,Source
+4.930000,United States Agency for Global Media (USAGM),05:30,07:00,25,60 m,English,"53,57",Moepeng Hill,Botswana,,100,20,-21.950000,27.650000,AM,5 kHz,2026-05-22,2026-10-24,,HFCC A26
+5.945000,Radio New Zealand,07:00,13:00,1234567,49 m,English,"51,56,64S,65S",Rangitaiki,New Zealand,,50,325,-38.833333,176.416667,AM,5 kHz,2026-03-29,2026-10-24,NZL,HFCC A26
+5.950000,Radio Miami International,00:00,05:00,1234567,49 m,English,"3,4,9","Okeechobee, FL",United States,,100,355,27.466667,-80.933333,AM,5 kHz,2026-03-29,2026-10-25,,HFCC A26
+5.955000,China Radio International,11:00,13:00,1234567,49 m,English,"44NE,45N",Beijing,China,,150,95,39.950000,116.450000,AM,5 kHz,2026-03-29,2026-10-25,,HFCC A26
+6.145000,Korean Broadcasting System,19:00,20:00,1234567,49 m,French,27SE,Woofferton,United Kingdom,,250,114,52.316667,-2.716667,AM,5 kHz,2026-07-02,2026-10-25,,HFCC A26
+7.220000,Radio Romania International,22:00,23:00,1234567,41 m,English,27N,Galbeni,Romania,,300,300,46.733333,26.833333,AM,5 kHz,2026-03-29,2026-10-25,,HFCC A26
+7.305000,Vatican Radio,01:30,02:00,1234567,41 m,Spanish,"11NW,11S",S. Maria di Galeria,Vatican,,250,285,42.050000,12.316667,AM,5 kHz,2026-03-29,2026-10-24,Spanish,HFCC A26
+7.305000,BBC Worldservice,06:00,06:29,1234567,41 m,French,46,Ascension,United Kingdom,,125,27,-7.900000,-14.383333,AM,5 kHz,2026-09-18,2026-10-25,FRENA_W,HFCC A26
+9.790000,Radio France Internationale,20:00,21:00,1234567,31 m,French,"37,46",Issoudun,France,,250,185,46.950000,1.983333,AM,5 kHz,2026-03-29,2026-10-24,49,HFCC A26
