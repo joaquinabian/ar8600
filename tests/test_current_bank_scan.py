@@ -46,6 +46,13 @@ class Controller:
         self.temporary_scan = None
         self.active_operation = None
         self.level_squelch_pending = False
+        self.level_squelch_requested = None
+        self.level_in_flight = None
+        self.level_debounce_ready = False
+        self.level_readback_timer = None
+        self.level_squelch_timer = Mock()
+        self.clear_level_edits = MethodType(main.AorCtrl.clear_level_edits, self)
+        self.fail_level_edit = MethodType(main.AorCtrl.fail_level_edit, self)
         self.scan_call_later = lambda milliseconds, callback: Timer()
         self.update_connection_ui = Mock()
         self.update_operation_ui = Mock()
@@ -304,7 +311,7 @@ class GuiBoundaryTests(unittest.TestCase):
 
         ctrl.sizer_18_staticbox.SetLabel.assert_called_with('Squelch')
         ctrl.sql.SetToolTip.assert_called_with('Signal threshold for opening the squelch or stopping the scan. 0 disables it.')
-        ctrl.sql.SetValue.assert_called_with(0)
+        self.assertNotIn(unittest.mock.call(0), ctrl.sql.SetValue.call_args_list)
         ctrl.sql_value.SetLabel.assert_called_with('---')
         ctrl.sql.Enable.assert_called_with(False)
         ctrl.group_response['scan'] = 3
@@ -335,7 +342,7 @@ class GuiBoundaryTests(unittest.TestCase):
         ctrl.sizer_18_staticbox.SetLabel.assert_called_with('Squelch')
         ctrl.sql.SetToolTip.assert_called_with('Signal threshold for opening the squelch or stopping the scan. 0 disables it.')
         ctrl.sql_value.SetLabel.assert_called_with('---')
-        ctrl.sql.SetValue.assert_called_with(0)
+        self.assertNotIn(unittest.mock.call(0), ctrl.sql.SetValue.call_args_list)
         ctrl.sql.Enable.assert_called_with(False)
         ctrl.accept_operation_parameter('DB 255')
         ctrl.sql.SetValue.assert_called_with(255)
@@ -391,7 +398,7 @@ class GuiBoundaryTests(unittest.TestCase):
         ctrl.operation_selection = lambda: ('Memory Scan', 'Current Bank')
         ctrl.refresh_level_context()
         ctrl.sql_value.SetLabel.assert_called_with('---')
-        ctrl.sql.SetValue.assert_called_with(0)
+        ctrl.sql.SetValue.assert_not_called()
         ctrl.sql.Enable.assert_called_with(False)
         ctrl.sizer_18_staticbox.SetLabel.assert_called_with('Squelch')
         main.AorCtrl.on_level_squelch_change(ctrl, None)
@@ -429,6 +436,185 @@ class GuiBoundaryTests(unittest.TestCase):
         main.AorCtrl.update_level_ui(ctrl)
         ctrl.sizer_18_staticbox.SetLabel.assert_called_with('Squelch')
         ctrl.sql.SetValue.assert_called_with(57)
+
+    def smooth_level_controller(self):
+        ctrl = self.level_controller()
+        ctrl.level_squelch_value = 100
+        thumb = [100]
+        ctrl.sql.GetValue.side_effect = lambda: thumb[0]
+        ctrl.sql.SetValue.side_effect = lambda value: thumb.__setitem__(0, value)
+        for method in ('on_level_squelch_change', 'on_level_squelch_timer'):
+            setattr(ctrl, method, MethodType(getattr(main.AorCtrl, method), ctrl))
+        ctrl.update_connection_ui = lambda: ctrl.update_level_ui()
+        def move(value):
+            thumb[0] = value  # Native mouse/key movement, before EVT_SLIDER.
+            ctrl.on_level_squelch_change(None)
+        return ctrl, thumb, move
+
+    def test_squelch_thumb_and_number_follow_desire_during_write(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.sql_value.SetLabel.assert_called_with('101')
+        ctrl.level_squelch_timer.StartOnce.assert_called_with(250)
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(ctrl.commands, [b'DB101\r\nDB\r\n'])
+        self.assertEqual(ctrl.level_squelch_value, 100)
+        self.assertEqual(ctrl.level_in_flight['value'], 101)
+        self.assertEqual(ctrl.level_squelch_requested, 101)
+        self.assertEqual(thumb[0], 101)
+        ctrl.sql.SetValue.assert_not_called()
+        ctrl.sql.Enable.assert_called_with(True)
+        ctrl.update_level_ui()
+        ctrl.sql.SetValue.assert_not_called()
+        ctrl.accept_operation_parameter('DB101')
+        self.assertIsNone(ctrl.level_in_flight)
+        self.assertIsNone(ctrl.level_squelch_requested)
+        self.assertEqual(ctrl.level_squelch_value, 101)
+        ctrl.sql.SetValue.assert_not_called()
+
+    def test_squelch_pending_changes_coalesce_to_latest_only(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.on_level_squelch_timer(None)
+        move(102)
+        move(103)
+        ctrl.on_level_squelch_timer(None)  # Debounce elapsed, first read still pending.
+        self.assertEqual(ctrl.commands, [b'DB101\r\nDB\r\n'])
+        self.assertEqual(ctrl.level_in_flight['value'], 101)
+        ctrl.sql_value.SetLabel.assert_called_with('103')
+        ctrl.accept_operation_parameter('DB101')
+        self.assertEqual(ctrl.commands, [b'DB101\r\nDB\r\n', b'DB103\r\nDB\r\n'])
+        self.assertEqual(ctrl.level_in_flight['value'], 103)
+        self.assertEqual(thumb[0], 103)
+        ctrl.accept_operation_parameter('DB103')
+        self.assertFalse(ctrl.level_squelch_pending)
+        self.assertEqual(ctrl.level_squelch_value, 103)
+        ctrl.sql.SetValue.assert_not_called()
+
+    def test_squelch_newer_edit_keeps_its_remaining_debounce(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.on_level_squelch_timer(None)
+        move(103)
+        ctrl.accept_operation_parameter('DB101')
+        self.assertEqual(len(ctrl.commands), 1)
+        self.assertEqual(thumb[0], 103)
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(ctrl.commands[-1], b'DB103\r\nDB\r\n')
+
+    def test_squelch_other_readback_during_debounce_does_not_cancel_desire(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.accept_operation_parameter('DB100')
+        self.assertEqual(ctrl.level_squelch_requested, 101)
+        self.assertEqual(thumb[0], 101)
+        ctrl.sql.SetValue.assert_not_called()
+        self.assertEqual(ctrl.commands, [])
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(ctrl.commands, [b'DB101\r\nDB\r\n'])
+
+    def test_squelch_scanner_mismatch_moves_once_without_newer_edit(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.on_level_squelch_timer(None)
+        ctrl.accept_operation_parameter('DB099')
+        self.assertEqual(thumb[0], 99)
+        ctrl.sql.SetValue.assert_called_once_with(99)
+        ctrl.update_level_ui()
+        ctrl.sql.SetValue.assert_called_once_with(99)
+        self.assertEqual(len(ctrl.commands), 1)
+
+    def test_squelch_timeout_clears_queue_and_restores_confirmed_once(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.on_level_squelch_timer(None)
+        move(103)
+        ctrl.on_level_squelch_timer(None)
+        ctrl.on_level_readback_timeout()
+        self.assertEqual(thumb[0], 100)
+        ctrl.sql.SetValue.assert_called_once_with(100)
+        self.assertIsNone(ctrl.level_squelch_requested)
+        self.assertIsNone(ctrl.level_in_flight)
+        self.assertFalse(ctrl.level_squelch_pending)
+        self.assertTrue(ctrl.errors)
+        ctrl.on_level_readback_timeout()
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(len(ctrl.commands), 1)
+        ctrl.sql.SetValue.assert_called_once_with(100)
+
+    def test_squelch_failed_write_restores_confirmed_without_retry(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        ctrl.write_serial = lambda data: 0
+        move(101)
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(thumb[0], 100)
+        ctrl.sql.SetValue.assert_called_once_with(100)
+        self.assertIsNone(ctrl.level_in_flight)
+        self.assertIsNone(ctrl.level_squelch_requested)
+        self.assertTrue(ctrl.errors)
+
+    def test_squelch_rejected_or_malformed_read_clears_edits(self):
+        for response in ('?', 'DB999'):
+            ctrl, thumb, move = self.smooth_level_controller()
+            ctrl.memory_inventory = ctrl.memory_bank_transfer = None
+            ctrl.bandscope = None
+            ctrl.monitor_muted = False
+            ctrl.mirror_console_line = Mock()
+            ctrl.maybe_load_initial_bank = Mock()
+            ctrl.memory_select_read = None
+            move(101)
+            ctrl.on_level_squelch_timer(None)
+            with self.subTest(response=response), unittest.mock.patch('sys.stderr'):
+                main.AorCtrl.on_serial_read(ctrl, SimpleNamespace(data=[response]))
+            self.assertEqual(thumb[0], 100)
+            ctrl.sql.SetValue.assert_called_once_with(100)
+            self.assertIsNone(ctrl.level_in_flight)
+            self.assertIsNone(ctrl.level_squelch_requested)
+            self.assertEqual(len(ctrl.commands), 1)
+
+    def test_squelch_context_switch_keeps_thumb_and_ignores_late_old_read(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        move(101)
+        ctrl.on_level_squelch_timer(None)
+        move(102)
+        ctrl.operation_selection = lambda: ('Memory Scan', 'Scan Group')
+        ctrl.refresh_level_context()
+        self.assertEqual(ctrl.commands[-1], b'GM3\r\nGM\r\n')
+        self.assertEqual(thumb[0], 102)
+        ctrl.sql.SetValue.assert_not_called()
+        ctrl.sql_value.SetLabel.assert_called_with('---')
+        ctrl.sql.Enable.assert_called_with(False)
+        self.assertIsNone(ctrl.level_squelch_requested)
+        self.assertIsNone(ctrl.level_in_flight)
+        ctrl.accept_operation_parameter('DB101')
+        self.assertEqual(ctrl.level_squelch_value, 101)  # Old cache can update.
+        self.assertEqual(thumb[0], 102)
+        ctrl.sql.SetValue.assert_not_called()
+        ctrl.group_response['scan'] = 3
+        ctrl.group_loading['scan'] = None
+        ctrl.accept_operation_parameter('XB023')
+        self.assertEqual(thumb[0], 23)
+        ctrl.sql.SetValue.assert_called_once_with(23)
+        self.assertEqual(len(ctrl.commands), 2)  # Original DB write + new context query.
+
+    def test_squelch_xb_edits_use_same_coalescing_path(self):
+        ctrl, thumb, move = self.smooth_level_controller()
+        ctrl.operation_selection = lambda: ('Memory Scan', 'Current Bank')
+        ctrl.temporary_scan = SimpleNamespace(group=2, busy=False)
+        ctrl.scan_level_context = ('XB', 2)
+        ctrl.group_response['scan'] = 2
+        ctrl.scan_levels[2] = 23
+        thumb[0] = 23
+        move(24)
+        ctrl.on_level_squelch_timer(None)
+        move(26)
+        ctrl.on_level_squelch_timer(None)
+        ctrl.accept_operation_parameter('XB024')
+        ctrl.accept_operation_parameter('XB026')
+        self.assertEqual(ctrl.commands, [b'XB024\r\nXB\r\n', b'XB026\r\nXB\r\n'])
+        self.assertEqual(ctrl.current_scan_level, 26)
+        self.assertEqual(ctrl.level_squelch_value, 100)
+        ctrl.sql.SetValue.assert_not_called()
 
     def test_db_and_xb_are_distinct_and_scanner_authoritative(self):
         ctrl = Controller()

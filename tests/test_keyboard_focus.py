@@ -10,6 +10,8 @@ import wx.dataview as dv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from keyboard_focus import MainKeyboardFocus
+from aor_control_frame import AorCtrlFrame
+import test_current_bank_scan as scan_tests
 
 
 class KeyboardGuiTests(unittest.TestCase):
@@ -131,6 +133,51 @@ class KeyboardGuiTests(unittest.TestCase):
         self.key(wx.WXK_TAB)
         self.assertEqual(wx.Window.FindFocus(), self.choice)
         self.key(wx.WXK_TAB, wx.MOD_SHIFT)
+        self.assertEqual(wx.Window.FindFocus(), self.slider)
+
+    def test_main_squelch_is_compact_and_in_left_column(self):
+        frame = AorCtrlFrame(None)
+        try:
+            frame.Show()
+            frame.Layout()
+            self.pump()
+            left = frame.panel_1.GetSizer().GetItem(0).GetSizer()
+            box = frame.sql.GetContainingSizer()
+            self.assertTrue(any(item.GetSizer() == box for item in left.GetChildren()))
+            self.assertEqual(box.GetItem(frame.sql).GetProportion(), 0)
+            self.assertGreaterEqual(frame.sql.GetSize().width, 200)
+            self.assertLessEqual(frame.sql.GetSize().width, 250)
+            self.assertGreater(frame.sizer_18_staticbox.GetPosition().y,
+                               frame.sizer_17_staticbox.GetPosition().y)
+            self.assertLess(frame.sql.GetPosition().x, frame.tuning_panel.GetPosition().x)
+        finally:
+            frame.Destroy()
+            self.pump()
+
+    def test_keyboard_squelch_remains_smooth_during_actual_handler_readback(self):
+        ctrl, _, _ = scan_tests.GuiBoundaryTests().smooth_level_controller()
+        ctrl.sql = self.slider
+        ctrl.sql_value = wx.StaticText(self.panel, label='100', pos=(10, 240))
+        ctrl.keyboard_focus = self.keyboard
+        self.slider.Unbind(wx.EVT_SLIDER)
+        self.slider.Bind(wx.EVT_SLIDER, ctrl.on_level_squelch_change)
+        self.focus(self.slider)
+        self.key(wx.WXK_RIGHT)
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(self.slider.GetValue(), 101)
+        self.assertEqual(wx.Window.FindFocus(), self.slider)
+        self.key(wx.WXK_UP)
+        self.key(wx.WXK_RIGHT)
+        self.key(wx.WXK_LEFT)
+        self.assertEqual(self.slider.GetValue(), 102)
+        self.assertEqual(ctrl.sql_value.GetLabel(), '102')
+        ctrl.on_level_squelch_timer(None)
+        self.assertEqual(ctrl.commands, [b'DB101\r\nDB\r\n'])
+        ctrl.accept_operation_parameter('DB101')
+        self.assertEqual(ctrl.commands[-1], b'DB102\r\nDB\r\n')
+        self.assertEqual(self.slider.GetValue(), 102)
+        ctrl.accept_operation_parameter('DB102')
+        self.assertEqual(self.slider.GetValue(), 102)
         self.assertEqual(wx.Window.FindFocus(), self.slider)
 
     def test_empty_click_neutralizes_focus_and_arrows(self):

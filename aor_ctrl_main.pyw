@@ -995,6 +995,8 @@ class AorCtrl(AorCtrlFrame):
         self.level_squelch_value = None
         self.level_squelch_pending = False
         self.level_squelch_requested = None
+        self.level_in_flight = None
+        self.level_debounce_ready = False
         self.level_readback_timer = None
         self.scan_levels = {}
         self.current_scan_level = None
@@ -1530,13 +1532,25 @@ class AorCtrl(AorCtrlFrame):
                     self.current_scan_level = value
         context = self.level_context()
         if key == context[0] and (key == 'DB' or self.group_response['scan'] == context[1]):
+            flight = self.level_in_flight
             self.level_squelch_pending = False
+            self.level_in_flight = None
             if self.level_readback_timer is not None:
                 self.level_readback_timer.Stop()
+            desired = self.level_squelch_requested
+            if (desired is None or desired == value or
+                    flight is not None and desired == flight['value']):
+                # No newer edit: accept the scanner's value, even if it differs.
+                self.level_squelch_requested = None
+                self.level_debounce_ready = False
+                self.level_squelch_timer.Stop()
         self.update_level_ui()
         self.update_operation_ui()
         if self.settings_dialog is not None:
             self.settings_dialog.accept(key, value)
+        if (self.level_squelch_requested is not None and self.level_debounce_ready and
+                not self.level_squelch_pending):
+            self.on_level_squelch_timer(None)
 
     def report_scan_error(self, message):
         self.aor_status.SetStatusText(message)
@@ -1611,19 +1625,21 @@ class AorCtrl(AorCtrlFrame):
 
     def update_level_ui(self):
         key, group = self.level_context()
-        value = None if self.level_squelch_pending else self.displayed_level()
+        synchronizing = self.level_squelch_pending and self.level_in_flight is None
+        confirmed = self.displayed_level()
+        value = (None if synchronizing else self.level_squelch_requested
+                 if self.level_squelch_requested is not None else confirmed)
         self.sizer_18_staticbox.SetLabel('Squelch')
         self.sql.SetToolTip(SQUELCH_TOOLTIP)
         self.sql_value.SetToolTip(SQUELCH_TOOLTIP)
         self.sql_value.SetLabel('---' if value is None else 'Off' if value == 0 else str(value))
-        if self.level_squelch_requested is None:
-            # Unknown/read-pending is not the previous context's threshold.
-            self.sql.SetValue(0 if value is None else value)
+        if value is not None and self.sql.GetValue() != value:
+            self.sql.SetValue(value)
         scan_busy = self.temporary_scan is not None and self.temporary_scan.busy
         enabled = (self.connected and self.serial.is_open and self.alive.is_set() and
                         self.memory_inventory is None and self.memory_bank_transfer is None and
-                        not self.level_squelch_pending and not scan_busy and
-                        value is not None and
+                        not synchronizing and not scan_busy and
+                        confirmed is not None and
                         not (key == 'XB' and self.group_loading['scan'] is not None) and
                         not (key == 'XB' and group == 0))
         keyboard = getattr(self, 'keyboard_focus', None)
@@ -1635,29 +1651,30 @@ class AorCtrl(AorCtrlFrame):
     def refresh_level_context(self, query=True):
         context = self.level_context()
         if context != self.scan_level_context:
-            if self.level_readback_timer is not None:
-                self.level_readback_timer.Stop()
-            self.level_squelch_timer.Stop()
-            self.level_squelch_requested = None
-            self.level_squelch_pending = False
+            self.clear_level_edits()
             self.scan_level_context = context
+        elif self.level_squelch_pending:
+            self.update_level_ui()
+            return
         if not query or not self.connected or not self.serial.is_open:
             self.update_level_ui()
             return
         key, group = context
         if key == 'DB':
-            self.level_squelch_value = None
             self.level_squelch_pending = True
             self.update_level_ui()
-            self.write_serial(b'DB\r\n')
-            self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+            if self.write_serial(b'DB\r\n') != 4:
+                self.fail_level_edit('Squelch query failed; value was not verified.')
+            else:
+                self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
         elif group is not None and self.temporary_scan is not None:
             if not self.temporary_scan.busy and self.group_response['scan'] == group:
-                self.scan_levels.pop(group, None)
                 self.level_squelch_pending = True
                 self.update_level_ui()
-                self.write_serial(b'XB\r\n')
-                self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+                if self.write_serial(b'XB\r\n') != 4:
+                    self.fail_level_edit('Squelch query failed; value was not verified.')
+                else:
+                    self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
             else:
                 self.update_level_ui()
         elif group is not None and self.active_operation is None:
@@ -1968,17 +1985,25 @@ class AorCtrl(AorCtrlFrame):
                 break
 
     def on_level_squelch_change(self, event):
-        if (not self.connected or not self.serial.is_open or self.level_squelch_pending or
+        if (not self.connected or not self.serial.is_open or
+                self.level_squelch_pending and self.level_in_flight is None or
                 self.displayed_level() is None):
             return
         self.level_squelch_requested = self.sql.GetValue()
+        self.level_debounce_ready = False
         self.level_squelch_timer.StartOnce(250)
+        self.update_level_ui()
         self.update_operation_ui()
 
     def on_level_squelch_timer(self, event):
+        self.level_debounce_ready = True
+        if self.level_squelch_pending:
+            return  # Keep only the latest desired value until this read completes.
         value = self.level_squelch_requested
-        self.level_squelch_requested = None
         if value is None or not self.connected or not self.serial.is_open or value == self.displayed_level():
+            self.level_squelch_requested = None
+            self.level_debounce_ready = False
+            self.update_level_ui()
             self.update_operation_ui()
             return
         key, group = self.level_context()
@@ -1993,22 +2018,33 @@ class AorCtrl(AorCtrlFrame):
             self.aor_status.SetStatusText('Wait for the current squelch read-back.')
             return
         self.level_squelch_pending = True
-        self.sql.SetValue(self.displayed_level())
+        self.level_in_flight = {'context': (key, group), 'value': value}
         self.update_connection_ui()
         command = operation_parameter_command(key, value) + (key + '\r\n').encode('ascii')
         if self.write_serial(command) != len(command):
-            self.level_squelch_pending = False
-            self.aor_status.SetStatusText('Squelch write failed; value was not verified.')
+            self.fail_level_edit('Squelch write failed; value was not verified.')
             self.update_connection_ui()
         else:
             self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
 
     def on_level_readback_timeout(self):
         if self.level_squelch_pending:
-            self.level_squelch_pending = False
-            self.report_scan_error('%s level read-back timed out; value was not assumed.' % self.level_context()[0])
-            self.update_level_ui()
-            self.update_operation_ui()
+            self.fail_level_edit('Squelch read-back timed out; value was not assumed.')
+
+    def clear_level_edits(self):
+        self.level_squelch_timer.Stop()
+        if self.level_readback_timer is not None:
+            self.level_readback_timer.Stop()
+        self.level_squelch_requested = None
+        self.level_in_flight = None
+        self.level_debounce_ready = False
+        self.level_squelch_pending = False
+
+    def fail_level_edit(self, message):
+        self.clear_level_edits()
+        self.report_scan_error(message)
+        self.update_level_ui()
+        self.update_operation_ui()
 
     def stop_thread(self):
         """Stop the receiver thread, wait util it's finished."""
@@ -2037,11 +2073,7 @@ class AorCtrl(AorCtrlFrame):
         self.filling_banks = False
         self.pending_memory_channels.clear()
         self.initial_bank_load_pending = False
-        self.level_squelch_timer.Stop()
-        if self.level_readback_timer is not None:
-            self.level_readback_timer.Stop()
-        self.level_squelch_pending = False
-        self.level_squelch_requested = None
+        self.clear_level_edits()
         self.level_squelch_value = None
         self.scan_levels.clear()
         self.receiver_switches = {'NL': None, 'AF': None}
@@ -2413,7 +2445,6 @@ class AorCtrl(AorCtrlFrame):
         if kind == 'scan':
             self.level_vfo_context = False
             self.refresh_level_context(query=False)
-            self.scan_levels.pop(group, None)
             if self.level_context()[0] == 'XB':
                 self.level_squelch_pending = True
                 self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
@@ -2612,6 +2643,10 @@ class AorCtrl(AorCtrlFrame):
             try:
                 if not isinstance(first, str):
                     raise ValueError('Response must be text')
+                if (first == '?' and self.level_squelch_pending and self.memory_bank_transfer is None and
+                        (self.temporary_scan is None or not self.temporary_scan.busy)):
+                    self.fail_level_edit('Scanner rejected Squelch write/read-back (?).')
+                    continue
                 if self.temporary_scan is not None and self.temporary_scan.receive(first):
                     received_valid = True
                     continue
@@ -2716,6 +2751,9 @@ class AorCtrl(AorCtrlFrame):
                 if first.startswith(('VA ', 'VB ', 'VF ', 'MR ', 'MS ', 'SM ', 'VS ', 'VV ', 'MW ')) or re.match(r'SR[A-Ta-t] RF', first):
                     startup_readback = True
             except (ValueError, IndexError, TypeError) as error:
+                if (self.level_squelch_pending and isinstance(first, str) and
+                        first.startswith(self.level_context()[0])):
+                    self.fail_level_edit('Malformed Squelch read-back: %r.' % first)
                 if self.memory_inventory is not None and isinstance(first, str) and first.startswith(('MW', 'MX', 'GR')):
                     self.finish_memory_inventory('Export failed: malformed scanner response %r: %s' % (first, error))
                 if isinstance(first, str) and first.startswith('GR') and self.memory_select_read is not None:
@@ -3917,6 +3955,8 @@ class AorCtrl(AorCtrlFrame):
             except serial.SerialException as error:
                 self.alive.clear()
                 print('Serial read error: %s' % error, file=sys.stderr)
+                if self.level_squelch_pending:
+                    wx.CallAfter(self.fail_level_edit, 'Squelch read failed; value was not verified.')
                 if self.temporary_scan is not None:
                     wx.CallAfter(self.temporary_scan.fail, 'Serial read failed; attempting original Scan Group restoration.')
                 elif self.memory_bank_transfer is not None:
@@ -3952,7 +3992,8 @@ class AorCtrl(AorCtrlFrame):
                 self.post_console_receive(raw_line)
                 continue
             if textline == '?\r\n':
-                if self.memory_bank_transfer is not None or self.temporary_scan is not None:
+                if (self.memory_bank_transfer is not None or self.temporary_scan is not None or
+                        self.level_squelch_pending):
                     self.GetEventHandler().AddPendingEvent(SerialRxEvent(self.GetId(), ['?'], [raw_line]))
                 else:
                     self.post_console_receive(raw_line)

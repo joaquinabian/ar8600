@@ -144,7 +144,7 @@ class AorCtrlFrame(wx.Frame):
         self.cbx_search.SetSelection(0)
         self.bt_search.SetMinSize((235, 25))
         self.bt_mkpassfreq.SetMinSize((155, 25))
-        self.sql.SetMinSize((209, 23))
+        self.sql.SetMinSize((220, 23))
         # end wxGlade
 
     def __do_layout(self):
@@ -205,6 +205,9 @@ class AorCtrlFrame(wx.Frame):
         sizer_17.Add(self.ckbx_afc, 0, wx.TOP, 5)
         sizer_16.Add(sizer_17, 0, wx.ALL | wx.EXPAND, 5)
         sizer_10.Add(sizer_16, 0, 0, 0)
+        sizer_18.Add(self.sql, 0, wx.ALIGN_CENTER_VERTICAL | wx.BOTTOM | wx.LEFT, 5)
+        sizer_18.Add(self.sql_value, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 5)
+        sizer_10.Add(sizer_18, 0, wx.ALL, 5)
         sizer_2.Add(sizer_10, 0, 0, 0)
         sizer_5.Add(self.tuning_panel, 0, wx.ADJUST_MINSIZE, 0)
         sizer_4.Add(sizer_5, 0, wx.ALL, 3)
@@ -254,9 +257,6 @@ class AorCtrlFrame(wx.Frame):
         sizer_6.Add(self.bt_mkpassfreq, 0, wx.EXPAND | wx.ALL, 3)
         sizer_4.Add(sizer_6, 0, 0, 0)
         sizer_3.Add(sizer_4, 0, wx.EXPAND | wx.LEFT, 0)
-        sizer_18.Add(self.sql, 1, wx.BOTTOM | wx.EXPAND, 5)
-        sizer_18.Add(self.sql_value, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        sizer_3.Add(sizer_18, 0, wx.BOTTOM | wx.EXPAND, 5)
         sizer_2.Add(sizer_3, 0, wx.LEFT, 5)
         sizer_2.Add(self.panel_2, 1, 0, 0)
         self.panel_1.SetSizer(sizer_2)
