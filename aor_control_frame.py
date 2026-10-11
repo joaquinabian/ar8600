@@ -15,6 +15,83 @@ from search_panel import EditListCtrlPanel
 # end wxGlade
 
 
+class VfoFrequency(wx.Panel):
+    """Right-aligned value with an independently sized, fixed-font unit column."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.value = wx.StaticText(self, label='----.-----', style=wx.ALIGN_RIGHT | wx.ST_NO_AUTORESIZE)
+        self.value.SetMinSize((140, -1))
+        self.unit = wx.StaticText(self, label='MHz', style=wx.ALIGN_LEFT | wx.ST_NO_AUTORESIZE)
+        self.unit.SetFont(wx.Font(10, wx.DEFAULT, wx.NORMAL, wx.NORMAL))
+        self.unit.SetMinSize((40, -1))
+        layout = wx.BoxSizer(wx.HORIZONTAL)
+        layout.Add(self.value, 1, wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.unit, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 8)
+        self.SetSizer(layout)
+
+    def SetLabel(self, label):
+        number, _, unit = label.rpartition(' ')
+        if unit in ('kHz', 'MHz', 'GHz'):
+            self.value.SetLabel(number)
+            self.unit.SetLabel(unit)
+        else:
+            self.value.SetLabel(label)
+
+    def GetLabel(self):
+        return self.value.GetLabel() + ' ' + self.unit.GetLabel()
+
+    def SetFont(self, font):
+        return self.value.SetFont(font)
+
+    def GetFont(self):
+        return self.value.GetFont()
+
+
+class VfoSelector(wx.Panel):
+    """Two receiver-display boxes; cache indices remain VA=0, VB=1, VF=2."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.buttons = {}
+        self.frequencies = {}
+        self.boxes = []
+        layout = wx.BoxSizer(wx.VERTICAL)
+        for rows in (((2, '1-VFO'),), ((0, 'VFO-A'), (1, 'VFO-B'))):
+            box = wx.StaticBox(self, label='')
+            self.boxes.append(box)
+            group = wx.StaticBoxSizer(box, wx.VERTICAL)
+            for index, label in rows:
+                # Common parent keeps all three native radio buttons in one group.
+                button = wx.RadioButton(self, label=label, style=wx.RB_GROUP if index == 2 else 0)
+                button.SetMinSize((78, -1))
+                button.SetToolTip('Select the active listening VFO; other VFOs retain their own settings.')
+                self.buttons[index] = button
+                frequency = VfoFrequency(self)
+                self.frequencies[index] = frequency
+                row = wx.BoxSizer(wx.HORIZONTAL)
+                row.Add(button, 0, wx.ALIGN_CENTER_VERTICAL)
+                row.Add(frequency, 1, wx.EXPAND | wx.LEFT, 4)
+                group.Add(row, 0, wx.EXPAND | wx.ALL, 4)
+                button.Bind(wx.EVT_RADIOBUTTON, lambda event, index=index: self.on_select(index))
+            layout.Add(group, 0, wx.EXPAND | wx.BOTTOM, 4)
+        self.SetSizer(layout)
+        self.SetSelection(2)
+
+    def GetSelection(self):
+        return next(index for index, button in self.buttons.items() if button.GetValue())
+
+    def SetSelection(self, index):
+        self.buttons[index].SetValue(True)
+
+    def GetStringSelection(self):
+        return self.buttons[self.GetSelection()].GetLabel()
+
+    def on_select(self, index):
+        event = wx.CommandEvent(wx.EVT_RADIOBOX.typeId, self.GetId())
+        event.SetEventObject(self)
+        event.SetInt(index)
+        self.GetEventHandler().ProcessEvent(event)
+
+
 class AorCtrlFrame(wx.Frame):
     def __init__(self, *args, **kwds):
         # begin wxGlade: AorCtrlFrame.__init__
@@ -41,13 +118,10 @@ class AorCtrlFrame(wx.Frame):
         self.aor_toolbar.AddTool(wx.ID_ANY, "config", wx.Bitmap(str(icon_dir / "applications_32.bmp"), wx.BITMAP_TYPE_ANY), wx.NullBitmap, wx.ITEM_NORMAL, "", "")
         # Tool Bar end
         self.panel_1 = wx.Panel(self, wx.ID_ANY)
-        self.rb_vfos = wx.RadioBox(self.panel_1, wx.ID_ANY, "", choices=["VFO-A", "VFO-B", "VFO"], majorDimension=1, style=wx.RA_SPECIFY_COLS)
-        self.panel_3 = wx.Panel(self.panel_1, wx.ID_ANY)
-        self.lb_vfa = wx.StaticText(self.panel_3, wx.ID_ANY, "xxxxxxx........", style=wx.ALIGN_RIGHT|wx.ST_NO_AUTORESIZE)
-        self.lb_vfb = wx.StaticText(self.panel_3, wx.ID_ANY, "xxxxxxx........", style=wx.ALIGN_RIGHT|wx.ST_NO_AUTORESIZE)
-        self.lb_vfo = wx.StaticText(self.panel_3, wx.ID_ANY, "xxxxxxxx........", style=wx.ALIGN_RIGHT|wx.ST_NO_AUTORESIZE)
-        self.sizer_12_staticbox = wx.StaticBox(self.panel_3, wx.ID_ANY, "")
-        self.sizer_11_staticbox = wx.StaticBox(self.panel_1, wx.ID_ANY, "VFO Frequency [MHz]")
+        self.rb_vfos = VfoSelector(self.panel_1)
+        self.lb_vfo = self.rb_vfos.frequencies[2]
+        self.lb_vfa = self.rb_vfos.frequencies[0]
+        self.lb_vfb = self.rb_vfos.frequencies[1]
         self.ckbx_auto = wx.CheckBox(self.panel_1, wx.ID_ANY, "A")
         self.sizer_24_staticbox = wx.StaticBox(self.panel_1, wx.ID_ANY, "Auto")
         self.cbx_step = wx.ComboBox(self.panel_1, wx.ID_ANY, choices=["0.05", "0.1", "0.2", "0.5", "1", "5", "10", "50", "100"], style=wx.CB_DROPDOWN)
@@ -92,6 +166,12 @@ class AorCtrlFrame(wx.Frame):
         self.bt_search = wx.Button(self.search_source_panel, label="Edit Linked Ranges...")
         self.bt_start = wx.Button(self.operation_panel, label="Start")
         self.bt_stop = wx.Button(self.operation_panel, label="Stop")
+        self.bt_resume = wx.Button(self.operation_panel, label="Resume")
+        self.bt_to_vfo = wx.Button(self.operation_panel, label="To VFO")
+        self.bt_resume.SetToolTip("Continue a memory scan paused on a received channel.")
+        self.bt_to_vfo.SetToolTip("Save the received channel to 1-VFO; apply it when scanning stops.")
+        self.bt_resume.Disable()
+        self.bt_to_vfo.Disable()
         self.bt_mkpassfreq = wx.Button(self.panel_1, wx.ID_ANY, "Add Pass Frequency...")
         self.bt_mkpassfreq.Hide()
         self.sql = wx.Slider(self.panel_1, wx.ID_ANY, 0, 0, 255, style=wx.SL_HORIZONTAL)
@@ -121,12 +201,10 @@ class AorCtrlFrame(wx.Frame):
             self.aor_status.SetStatusText(aor_status_fields[i], i)
         self.aor_toolbar.SetToolBitmapSize((32, 32))
         self.aor_toolbar.Realize()
-        self.rb_vfos.SetMinSize((78, 100))
-        self.rb_vfos.SetSelection(0)
-        self.lb_vfa.SetFont(wx.Font(9, wx.DEFAULT, wx.NORMAL, wx.BOLD, 0, ""))
-        self.lb_vfb.SetFont(wx.Font(9, wx.DEFAULT, wx.NORMAL, wx.BOLD, 0, ""))
-        self.lb_vfo.SetFont(wx.Font(9, wx.DEFAULT, wx.NORMAL, wx.BOLD, 0, ""))
-        self.panel_3.SetMinSize((195, 100))
+        self.rb_vfos.SetSelection(2)
+        self.lb_vfa.SetFont(wx.Font(11, wx.DEFAULT, wx.NORMAL, wx.BOLD, 0, ""))
+        self.lb_vfb.SetFont(wx.Font(11, wx.DEFAULT, wx.NORMAL, wx.BOLD, 0, ""))
+        self.lb_vfo.SetFont(wx.Font(14, wx.DEFAULT, wx.NORMAL, wx.BOLD, 0, ""))
         self.cbx_step.SetMinSize((75, 24))
         self.cbx_step.SetSelection(-1)
         self.cbx_mode.SetMinSize((75, 24))
@@ -140,6 +218,8 @@ class AorCtrlFrame(wx.Frame):
         self.bt_scgrp.SetMinSize((235, 25))
         self.bt_start.SetMinSize((75, 25))
         self.bt_stop.SetMinSize((75, 25))
+        self.bt_resume.SetMinSize((75, 25))
+        self.bt_to_vfo.SetMinSize((75, 25))
         self.cbx_search.SetMinSize((65, 24))
         self.cbx_search.SetSelection(0)
         self.bt_search.SetMinSize((235, 25))
@@ -172,23 +252,7 @@ class AorCtrlFrame(wx.Frame):
         sizer_25 = wx.StaticBoxSizer(self.sizer_25_staticbox, wx.HORIZONTAL)
         self.sizer_24_staticbox.Lower()
         sizer_24 = wx.StaticBoxSizer(self.sizer_24_staticbox, wx.HORIZONTAL)
-        self.sizer_11_staticbox.Lower()
-        sizer_11 = wx.StaticBoxSizer(self.sizer_11_staticbox, wx.HORIZONTAL)
-        self.sizer_12_staticbox.Lower()
-        sizer_12 = wx.StaticBoxSizer(self.sizer_12_staticbox, wx.VERTICAL)
-        sizer_15 = wx.BoxSizer(wx.HORIZONTAL)
-        sizer_14 = wx.BoxSizer(wx.HORIZONTAL)
-        sizer_13 = wx.BoxSizer(wx.HORIZONTAL)
-        sizer_11.Add(self.rb_vfos, 0, wx.BOTTOM | wx.EXPAND | wx.LEFT, 5)
-        sizer_13.Add(self.lb_vfa, 1, wx.EXPAND, 0)
-        sizer_12.Add(sizer_13, 1, wx.EXPAND | wx.RIGHT | wx.TOP, 5)
-        sizer_14.Add(self.lb_vfb, 1, wx.EXPAND, 0)
-        sizer_12.Add(sizer_14, 1, wx.EXPAND | wx.RIGHT, 5)
-        sizer_15.Add(self.lb_vfo, 1, wx.EXPAND, 0)
-        sizer_12.Add(sizer_15, 1, wx.EXPAND | wx.RIGHT, 5)
-        self.panel_3.SetSizer(sizer_12)
-        sizer_11.Add(self.panel_3, 1, 0, 0)
-        sizer_10.Add(sizer_11, 0, wx.ALL, 5)
+        sizer_10.Add(self.rb_vfos, 0, wx.EXPAND | wx.ALL, 5)
         sizer_24.Add(self.ckbx_auto, 0, wx.ALIGN_CENTER_VERTICAL | wx.BOTTOM | wx.TOP, 4)
         sizer_23.Add(sizer_24, 0, wx.EXPAND, 0)
         sizer_25.Add(self.cbx_step, 0, 0, 0)
@@ -251,6 +315,8 @@ class AorCtrlFrame(wx.Frame):
         common_buttons = wx.BoxSizer(wx.HORIZONTAL)
         common_buttons.Add(self.bt_start, 1)
         common_buttons.Add(self.bt_stop, 1, wx.LEFT, 5)
+        common_buttons.Add(self.bt_resume, 1, wx.LEFT, 5)
+        common_buttons.Add(self.bt_to_vfo, 1, wx.LEFT, 5)
         operation_sizer.Add(common_buttons, 0, wx.EXPAND | wx.ALL, 5)
         self.operation_panel.SetSizer(operation_sizer)
         sizer_6.Add(self.operation_panel, 0, wx.EXPAND | wx.ALL, 3)

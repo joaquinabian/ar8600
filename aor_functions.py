@@ -250,6 +250,21 @@ def protocol_frequency_hz(value):
     return Decimal(value) * (1000000 if '.' in value else 1)
 
 
+def display_vfo_frequency(hz):
+    """Readable VFO units, retaining every significant Hz digit in the label."""
+    hz = Decimal(str(hz))
+    if hz < 3000000:
+        divisor, unit, minimum = Decimal(1000), 'kHz', 1
+    elif hz < 1000000000:
+        divisor, unit, minimum = Decimal(1000000), 'MHz', 3
+    else:
+        divisor, unit, minimum = Decimal(1000000000), 'GHz', 6
+    number = format(hz / divisor, 'f')
+    integer, _, fraction = number.partition('.')
+    fraction = fraction.rstrip('0').ljust(minimum, '0')
+    return '%s.%s %s' % (integer, fraction, unit)
+
+
 def display_frequency(hz):
     hz = Decimal(str(hz))
     return ('%.3f kHz' % (hz / 1000)) if hz < 3000000 else ('%.6f MHz' % (hz / 1000000))
@@ -325,10 +340,10 @@ def operation_parameter_command(key, value):
             raw = '%02d' % value
         else:
             raise ValueError('Resume delay must be Off, 0.1-9.9 s, or supported Hold')
-    elif key[1] == 'P' and isinstance(value, int) and 0 <= value <= 60:
+    elif key[1] == 'P' and isinstance(value, int) and 0 <= value <= (99 if key == 'XP' else 60):
         raw = '%02d' % value
     else:
-        raise ValueError('Maximum dwell must be Off or 1-60 s')
+        raise ValueError('Maximum dwell must be Off or 1-%d s' % (99 if key == 'XP' else 60))
     if key not in ('DA', 'DB', 'DD', 'DP', 'XA', 'XB', 'XD', 'XM', 'XP', 'SA', 'SB', 'SD', 'SP'):
         raise ValueError('Unknown scan/search parameter')
     return (key + raw + '\r\n').encode('ascii')

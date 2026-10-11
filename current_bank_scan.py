@@ -27,7 +27,7 @@ def group_snapshot(header, membership):
         if key in raw:
             raise ValueError('Duplicate group parameter')
         # Read-back XD2.0 must be restored with the documented setter XD20.
-        # XP can legitimately exceed the dialog's 60 s limit: retain it exactly.
+        # Retain all documented XP00..XP99 values exactly for restoration.
         raw[key] = ('XP%02d' % value if key == 'XP' else
                     operation_parameter_command(key, value).decode('ascii').rstrip('\r\n'))
         values[key] = value
@@ -43,7 +43,7 @@ class CurrentBankScan:
     def __init__(self, controller, target, level=None, ready=None):
         self.controller = controller
         self.target = target['bank']
-        self.level = level
+        self.level = getattr(controller, 'level_squelch_value', None) if level is None else level
         self.ready_callback = ready
         self.phase = 'empty'
         self.timer = None
@@ -84,6 +84,9 @@ class CurrentBankScan:
         return ok
 
     def start(self):
+        if not isinstance(self.level, int) or not 0 <= self.level <= 255:
+            self.fail('Read the confirmed listening Squelch (DB) before preparing a bank scan.')
+            return
         if len(self.controller.memory_banks) != 20:
             self.fail('Complete TB metadata is required before starting Current Memory Bank.')
             return
@@ -96,15 +99,27 @@ class CurrentBankScan:
         self.helper = self.candidates.pop(0)
         capacity = self.controller.memory_banks[self.helper]['channels']
         # Even a zero-capacity bank must answer MA with explicit empty slots.
-        blocks = max(1, (capacity + 9) // 10)
-        self.remaining = {'%s%02d' % (self.helper, n) for n in range(blocks * 10)}
-        self.populated = False
+        self.blocks = max(1, (capacity + 9) // 10)
+        self.remaining = {'%s%02d' % (self.helper, n) for n in range(self.blocks * 10)}
+        self.block = 0
         self.phase = 'empty'
-        self.controller.aor_status.SetStatusText('Verifying empty helper bank %s...' % self.helper)
-        self.send(('MA%s\r\n' % self.helper + 'MA\r\n' * (blocks - 1)).encode('ascii'))
+        self.read_empty_block()
+
+    def read_empty_block(self):
+        first = self.block * 10
+        self.block_remaining = {'%s%02d' % (self.helper, n) for n in range(first, first + 10)}
+        self.controller.aor_status.SetStatusText(
+            'Preparing Memory Bank %s scan: verifying empty helper bank %s, channels %02d-%02d...' %
+            (self.target, self.helper, first, first + 9))
+        command = ('MA%s\r\n' % self.helper) if self.block == 0 else 'MA\r\n'
+        self.send(command.encode('ascii'))
 
     def query_group(self, group, phase):
         self.phase, self.header, self.expected_group = phase, None, group
+        self.controller.aor_status.SetStatusText(
+            '%s Memory Bank %s scan: reading Scan Group %s...' %
+            ('Restoring' if phase == 'restore_context' else 'Preparing',
+             self.target, 'current' if group is None else group))
         self.send((('GM%d\r\n' % group if group is not None else '') + 'GM\r\n').encode('ascii'))
 
     def receive(self, text):
@@ -125,17 +140,25 @@ class CurrentBankScan:
                 self.phase = 'active'
                 self.timer.Stop()
                 self.controller.update_connection_ui()
+                self.controller.aor_status.SetStatusText('Scanning Memory Bank %s' % self.target)
                 return False  # Normal validated RX parser owns the displayed scan state.
             if self.phase == 'empty' and text.startswith('MX'):
                 channel, fields = self.controller.parse_memory_line(text)
-                if channel in self.remaining:
-                    self.remaining.remove(channel)
-                    self.populated |= fields is not None
-                    if not self.remaining:
-                        if self.populated:
-                            self.next_empty_bank()
-                        else:
-                            self.query_group(None, 'original')
+                if channel in self.block_remaining:
+                    if fields is not None:
+                        # Reject at the first populated slot, without requesting
+                        # further blocks. Tail lines from this block are ignored
+                        # by the next candidate's bank-specific channel set.
+                        self.next_empty_bank()
+                    else:
+                        self.remaining.remove(channel)
+                        self.block_remaining.remove(channel)
+                        if not self.block_remaining:
+                            if self.remaining:
+                                self.block += 1
+                                self.read_empty_block()
+                            else:
+                                self.query_group(None, 'original')
                 return True
             if self.busy and text.startswith('GM'):
                 if not re.match(r'GM[0-9](?:\s|$)', text):
@@ -191,6 +214,16 @@ class CurrentBankScan:
                 self.ready_callback()
             else:
                 self.begin_scan()
+        elif self.phase == 'level_start':
+            if set(state['members']) != {self.helper, self.target} or state['values']['XB'] != self.level:
+                raise ValueError('Listening Squelch did not verify as temporary Scan Level')
+            self.controller.scan_levels[self.group] = self.level
+            self.controller.current_scan_level = self.level
+            self.controller.group_response['scan'] = self.group
+            self.phase = 'ready'
+            self.timer.Stop()
+            self.controller.update_connection_ui()
+            self.begin_scan()
         elif self.phase == 'restoring':
             if state['values'] != self.saved['values'] or state['members'] != self.saved['members']:
                 raise ValueError('Original temporary Scan Group state did not verify')
@@ -210,17 +243,26 @@ class CurrentBankScan:
 
     def configure(self, state):
         self.group, self.saved = state['group'], state
-        if self.level is None:
-            self.level = state['values']['XB']
         # Mark dirty BEFORE writing: even a short/failed write may have changed BM.
         self.modified = True
         self.phase, self.expected_group, self.header = 'configured', self.group, None
+        self.controller.aor_status.SetStatusText(
+            'Preparing Memory Bank %s scan: configuring temporary Scan Group %d with Squelch %d...' %
+            (self.target, self.group, self.level))
         command = ('GM%d\r\nBM%%%%%s%s\r\n' % (self.group, self.helper, self.target)).encode('ascii')
         command += operation_parameter_command('XB', self.level) + b'GM\r\n'
         self.send(command)
 
-    def begin_scan(self):
+    def begin_scan(self, level=None):
         if self.phase != 'ready':
+            return
+        if level is not None and self.controller.scan_levels.get(self.group) != level:
+            self.level = level
+            self.phase, self.header, self.expected_group = 'level_start', None, self.group
+            self.controller.aor_status.SetStatusText(
+                'Preparing Memory Bank %s scan: verifying listening Squelch %d...' % (self.target, level))
+            self.send(operation_parameter_command('XB', level) + b'GM\r\n')
+            self.controller.update_connection_ui()
             return
         self.phase = 'starting'
         command = ('GM%d\r\nMS%s\r\nRX\r\n' % (self.group, self.target)).encode('ascii')
@@ -229,7 +271,7 @@ class CurrentBankScan:
         if self.send(command):
             self.controller.show_now_receiving()
             self.controller.update_connection_ui()
-            self.controller.aor_status.SetStatusText('Scanning Memory Bank %s (temporary linked group %d).' % (self.target, self.group))
+            self.controller.aor_status.SetStatusText('Scanning Memory Bank %s' % self.target)
 
     def restore(self, callback=None):
         if callback is not None:
@@ -264,6 +306,9 @@ class CurrentBankScan:
         self.controller.update_connection_ui()
 
     def fail(self, message):
+        discard = getattr(self.controller, 'discard_pending_vfo_target', None)
+        if discard is not None:
+            discard()
         self.failure = message
         if self.phase in ('restoring', 'restore_context', 'restore_failed'):
             self.restoration_failed(message)
