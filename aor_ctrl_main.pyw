@@ -1402,8 +1402,8 @@ class AorCtrl(AorCtrlFrame):
             control.Enable(ready and idle and panel is selected and self.group_loading[kind] is None)
         self.bt_start.Enable(ready and idle and not self.level_squelch_pending and self.level_squelch_requested is None)
         self.bt_stop.Enable(ready)
-        for name, enabled in (('bt_resume', self.memory_scan_paused()),
-                              ('bt_to_vfo', self.paused_scan_target() is not None)):
+        for name, enabled in (('bt_resume', self.operation_paused()),
+                              ('bt_to_vfo', self.paused_operation_target() is not None)):
             control = getattr(self, name, None)
             if control is not None:
                 control.Enable(ready and enabled)
@@ -1532,19 +1532,24 @@ class AorCtrl(AorCtrlFrame):
             self.aor_status.SetStatusText('%s started: %s' % (operation, source))
             self.update_operation_ui()
 
-    def memory_scan_paused(self):
+    def operation_paused(self):
+        operation = getattr(self, 'active_operation', None)
         scan = getattr(self, 'temporary_scan', None)
-        return bool(getattr(self, 'active_operation', None) and
-                    self.active_operation[0] == 'Memory Scan' and
-                    getattr(self, 'operation_signal_open', False) and
-                    (scan is None or scan.phase == 'active') and
-                    re.fullmatch(r'[A-Ja-j][0-9]{2}',
-                                 (getattr(self, 'receiver_status', None) or {}).get('channel') or ''))
+        if (operation is None or not getattr(self, 'operation_signal_open', False) or
+                scan is not None and scan.phase != 'active'):
+            return False
+        if operation[0] == 'Memory Scan':
+            return bool(re.fullmatch(r'[A-Ja-j][0-9]{2}',
+                        (getattr(self, 'receiver_status', None) or {}).get('channel') or ''))
+        if operation[0] == 'Frequency Search':
+            return self.receiver_operation_target() is not None
+        return False
 
-    def paused_scan_target(self):
-        if not self.memory_scan_paused():
-            return None
-        state = self.receiver_status
+    def paused_operation_target(self):
+        return self.receiver_operation_target() if self.operation_paused() else None
+
+    def receiver_operation_target(self):
+        state = self.receiver_status or {}
         target = {key: state.get(key) for key in ('frequency_hz', 'step_hz', 'mode', 'attenuator')}
         if (not isinstance(target['frequency_hz'], (int, Decimal)) or not 100000 <= target['frequency_hz'] < 3000000000 or
                 not isinstance(target['step_hz'], (int, Decimal)) or not 0 < target['step_hz'] <= 999999 or
@@ -1556,24 +1561,24 @@ class AorCtrl(AorCtrlFrame):
         return target
 
     def on_scan_resume(self, event):
-        if not self.connected or not self.serial.is_open or not self.memory_scan_paused():
+        if not self.connected or not self.serial.is_open or not self.operation_paused():
             return
-        # Documented Up arrow resumes a scan stopped on a busy channel.
+        # Documented Up arrow resumes either scan or search stopped on a busy signal.
         if self.write_serial(b'\x1e\r\n') != 3:
-            self.report_scan_error('Could not resume Memory Scan.')
+            self.report_scan_error('Could not resume the current scan/search.')
             return
         self.operation_signal_open = False
         self.show_now_receiving()
         self.update_operation_ui()
 
     def on_scan_to_vfo(self, event):
-        target = self.paused_scan_target()
+        target = self.paused_operation_target()
         if target is None or not self.connected or not self.serial.is_open:
             return
         # Display overlay only: vfo/vfo_status remain scanner-confirmed caches.
         self.pending_vfo_target = target
         self.lb_vfo.SetLabel(display_vfo_frequency(target['frequency_hz']))
-        self.aor_status.SetStatusText('Channel saved for 1-VFO; it will be tuned after Stop.')
+        self.aor_status.SetStatusText('Received target saved for 1-VFO; it will be tuned after Stop.')
 
     def discard_pending_vfo_target(self):
         timer = getattr(self, 'pending_vfo_timer', None)
@@ -1643,7 +1648,9 @@ class AorCtrl(AorCtrlFrame):
         # Range Search has cached VFO settings to restore; other sources leave
         # scanning/searching by selecting normal receiver mode, then reading RX.
         if self.active_operation == ('Frequency Search', 'Range') or self.search_restore_command is not None:
-            self.on_vfo_stop(event)
+            if not self.on_vfo_stop(event):
+                self.discard_pending_vfo_target()
+                return
         else:
             command = self.normal_vfo_command() + b'RX\r\n'
             if self.write_serial(command) != len(command):
@@ -1901,7 +1908,7 @@ class AorCtrl(AorCtrlFrame):
         if not self.connected or not self.serial.is_open or state is None and not moving:
             text = '—'
         elif moving:
-            text = 'Scanning...' if self.active_operation[0] == 'Memory Scan' else 'Searching...'
+            text = 'Scanning...' if self.active_operation[0] == 'Memory Scan' else '—'
         else:
             channel = state.get('channel')
             name = state.get('name', '')
@@ -2615,7 +2622,7 @@ class AorCtrl(AorCtrlFrame):
         # VA/VB/VF select normal receiver operation. VV0 is VFO Scan, not Search stop.
         command = self.normal_vfo_command() + (self.search_restore_command or b'') + b'RX\r\n'
         self.search_restore_command = None
-        self.write_serial(command)
+        return self.write_serial(command) == len(command)
 
     def on_select_scan_start(self, evt, source=None):
         if not self.connected or not self.serial.is_open:

@@ -31,7 +31,7 @@ def controller(ctrl=None):
     ctrl.clear_vfo_channel = Mock()
     ctrl.monitor_muted = False
     ctrl.search_restore_command = None
-    for name in ('memory_scan_paused', 'paused_scan_target', 'on_scan_resume', 'on_scan_to_vfo',
+    for name in ('operation_paused', 'paused_operation_target', 'receiver_operation_target', 'on_scan_resume', 'on_scan_to_vfo',
                  'discard_pending_vfo_target', 'pending_vfo_timeout', 'finish_operation_stop',
                  'on_operation_stop', 'release_monitor_mute', 'show_scan_frequency', 'set_vfo_text',
                  'report_scan_error'):
@@ -46,6 +46,130 @@ def controller(ctrl=None):
 
 
 class ScanControlTests(unittest.TestCase):
+    def test_search_pause_requires_signal_and_complete_target_without_memory_id(self):
+        for source in ('Range', 'Search Bank', 'Search Group'):
+            ctrl = self.scan_receiver()
+            ctrl.active_operation = ('Frequency Search', source)
+            response = 'VS VA RF0100300000 ST012500 AU0 MD1 AT1'
+            ctrl.on_serial_read(SimpleNamespace(data=[response]))
+            self.assertFalse(ctrl.operation_paused())
+            self.assertIsNone(ctrl.paused_operation_target())
+            ctrl.on_scan_resume(None)
+            self.assertEqual(ctrl.commands, [])
+            ctrl.receive_activity_context(dict(source='VFO', source_id='A',
+                                               frequency_hz=100300000, squelch_open=True))
+            self.assertTrue(ctrl.operation_signal_open)
+            self.assertIsNone(ctrl.paused_operation_target())  # LC alone lacks mode/step/ATT.
+            ctrl.on_serial_read(SimpleNamespace(data=[response]))
+            self.assertIsNone(ctrl.receiver_status['channel'])
+            self.assertTrue(ctrl.operation_paused())
+            self.assertEqual(ctrl.paused_operation_target(),
+                             dict(frequency_hz=100300000, step_hz=12500, mode=1, attenuator=1))
+            ctrl.on_scan_resume(None)
+            self.assertEqual(ctrl.commands[-1], b'\x1e\r\n')
+            self.assertFalse(ctrl.operation_signal_open)
+            self.assertEqual(ctrl.active_operation, ('Frequency Search', source))
+            self.assertFalse(any(b'MP' in command or b'GA' in command for command in ctrl.commands))
+            ctrl.update_operation_ui.assert_called()
+
+    def test_search_buttons_enable_only_when_genuinely_paused(self):
+        ctrl = controller(scan_tests.GuiBoundaryTests().current_bank_start_controller())
+        ctrl.bt_resume, ctrl.bt_to_vfo = Mock(), Mock()
+        ctrl.active_operation = ('Frequency Search', 'Range')
+        ctrl.receiver_status['channel'] = None
+        main.AorCtrl.update_operation_ui(ctrl)
+        ctrl.bt_resume.Enable.assert_called_with(True)
+        ctrl.bt_to_vfo.Enable.assert_called_with(True)
+        ctrl.operation_signal_open = False
+        main.AorCtrl.update_operation_ui(ctrl)
+        ctrl.bt_resume.Enable.assert_called_with(False)
+        ctrl.bt_to_vfo.Enable.assert_called_with(False)
+        ctrl.operation_signal_open = True
+        ctrl.receiver_status['attenuator'] = None
+        main.AorCtrl.update_operation_ui(ctrl)
+        ctrl.bt_resume.Enable.assert_called_with(False)
+        ctrl.bt_to_vfo.Enable.assert_called_with(False)
+
+    def test_search_to_vfo_target_replaces_and_survives_later_search_cursors(self):
+        ctrl = self.scan_receiver()
+        ctrl.active_operation = ('Frequency Search', 'Range')
+        ctrl.on_serial_read(SimpleNamespace(data=['VS VA RF0100300000 ST012500 AU0 MD1 AT1']))
+        ctrl.operation_signal_open = True
+        ctrl.on_scan_to_vfo(None)
+        self.assertEqual(ctrl.commands, [])
+        self.assertEqual(ctrl.pending_vfo_target, dict(frequency_hz=100300000, step_hz=12500, mode=1, attenuator=1))
+        ctrl.lb_vfo.SetLabel.assert_called_once_with('100.300 MHz')
+        ctrl.on_serial_read(SimpleNamespace(data=['VS VB RF0106600000 ST005000 AU0 MD2 AT0']))
+        ctrl.lb_vfo.SetLabel.assert_called_once_with('100.300 MHz')
+        self.assertEqual(ctrl.pending_vfo_target['frequency_hz'], 100300000)
+        ctrl.operation_signal_open = True
+        ctrl.on_scan_to_vfo(None)
+        self.assertEqual(ctrl.pending_vfo_target, dict(frequency_hz=106600000, step_hz=5000, mode=2, attenuator=0))
+        ctrl.lb_vfo.SetLabel.assert_called_with('106.600 MHz')
+        self.assertEqual(ctrl.commands, [])
+        self.assertEqual(ctrl.vfo, '0093500000')
+
+    def test_search_stop_restores_context_before_applying_pending_one_vfo(self):
+        ctrl = self.scan_receiver()
+        ctrl.active_operation = ('Frequency Search', 'Range')
+        ctrl.normal_vfo_command = lambda: b'VF\r\n'
+        ctrl.on_vfo_stop = MethodType(main.AorCtrl.on_vfo_stop, ctrl)
+        restore = b'VA\r\nRF0093000000\r\nVB\r\nRF0094000000\r\nVF\r\n'
+        ctrl.search_restore_command = restore
+        ctrl.on_serial_read(SimpleNamespace(data=['VS VA RF0100300000 ST012500 AU0 MD1 AT1']))
+        ctrl.operation_signal_open = True
+        ctrl.on_scan_to_vfo(None)
+        ctrl.on_operation_stop(None)
+        self.assertEqual(ctrl.commands, [b'VF\r\n' + restore + b'RX\r\n',
+                                         b'MC1\r\n', b'VF\r\n', b'AU0\r\n', b'RF0100300000\r\n',
+                                         b'MD1\r\n', b'ST012500\r\n', b'AT1\r\n', b'MC0\r\n', b'RX\r\n'])
+        self.assertIsNone(ctrl.search_restore_command)
+        self.assertIsNone(ctrl.active_operation)
+        self.assertIsNotNone(ctrl.pending_vfo_target)
+        ctrl.on_serial_read(SimpleNamespace(data=['VF RF0100300000 ST012500 AU0 MD1 AT1']))
+        self.assertIsNone(ctrl.pending_vfo_target)
+        self.assertEqual(ctrl.vfo, '0100300000')
+        ctrl.lb_vfo.SetLabel.assert_called_with('100.300 MHz')
+
+    def test_failed_search_restoration_discards_target_without_applying_it(self):
+        ctrl = self.scan_receiver()
+        ctrl.active_operation = ('Frequency Search', 'Range')
+        ctrl.on_vfo_stop = MethodType(main.AorCtrl.on_vfo_stop, ctrl)
+        ctrl.search_restore_command = b'VF\r\n'
+        ctrl.receiver_status.update(channel=None, mode=1, attenuator=1)
+        ctrl.operation_signal_open = True
+        ctrl.on_scan_to_vfo(None)
+        ctrl.write_serial = Mock(return_value=0)
+        ctrl.on_operation_stop(None)
+        self.assertIsNone(ctrl.pending_vfo_target)
+        self.assertEqual(ctrl.write_serial.call_count, 1)
+        self.assertFalse(ctrl.pending_vfo_applying)
+
+    def test_now_receiving_search_stays_dash_and_memory_identity_is_preserved(self):
+        ctrl = self.scan_receiver()
+        ctrl.now_text = Mock()
+        ctrl.show_memory_flags = Mock()
+        ctrl.receiving_channel = None
+        ctrl.connected = True
+        ctrl.show_now_receiving = MethodType(main.AorCtrl.show_now_receiving, ctrl)
+        with patch.object(main.wx.SystemSettings, 'GetColour', return_value='system colour'):
+            for source in ('Range', 'Search Bank', 'Search Group'):
+                ctrl.active_operation = ('Frequency Search', source)
+                for opened in (False, True, False):
+                    ctrl.operation_signal_open = opened
+                    ctrl.receiver_status = dict(context='VS', channel=None, frequency_hz=100300000,
+                                                mode=1, step_hz=12500, attenuator=1, name='')
+                    ctrl.show_now_receiving()
+                    ctrl.now_text.SetLabel.assert_called_with('\u2014')
+            ctrl.active_operation = ('Memory Scan', 'Current Bank')
+            ctrl.operation_signal_open = True
+            ctrl.receiver_status.update(channel='A02', name='Station')
+            ctrl.show_now_receiving()
+            ctrl.now_text.SetLabel.assert_called_with('A02 \u2014 Station')
+            self.assertEqual(ctrl.receiving_channel, 'A02')
+            ctrl.operation_signal_open = False
+            ctrl.show_now_receiving()
+            ctrl.now_text.SetLabel.assert_called_with('Scanning...')
     def scan_receiver(self, original=None):
         ctrl = controller(original)
         ctrl.connected = True
@@ -180,11 +304,11 @@ class ScanControlTests(unittest.TestCase):
     def test_incomplete_or_moving_channel_cannot_be_saved(self):
         ctrl = controller()
         ctrl.receiver_status['attenuator'] = None
-        self.assertIsNone(ctrl.paused_scan_target())
+        self.assertIsNone(ctrl.paused_operation_target())
         ctrl.on_scan_to_vfo(None)
         self.assertIsNone(ctrl.pending_vfo_target)
         ctrl.operation_signal_open = False
-        self.assertFalse(ctrl.memory_scan_paused())
+        self.assertFalse(ctrl.operation_paused())
 
     def test_buttons_only_enabled_for_paused_memory_scan(self):
         ctrl = controller(scan_tests.GuiBoundaryTests().current_bank_start_controller())

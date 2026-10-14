@@ -477,8 +477,9 @@ class GuiBoundaryTests(unittest.TestCase):
         ctrl.memory_rows = {}
         ctrl.receiving_channel = ctrl.vfo_channel = None
         ctrl.operation_signal_open = False
-        ctrl.memory_scan_paused = MethodType(main.AorCtrl.memory_scan_paused, ctrl)
-        ctrl.paused_scan_target = MethodType(main.AorCtrl.paused_scan_target, ctrl)
+        ctrl.operation_paused = MethodType(main.AorCtrl.operation_paused, ctrl)
+        ctrl.paused_operation_target = MethodType(main.AorCtrl.paused_operation_target, ctrl)
+        ctrl.receiver_operation_target = MethodType(main.AorCtrl.receiver_operation_target, ctrl)
         ctrl.finish_operation_stop = MethodType(main.AorCtrl.finish_operation_stop, ctrl)
         return ctrl
 
