@@ -823,6 +823,7 @@ class OperationSettingsDialog(wx.Dialog):
     def __init__(self, controller, family, group):
         super().__init__(controller, title='Operation Settings')
         self.controller, self.family, self.group = controller, family, group
+        self.running_operation = controller.active_operation
         self.context_confirmed = family == 'D'
         self.values, self.expected = {}, None
         self.controls, self.options = {}, {}
@@ -880,7 +881,8 @@ class OperationSettingsDialog(wx.Dialog):
         prefix = 'GM' if self.family == 'X' else 'GS'
         command = b''
         if self.family != 'D':
-            command = (('%s%d\r\n' % (prefix, self.group)) if self.group is not None else '').encode('ascii')
+            command = (('%s%d\r\n' % (prefix, self.group))
+                       if self.group is not None and self.running_operation is None else '').encode('ascii')
             command += (prefix + '\r\n').encode('ascii')
         else:
             command = ''.join(key + '\r\n' for key in self.controls).encode('ascii')
@@ -948,7 +950,13 @@ class OperationSettingsDialog(wx.Dialog):
         proposed = self.proposed()
         changed = {key: value for key, value in proposed.items() if self.values[key] != value}
         command = b''.join(operation_parameter_command(key, value) for key, value in changed.items())
-        if self.family != 'D':
+        if self.running_operation is not None:
+            context = self.controller.operation_settings_context()
+            if self.controller.active_operation != self.running_operation or context != (self.family, self.group):
+                self.message.SetLabel('Operation context changed; reopen Settings before saving.')
+                self.save.Disable()
+                return
+        if self.family != 'D' and self.running_operation is None:
             command = ('%s%d\r\n' % ('GM' if self.family == 'X' else 'GS', self.group)).encode('ascii') + command
         self.expected = proposed
         if self.controller.write_serial(command) != len(command):
@@ -1138,8 +1146,9 @@ class AorCtrl(AorCtrlFrame):
                     tool.SetLabel(label)
                     toolbar.SetToolShortHelp(tool.GetId(), tip)
                     toolbar.EnableTool(tool.GetId(), False)
-        settings = toolbar.AddTool(wx.ID_ANY, 'Operation Settings',
-                                   toolbar.FindById(self.config_tool_id).GetNormalBitmap(),
+        settings_bitmap = wx.ArtProvider.GetBitmap(wx.ART_LIST_VIEW, wx.ART_TOOLBAR, (32, 32))
+        settings = toolbar.AddTool(wx.ID_ANY, 'Operation Settings', settings_bitmap,
+                                   settings_bitmap.ConvertToImage().ConvertToGreyscale().ConvertToBitmap(),
                                    shortHelp='Read and edit timing and signal acceptance settings for the selected operation/context.')
         self.operation_settings_tool_id = settings.GetId()
         toolbar.EnableTool(self.operation_settings_tool_id, False)
@@ -1240,7 +1249,6 @@ class AorCtrl(AorCtrlFrame):
         self.operation_choice.Enable(self.memory_inventory is None and self.memory_bank_transfer is None)
         self.source_choice.Enable(self.memory_inventory is None and self.memory_bank_transfer is None)
         self.update_level_ui()
-        toolbar.EnableTool(self.operation_settings_tool_id, ready and self.active_operation is None)
         if not port_open:
             self.receiver_status = None
             self.vfo_channel = None
@@ -1371,7 +1379,9 @@ class AorCtrl(AorCtrlFrame):
         if getattr(self, 'pending_vfo_applying', False):
             self.bt_start.Disable()
             self.bt_stop.Disable()
-        self.GetToolBar().EnableTool(self.operation_settings_tool_id, ready and idle)
+        toolbar = self.GetToolBar()
+        toolbar.EnableTool(self.operation_settings_tool_id, ready and self.operation_settings_available())
+        toolbar.EnableTool(self.config_tool_id, self.active_operation is None and self.temporary_scan is None)
         if self.settings_dialog is not None:
             self.bt_start.Disable()
             self.operation_choice.Disable()
@@ -1613,31 +1623,46 @@ class AorCtrl(AorCtrlFrame):
         self.update_operation_ui()
         self.finish_operation_stop()
 
+    def operation_settings_context(self):
+        operation, source = self.active_operation or self.operation_selection()
+        scan = self.temporary_scan
+        if scan is not None and scan.phase not in ('ready', 'active'):
+            return None
+        if operation == 'Memory Scan':
+            if source == 'Current Bank':
+                return ('X', scan.group) if scan is not None else ('X', None) if self.active_operation is None else None
+            group = self.group_response['scan'] if self.active_operation is not None else int(self.cbx_scan.GetValue()) if source == 'Scan Group' else None
+            return ('X', group)
+        if source == 'Range':
+            return ('D', None)
+        group = self.group_response['search'] if self.active_operation is not None else int(self.cbx_search.GetValue()) if source == 'Search Group' else None
+        return ('S', group)
+
+    def operation_settings_available(self):
+        if self.memory_flag_edit is not None or self.memory_channel_pending is not None:
+            return False
+        context = self.operation_settings_context()
+        return context is not None and not (self.active_operation is not None and context[0] != 'D' and context[1] == 0)
+
     def open_operation_settings(self, event):
         if self.settings_dialog is not None:
             self.settings_dialog.Raise()
             return
-        if not self.connected or self.memory_flag_edit is not None or self.memory_channel_pending is not None or self.active_operation is not None:
+        if (not self.connected or not self.serial.is_open or self.memory_inventory is not None or
+                self.memory_bank_transfer is not None or not self.operation_settings_available()):
             return
-        operation, source = self.operation_selection()
-        family = 'X' if operation == 'Memory Scan' else 'D' if source == 'Range' else 'S'
+        operation, source = self.active_operation or self.operation_selection()
+        family, group = self.operation_settings_context()
         if operation == 'Memory Scan' and self.level_vfo_context:
             self.level_vfo_context = False
             self.refresh_level_context()
-        if source == 'Current Bank':
-            if self.temporary_scan is None:
-                metadata = self.operation_memory_bank()
-                if metadata is None:
-                    self.aor_status.SetStatusText('Choose a Memory Bank first.')
-                    return
-                self.prepare_current_bank_scan(metadata, ready=lambda: self.open_operation_settings(None))
+        if source == 'Current Bank' and self.temporary_scan is None:
+            metadata = self.operation_memory_bank()
+            if metadata is None:
+                self.aor_status.SetStatusText('Choose a Memory Bank first.')
                 return
-            if self.temporary_scan.phase != 'ready':
-                return
-        group = (0 if source == 'Current Bank' else int(self.cbx_scan.GetValue()) if source == 'Scan Group' else
-                 int(self.cbx_search.GetValue()) if source == 'Search Group' else None)
-        if source == 'Current Bank':
-            group = self.temporary_scan.group
+            self.prepare_current_bank_scan(metadata, ready=lambda: self.open_operation_settings(None))
+            return
         self.settings_dialog = OperationSettingsDialog(self, family, group)
         self.settings_dialog.Show()
         self.settings_dialog.read()
@@ -2932,7 +2957,13 @@ class AorCtrl(AorCtrlFrame):
             # Other group/MA writers could corrupt the snapshot or verification.
             # During an active scan, allow normal receiver controls and live XB.
             commands = [command for command in data.split(b'\r\n') if command]
-            if (scan.busy and any(command != b'LM' for command in commands) or
+            settings = self.settings_dialog
+            settings_commands = (not scan.busy and settings is not None and settings.family == 'X' and
+                                 settings.group == scan.group and all(
+                                     command in (b'GM', ('GM%d' % scan.group).encode('ascii')) or
+                                     re.fullmatch(rb'X[AB][0-9]{3}|XD[0-9]{2}|XM[0-8F]|XP[0-9]{2}', command)
+                                     for command in commands))
+            if not settings_commands and (scan.busy and any(command != b'LM' for command in commands) or
                     any(command.startswith((b'GM', b'BM', b'MA')) for command in commands) and
                     not (scan.phase == 'ready' and self.settings_dialog is not None)):
                 self.aor_status.SetStatusText('Wait for temporary scan-group restoration before changing scanner context.')
@@ -3029,8 +3060,8 @@ class AorCtrl(AorCtrlFrame):
         """Show the port settings dialog. The reader thread is stopped for the
            settings change.
         """
-        if self.temporary_scan is not None:
-            self.restore_temporary_scan(self.set_port, disconnecting=True)
+        if self.active_operation is not None or self.temporary_scan is not None:
+            self.aor_status.SetStatusText('Stop the current operation before changing Serial Config.')
             return
         self.stop_thread()
         self.close_serial()

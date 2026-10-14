@@ -244,6 +244,12 @@ class GuiActionTests(unittest.TestCase):
                          ['Upload', 'Connect', 'Serial Config', 'Operation Settings'])
         self.assertFalse(toolbar.GetToolEnabled(frame.operation_settings_tool_id))
         self.assertEqual(toolbar.GetToolBitmapSize(), wx.Size(32, 32))
+        settings_tool = toolbar.FindById(frame.operation_settings_tool_id)
+        self.assertNotEqual(settings_tool.GetNormalBitmap().ConvertToImage().GetData(),
+                            toolbar.FindById(frame.config_tool_id).GetNormalBitmap().ConvertToImage().GetData())
+        disabled_image = settings_tool.GetDisabledBitmap().ConvertToImage()
+        self.assertTrue(disabled_image.IsOk())
+        self.assertGreater(len(set(disabled_image.GetData())), 1)
         frame.open_operation_settings = Mock()
         event = wx.CommandEvent(wx.EVT_TOOL.typeId, frame.operation_settings_tool_id)
         frame.GetEventHandler().ProcessEvent(event)
@@ -331,6 +337,143 @@ class GuiActionTests(unittest.TestCase):
             self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.operation_settings_tool_id))
         finally:
             frame.memory_bank_transfer = None
+            frame.alive.clear()
+            frame.serial.is_open = False
+
+    def connected_frame(self):
+        frame = self.frame
+        frame.connected = True
+        frame.serial.is_open = True
+        frame.alive.set()
+        frame.serial.write = Mock(side_effect=len)
+        return frame
+
+    def test_running_temporary_group_settings_change_and_restore_without_restart(self):
+        frame = self.connected_frame()
+        fixture = scan_tests.ScanTests()
+        original, scan = fixture.prepare()
+        scan.controller = frame
+        frame.temporary_scan = scan
+        frame.active_operation = ('Memory Scan', 'Current Bank')
+        frame.group_response['scan'] = scan.group
+        frame.scan_levels[scan.group] = scan.level
+        frame.current_scan_level = scan.level
+        frame.level_vfo_context = False
+        snapshot = {key: dict(value) if isinstance(value, dict) else value for key, value in scan.saved.items()}
+        try:
+            frame.update_operation_ui()
+            self.assertTrue(frame.GetToolBar().GetToolEnabled(frame.operation_settings_tool_id))
+            self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.config_tool_id))
+            frame.open_operation_settings(None)
+            dialog = frame.settings_dialog
+            self.assertEqual((dialog.family, dialog.group), ('X', scan.group))
+            self.assertEqual(frame.serial.write.call_args_list[-1].args[0], b'GM\r\n')
+            frame.set_group_response(header(scan.group, level=scan.level))
+            frame.set_group_response(membership('AJ'))
+            changes = {'XA': 24, 'XB': 42, 'XD': 30, 'XM': '1', 'XP': 99}
+            for key, value in changes.items():
+                dialog.controls[key].SetSelection(dialog.options[key].index(value))
+            dialog.on_changed(None)
+            self.assertTrue(dialog.save.IsEnabled())
+            frame.serial.write.reset_mock()
+            dialog.on_save(None)
+            writes = [call.args[0] for call in frame.serial.write.call_args_list]
+            self.assertEqual(writes, [b'XD30\r\nXP99\r\nXB042\r\nXA024\r\nXM1\r\n', b'GM\r\n'])
+            frame.set_group_response('GM2 XD3.0 XB 042 XA 024 XP99 XM1')
+            frame.set_group_response(membership('AJ'))
+            self.assertEqual(frame.sql.GetValue(), 42)
+            self.assertEqual(scan.saved, snapshot)
+            self.assertEqual(scan.phase, 'active')
+            self.assertEqual(frame.active_operation, ('Memory Scan', 'Current Bank'))
+            frame.serial.write.reset_mock()
+            frame.on_operation_stop(None)
+            wx.Yield()
+            restore = frame.serial.write.call_args_list[0].args[0]
+            self.assertIn(b'XA023\r\nXB009\r\nXD20\r\nXM2\r\nXP60\r\n', restore)
+            scan.receive(header(2))
+            scan.receive(membership(''))
+            scan.receive(header(4))
+            scan.receive(membership('BCD'))
+            self.assertIsNone(frame.temporary_scan)
+        finally:
+            if frame.settings_dialog is not None:
+                frame.settings_dialog.Destroy()
+                frame.settings_dialog = None
+            frame.temporary_scan = None
+            frame.alive.clear()
+            frame.serial.is_open = False
+
+    def test_running_linked_context_overrides_visible_operation_and_serial_config_guard(self):
+        frame = self.connected_frame()
+        try:
+            for operation, group, kind, family in ((('Memory Scan', 'Scan Group'), 3, 'scan', 'X'),
+                                                   (('Frequency Search', 'Search Group'), 4, 'search', 'S'),
+                                                   (('Frequency Search', 'Range'), None, 'search', 'D')):
+                frame.active_operation = operation
+                frame.group_response[kind] = group
+                frame.update_operation_ui()
+                self.assertTrue(frame.GetToolBar().GetToolEnabled(frame.operation_settings_tool_id))
+                self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.config_tool_id))
+                self.assertEqual(frame.operation_settings_context(), (family, group))
+                with patch.object(main, 'OperationSettingsDialog') as create:
+                    frame.open_operation_settings(None)
+                    create.assert_called_once_with(frame, family, group)
+                    create.return_value.read.assert_called_once_with()
+                frame.settings_dialog = None
+                with patch.object(frame, 'stop_thread') as stop, patch.object(frame, 'close_serial') as close:
+                    frame.set_port()
+                stop.assert_not_called()
+                close.assert_not_called()
+                self.assertEqual(frame.aor_status.GetStatusText(), 'Stop the current operation before changing Serial Config.')
+            frame.active_operation = None
+            frame.temporary_scan = Mock(phase='empty')
+            frame.update_operation_ui()
+            self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.operation_settings_tool_id))
+            self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.config_tool_id))
+            with patch.object(frame, 'restore_temporary_scan') as restore:
+                frame.set_port()
+            restore.assert_not_called()
+            frame.temporary_scan = None
+            frame.update_operation_ui()
+            self.assertTrue(frame.GetToolBar().GetToolEnabled(frame.config_tool_id))
+        finally:
+            frame.temporary_scan = None
+            frame.settings_dialog = None
+            frame.alive.clear()
+            frame.serial.is_open = False
+
+    def test_running_linked_group_save_uses_parameters_without_selecting_or_restarting(self):
+        frame = self.connected_frame()
+        try:
+            for operation, kind, family, group in ((('Memory Scan', 'Scan Group'), 'scan', 'X', 3),
+                                                    (('Frequency Search', 'Search Group'), 'search', 'S', 4)):
+                frame.active_operation = operation
+                frame.group_response[kind] = group
+                dialog = main.OperationSettingsDialog(frame, family, group)
+                frame.settings_dialog = dialog
+                frame.serial.write.reset_mock()
+                dialog.read()
+                self.assertEqual(frame.serial.write.call_args.args[0], ('G%s\r\n' % ('M' if family == 'X' else 'S')).encode('ascii'))
+                dialog.accept_context(kind, group)
+                values = {family + 'A': 0, family + 'B': 10, family + 'D': 20, family + 'P': 5}
+                if family == 'X':
+                    values['XM'] = 'F'
+                for key, value in values.items():
+                    dialog.accept(key, value)
+                dialog.controls[family + 'P'].SetSelection(6)
+                dialog.on_changed(None)
+                frame.serial.write.reset_mock()
+                dialog.on_save(None)
+                self.assertEqual([c.args[0] for c in frame.serial.write.call_args_list],
+                                 [(family + 'P06\r\n').encode('ascii'),
+                                  ('G%s\r\n' % ('M' if family == 'X' else 'S')).encode('ascii')])
+                self.assertEqual(frame.active_operation, operation)
+                dialog.Destroy()
+                frame.settings_dialog = None
+        finally:
+            if frame.settings_dialog is not None:
+                frame.settings_dialog.Destroy()
+                frame.settings_dialog = None
             frame.alive.clear()
             frame.serial.is_open = False
 

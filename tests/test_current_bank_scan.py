@@ -396,6 +396,9 @@ class GuiBoundaryTests(unittest.TestCase):
             setattr(ctrl, name, Mock())
         ctrl.GetToolBar = Mock(return_value=Mock())
         ctrl.operation_settings_tool_id = 1234
+        ctrl.config_tool_id = 1235
+        ctrl.operation_settings_context = MethodType(main.AorCtrl.operation_settings_context, ctrl)
+        ctrl.operation_settings_available = MethodType(main.AorCtrl.operation_settings_available, ctrl)
         ctrl.Layout = Mock()
         ctrl.now_text = Mock()
         ctrl.memory_rows = {}
