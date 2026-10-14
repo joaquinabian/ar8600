@@ -1,6 +1,6 @@
 """Focused scan controls tests; no scanner opens or hardware writes."""
 from decimal import Decimal
-from types import MethodType
+from types import MethodType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,6 +46,104 @@ def controller(ctrl=None):
 
 
 class ScanControlTests(unittest.TestCase):
+    def scan_receiver(self, original=None):
+        ctrl = controller(original)
+        ctrl.connected = True
+        ctrl.alive = SimpleNamespace(is_set=lambda: True)
+        ctrl.memory_bank_transfer = ctrl.memory_inventory = None
+        ctrl.memory_channel_pending = ctrl.memory_select_read = None
+        ctrl.background_vfo = ctrl.bandscope = None
+        ctrl.startup_connect_pending = False
+        ctrl.vfo_channel = ctrl.database_station = None
+        ctrl.memory_rows = {}
+        ctrl.clear_memory_import_error = Mock()
+        ctrl.mirror_console_line = Mock()
+        ctrl.receive_memory_delete_status = ctrl.on_memory_flag_status = Mock()
+        ctrl.maybe_load_initial_bank = Mock()
+        ctrl.receive_context_status = MethodType(main.AorCtrl.receive_context_status, ctrl)
+        ctrl.receive_activity_context = MethodType(main.AorCtrl.receive_activity_context, ctrl)
+        ctrl.on_serial_read = MethodType(main.AorCtrl.on_serial_read, ctrl)
+        ctrl.operation_signal_open = False
+        return ctrl
+
+    def test_scan_rx_keeps_pre_scan_one_vfo_display_and_full_cached_state(self):
+        ctrl = self.scan_receiver()
+        confirmed = dict(ctrl.vfo_status)
+        for channel, frequency in (('A02', '0100300000'), ('A03', '0106600000')):
+            ctrl.on_serial_read(SimpleNamespace(data=[
+                'MS MX%s MP0 RF%s ST100000 AU0 MD0 AT1 TMStation' % (channel, frequency)]))
+            ctrl.lb_vfo.SetLabel.assert_not_called()
+            self.assertEqual(ctrl.vfo, '0093500000')
+            self.assertEqual(ctrl.vfo_status, confirmed)
+            self.assertEqual(ctrl.receiver_status['channel'], channel)
+            self.assertEqual(ctrl.receiver_status['frequency_hz'], int(frequency))
+            ctrl.show_now_receiving.assert_called()
+
+    def test_search_rx_does_not_update_any_vfo_cache_or_labels(self):
+        ctrl = self.scan_receiver()
+        ctrl.active_operation = ('Frequency Search', 'Range')
+        for prefix in ('VS', 'VV'):
+            for source in ('VA', 'VB', 'VF'):
+                ctrl.on_serial_read(SimpleNamespace(data=[
+                    '%s %s RF0100300000 ST012500 AU0 MD1 AT0' % (prefix, source)]))
+                self.assertEqual(ctrl.vfo_status, {2: 'VF RF0093500000 ST100000 AU0 MD0 AT0'})
+                self.assertEqual(ctrl.vfo, '0093500000')
+                self.assertEqual(ctrl.receiver_status['frequency_hz'], 100300000)
+                for label in (ctrl.lb_vfa, ctrl.lb_vfb, ctrl.lb_vfo):
+                    label.SetLabel.assert_not_called()
+        ctrl.aor_status.SetStatusText.assert_called_with('Frequency search: 100.300000 MHz')
+
+    def test_scan_rx_and_activity_keep_deferred_target_until_next_to_vfo(self):
+        ctrl = self.scan_receiver()
+        ctrl.on_serial_read(SimpleNamespace(data=[
+            'MS MXA02 MP0 RF0100300000 ST100000 AU0 MD0 AT1 TMStation']))
+        ctrl.operation_signal_open = True
+        ctrl.on_scan_to_vfo(None)
+        self.assertEqual(ctrl.pending_vfo_target['frequency_hz'], 100300000)
+        ctrl.lb_vfo.SetLabel.assert_called_once_with('100.300 MHz')
+        ctrl.on_serial_read(SimpleNamespace(data=[
+            'MS MXA03 MP0 RF0106600000 ST100000 AU0 MD0 AT1 TMStation']))
+        ctrl.receive_activity_context(dict(source='Memory', source_id='A03',
+                                           frequency_hz=106600000, squelch_open=True))
+        ctrl.lb_vfo.SetLabel.assert_called_once_with('100.300 MHz')
+        ctrl.receiver_status.update(mode=0, step_hz=100000, attenuator=1)
+        ctrl.on_scan_to_vfo(None)
+        ctrl.lb_vfo.SetLabel.assert_called_with('106.600 MHz')
+        self.assertEqual(ctrl.pending_vfo_target['frequency_hz'], 106600000)
+        self.assertEqual(ctrl.vfo, '0093500000')
+        self.assertEqual(ctrl.active_operation, ('Memory Scan', 'Current Bank'))
+
+    def test_stop_without_to_vfo_preserves_pre_scan_vf_and_confirmed_readback(self):
+        ctrl = self.scan_receiver()
+        ctrl.normal_vfo_command = lambda: b'VF\r\n'
+        ctrl.on_serial_read(SimpleNamespace(data=[
+            'MS MXA02 MP0 RF0100300000 ST100000 AU0 MD0 AT1 TMStation']))
+        ctrl.on_operation_stop(None)
+        self.assertEqual(ctrl.commands, [b'VF\r\nRX\r\n'])
+        self.assertEqual(ctrl.vfo, '0093500000')
+        ctrl.lb_vfo.SetLabel.assert_not_called()
+        ctrl.on_serial_read(SimpleNamespace(data=['VF RF0093500000 ST100000 AU0 MD0 AT0']))
+        ctrl.lb_vfo.SetLabel.assert_called_with('93.500 MHz')
+        self.assertEqual(ctrl.vfo_status[2], 'VF RF0093500000 ST100000 AU0 MD0 AT0')
+
+    def test_temporary_group_stop_without_target_preserves_one_vfo_through_restoration(self):
+        fixture = scan_tests.ScanTests()
+        original, scan = fixture.prepare()
+        ctrl = self.scan_receiver(original)
+        ctrl.restore_temporary_scan = MethodType(main.AorCtrl.restore_temporary_scan, ctrl)
+        ctrl.scan_lifecycle_action = None
+        ctrl.on_serial_read(SimpleNamespace(data=[
+            'MS MXJ02 MP0 RF0446500000 ST012500 AU0 MD1 AT0 TMPMR']))
+        ctrl.on_operation_stop(None)
+        self.assertEqual(scan.phase, 'restoring')
+        fixture.feed_group(scan, 2, '')
+        fixture.feed_group(scan, 4, 'BCD')
+        self.assertIsNone(ctrl.temporary_scan)
+        self.assertEqual(ctrl.vfo, '0093500000')
+        self.assertEqual(ctrl.vfo_status[2], 'VF RF0093500000 ST100000 AU0 MD0 AT0')
+        ctrl.lb_vfo.SetLabel.assert_not_called()
+        self.assertFalse(any(b'RF' in command or command == b'VF\r\n' for command in ctrl.commands))
+
     def test_xp_99_and_other_dwell_limits_unchanged(self):
         self.assertEqual(operation_parameter_command('XP', 99), b'XP99\r\n')
         self.assertEqual(operation_parameter_command('XP', 0), b'XP00\r\n')
@@ -120,9 +218,11 @@ class ScanControlTests(unittest.TestCase):
         ctrl.on_operation_stop(None)
         self.assertEqual(scan.phase, 'restoring')
         self.assertFalse(any(b'VF\r\n' in c or b'RF' in c for c in ctrl.commands))
+        scan_tests.drain_pacing(scan)
         scan.receive(header(2, dwell=99))
         scan.receive(membership(''))
         self.assertFalse(any(b'VF\r\n' in c for c in ctrl.commands))
+        scan_tests.drain_pacing(scan)
         scan.receive(header(4, dwell=99))
         scan.receive(membership('BCD'))
         self.assertIsNone(ctrl.temporary_scan)
@@ -208,6 +308,7 @@ class ScanControlLayoutTests(unittest.TestCase):
             self.assertLessEqual(buttons[-1].GetRect().right, frame.operation_panel.GetClientSize().width)
             self.assertFalse(frame.bt_resume.IsEnabled())
             self.assertFalse(frame.bt_to_vfo.IsEnabled())
+            frame.active_operation = None
             dialog = main.OperationSettingsDialog(frame, 'X', 1)
             self.assertEqual(dialog.options['XP'], list(range(100)))
             self.assertEqual(dialog.controls['XP'].GetString(99), '99 s')
@@ -281,12 +382,15 @@ class GuiActionTests(unittest.TestCase):
         menu = self.capture_menu(0)
         self.assertEqual([label for label, enabled in menu],
                          ['New Channel...', 'Edit Channel...', 'Delete Channel...', '',
-                          'Include in Selected Channels', 'Skip during Stored Channels scanning'])
+                          'Include in Selected Channels', 'Skip during Stored Channels scanning', '',
+                          'Select all channels', 'Deselect all channels', 'Skip all channels', 'Clear all skips'])
         self.assertTrue(menu[0][1])
         frame.open_memory_channel.assert_called_once_with()
         frame.memory_rows.clear()
         frame.edit_list.memory_model.channels.clear()
-        self.assertEqual(self.capture_menu(), [('New Channel...', True)])
+        self.assertEqual(self.capture_menu(), [('New Channel...', True), ('', True),
+                                              ('Select all channels', False), ('Deselect all channels', False),
+                                              ('Skip all channels', False), ('Clear all skips', False)])
         frame.open_memory_channel.assert_called_once_with()
 
     def test_new_disabled_without_empty_slot_or_edit_permission(self):
@@ -294,10 +398,10 @@ class GuiActionTests(unittest.TestCase):
         frame.selected_memory_bank = lambda: {'bank': 'A', 'channels': 1}
         frame.memory_channel_available = lambda: True
         frame.memory_empty_channels.clear()
-        self.assertEqual(self.capture_menu(), [('New Channel...', False)])
+        self.assertEqual(self.capture_menu()[0], ('New Channel...', False))
         frame.memory_empty_channels.add('A00')
         frame.memory_channel_available = lambda: False
-        self.assertEqual(self.capture_menu(), [('New Channel...', False)])
+        self.assertEqual(self.capture_menu()[0], ('New Channel...', False))
         frame.selected_memory_bank = lambda: None
         with patch.object(frame.edit_list.memory, 'PopupMenu') as popup:
             frame.open_memory_flag_menu()
@@ -348,11 +452,71 @@ class GuiActionTests(unittest.TestCase):
         frame.serial.write = Mock(side_effect=len)
         return frame
 
+    def test_shared_group_master_checkbox_changes_proposal_only_for_both_group_kinds(self):
+        frame = self.connected_frame()
+        try:
+            for kind, count in (('scan', 20), ('search', 40)):
+                dialog = main.GroupDialog(frame, kind, 1)
+                try:
+                    self.assertFalse(dialog.select_all.GetValue())
+                    self.assertFalse(dialog.select_all.Is3State())
+                    self.assertFalse(dialog.select_all.IsEnabled())
+                    dialog.show_members(('A', 'B'))
+                    self.assertTrue(dialog.select_all.IsEnabled())
+                    frame.serial.write.reset_mock()
+                    dialog.select_all.SetValue(True)
+                    event = wx.CommandEvent(wx.EVT_CHECKBOX.typeId, dialog.select_all.GetId())
+                    dialog.select_all.GetEventHandler().ProcessEvent(event)
+                    self.assertEqual(dialog.members.GetCheckedItems(), tuple(range(count)))
+                    self.assertTrue(dialog.save.IsEnabled())
+                    self.assertEqual(dialog.confirmed_members, ('A', 'B'))
+                    frame.serial.write.assert_not_called()
+                    dialog.select_all.SetValue(False)
+                    dialog.select_all.GetEventHandler().ProcessEvent(event)
+                    self.assertEqual(dialog.members.GetCheckedItems(), ())
+                    self.assertTrue(dialog.save.IsEnabled())
+                    frame.serial.write.assert_not_called()
+                    dialog.show_members(())
+                    dialog.on_select_all(None)
+                    self.assertFalse(dialog.save.IsEnabled())
+                    dialog.members.Check(0, True)
+                    dialog.on_members_changed(None)
+                    self.assertFalse(dialog.select_all.GetValue())
+                    self.assertTrue(dialog.save.IsEnabled())
+                finally:
+                    dialog.read_timer.Stop()
+                    dialog.Destroy()
+        finally:
+            frame.alive.clear()
+            frame.serial.is_open = False
+
+    def test_group_zero_master_checkbox_stays_read_only_for_both_group_kinds(self):
+        frame = self.connected_frame()
+        try:
+            for kind in ('scan', 'search'):
+                dialog = main.GroupDialog(frame, kind, 0)
+                try:
+                    dialog.show_members(('A',))
+                    self.assertFalse(dialog.select_all.IsEnabled())
+                    self.assertFalse(dialog.members.IsEnabled())
+                    self.assertFalse(dialog.save.IsEnabled())
+                    dialog.select_all.SetValue(True)
+                    dialog.on_select_all(None)
+                    self.assertEqual(dialog.proposed_members(), ('A',))
+                    frame.serial.write.assert_not_called()
+                finally:
+                    dialog.read_timer.Stop()
+                    dialog.Destroy()
+        finally:
+            frame.alive.clear()
+            frame.serial.is_open = False
+
     def test_running_temporary_group_settings_change_and_restore_without_restart(self):
         frame = self.connected_frame()
         fixture = scan_tests.ScanTests()
         original, scan = fixture.prepare()
         scan.controller = frame
+        frame.scan_call_later = original.scan_call_later
         frame.temporary_scan = scan
         frame.active_operation = ('Memory Scan', 'Current Bank')
         frame.group_response['scan'] = scan.group
@@ -368,8 +532,8 @@ class GuiActionTests(unittest.TestCase):
             dialog = frame.settings_dialog
             self.assertEqual((dialog.family, dialog.group), ('X', scan.group))
             self.assertEqual(frame.serial.write.call_args_list[-1].args[0], b'GM\r\n')
-            frame.set_group_response(header(scan.group, level=scan.level))
-            frame.set_group_response(membership('AJ'))
+            frame.set_group_response('GM%d XD2.0 XB %03d XA 000 XP00 XMF' % (scan.group, scan.level))
+            frame.set_group_response(membership('J'))
             changes = {'XA': 24, 'XB': 42, 'XD': 30, 'XM': '1', 'XP': 99}
             for key, value in changes.items():
                 dialog.controls[key].SetSelection(dialog.options[key].index(value))
@@ -380,18 +544,21 @@ class GuiActionTests(unittest.TestCase):
             writes = [call.args[0] for call in frame.serial.write.call_args_list]
             self.assertEqual(writes, [b'XD30\r\nXP99\r\nXB042\r\nXA024\r\nXM1\r\n', b'GM\r\n'])
             frame.set_group_response('GM2 XD3.0 XB 042 XA 024 XP99 XM1')
-            frame.set_group_response(membership('AJ'))
+            frame.set_group_response(membership('J'))
             self.assertEqual(frame.sql.GetValue(), 42)
+            self.assertEqual(frame.memory_bank_dwell[scan.target], 99)
             self.assertEqual(scan.saved, snapshot)
             self.assertEqual(scan.phase, 'active')
             self.assertEqual(frame.active_operation, ('Memory Scan', 'Current Bank'))
             frame.serial.write.reset_mock()
             frame.on_operation_stop(None)
             wx.Yield()
-            restore = frame.serial.write.call_args_list[0].args[0]
-            self.assertIn(b'XA023\r\nXB009\r\nXD20\r\nXM2\r\nXP60\r\n', restore)
+            scan_tests.drain_pacing(scan)
+            restore = [call.args[0] for call in frame.serial.write.call_args_list]
+            self.assertEqual(restore[-6:-1], [b'XA023\r\n', b'XB009\r\n', b'XD20\r\n', b'XM2\r\n', b'XP60\r\n'])
             scan.receive(header(2))
             scan.receive(membership(''))
+            scan_tests.drain_pacing(scan)
             scan.receive(header(4))
             scan.receive(membership('BCD'))
             self.assertIsNone(frame.temporary_scan)
@@ -426,7 +593,7 @@ class GuiActionTests(unittest.TestCase):
                 close.assert_not_called()
                 self.assertEqual(frame.aor_status.GetStatusText(), 'Stop the current operation before changing Serial Config.')
             frame.active_operation = None
-            frame.temporary_scan = Mock(phase='empty')
+            frame.temporary_scan = Mock(phase='original')
             frame.update_operation_ui()
             self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.operation_settings_tool_id))
             self.assertFalse(frame.GetToolBar().GetToolEnabled(frame.config_tool_id))

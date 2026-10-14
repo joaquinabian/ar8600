@@ -539,6 +539,10 @@ class GroupDialog(wx.Dialog):
         self.message.Wrap(320)
         instructions = wx.StaticText(self, label='Check boxes to link %s.\nHighlighting a row does not change its checkbox.' %
                                      ('Memory Banks' if kind == 'scan' else 'Search Banks'))
+        self.select_all = wx.CheckBox(self, label='Select all')
+        self.select_all.SetValue(False)
+        self.select_all.Disable()
+        self.select_all.SetToolTip('Check or clear all proposed bank links. Press Save membership to apply them.')
         self.members = wx.CheckListBox(self, choices=labels)
         self.members.Disable()
         self.members.SetToolTip('Memory Banks scanned together.' if kind == 'scan' else 'Stored Search Banks searched together.')
@@ -546,12 +550,14 @@ class GroupDialog(wx.Dialog):
         self.save.Disable()
         sizer.Add(self.message, 0, wx.ALL, 8)
         sizer.Add(instructions, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        sizer.Add(self.select_all, 0, wx.LEFT | wx.RIGHT, 8)
         sizer.Add(self.members, 1, wx.EXPAND | wx.ALL, 8)
         sizer.Add(self.save, 0, wx.ALL, 8)
         self.SetSizer(sizer)
         self.save.SetToolTip('Replace group links with these checked banks, then read back the scanner configuration.')
         self.save.Bind(wx.EVT_BUTTON, self.on_save)
         self.members.Bind(wx.EVT_CHECKLISTBOX, self.on_members_changed)
+        self.select_all.Bind(wx.EVT_CHECKBOX, self.on_select_all)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.read_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_read_timeout, self.read_timer)
@@ -570,7 +576,15 @@ class GroupDialog(wx.Dialog):
         self.message.Wrap(320)
         self.Layout()
 
+    def on_select_all(self, event):
+        if not self.select_all.IsEnabled() or not self.members.IsEnabled() or self.group == 0:
+            return
+        self.members.SetCheckedItems(list(range(self.members.GetCount())) if self.select_all.GetValue() else [])
+        self.on_members_changed(None)
+
     def on_members_changed(self, event):
+        if len(self.members.GetCheckedItems()) != self.members.GetCount():
+            self.select_all.SetValue(False)
         self.verification_members = None
         self.update_save_state()
         if self.confirmed_members is not None:
@@ -587,6 +601,8 @@ class GroupDialog(wx.Dialog):
         self.confirmed_members = tuple(members)
         self.members.SetCheckedItems([index for index, bank in enumerate(self.banks) if bank in members])
         self.members.Enable(self.group != 0)
+        self.select_all.Enable(self.group != 0)
+        self.select_all.SetValue(False)
         self.save.Disable()
         if self.expected_members is not None or self.verification_members is not None:
             expected = self.expected_members if self.expected_members is not None else self.verification_members
@@ -617,6 +633,7 @@ class GroupDialog(wx.Dialog):
         command = make_group_members_command(self.kind, self.group, members)
         self.save.Disable()
         self.members.Disable()
+        self.select_all.Disable()
         self.expected_members = members
         self.set_message('Saving and verifying scanner links...')
         self.controller.group_loading[self.kind] = self.group
@@ -627,6 +644,7 @@ class GroupDialog(wx.Dialog):
             self.expected_members = None
             self.controller.group_loading[self.kind] = None
             self.members.Enable(True)
+            self.select_all.Enable(True)
             self.update_save_state()
             self.set_message('Serial write failed; membership was not verified.', error=True)
         else:
@@ -639,6 +657,7 @@ class GroupDialog(wx.Dialog):
         self.confirmed_members = None
         self.save.Disable()
         self.members.Disable()
+        self.select_all.Disable()
         self.controller.group_loading[self.kind] = None
         self.set_message('No group read-back received. Close and reopen the editor to read again.', error=True)
         self.controller.update_connection_ui()
@@ -923,6 +942,15 @@ class OperationSettingsDialog(wx.Dialog):
             control.Enable(self.family == 'D' or self.group != 0)
         if self.expected is not None:
             matched = all(self.values[key] == value for key, value in self.expected.items())
+            scan = self.controller.temporary_scan
+            if matched and self.family == 'X' and scan is not None and self.group == scan.group:
+                self.controller.memory_bank_dwell[scan.target] = self.values['XP']
+                profiles = self.controller.memory_bank_scan_profiles
+                profile = profiles.setdefault(scan.target, dict(scan.profile))
+                for key in ('XA', 'XD', 'XM', 'XP'):
+                    profile[key] = self.values[key]
+                if 'XB' in self.changed_settings:
+                    profile['XB'] = self.values['XB']
             self.message.SetLabel('Settings saved and verified.' if matched else
                                   'Verification failed; controls show scanner-returned values.')
             self.expected = None
@@ -958,6 +986,7 @@ class OperationSettingsDialog(wx.Dialog):
                 return
         if self.family != 'D' and self.running_operation is None:
             command = ('%s%d\r\n' % ('GM' if self.family == 'X' else 'GS', self.group)).encode('ascii') + command
+        self.changed_settings = set(changed)
         self.expected = proposed
         if self.controller.write_serial(command) != len(command):
             self.expected = None
@@ -1002,6 +1031,8 @@ class AorCtrl(AorCtrlFrame):
         self.background_vfo = None
         self.memory_banks = {}
         self.last_memory_bank = None
+        self.memory_bank_dwell = {}  # Session-local; never part of the borrowed group snapshot.
+        self.memory_bank_scan_profiles = {}
         self.initial_bank_load_pending = False
         self.level_squelch_value = None
         self.level_squelch_pending = False
@@ -1417,6 +1448,8 @@ class AorCtrl(AorCtrlFrame):
         elif source == 'Select Scan':
             self.select_list_view('SELECT SCAN')
             self.on_select_list(None)
+        elif source == 'Current Bank':
+            self.on_memory_source_changed(None)
 
     def operation_memory_bank(self):
         index = self.memory_bank_choice.GetSelection()
@@ -1853,11 +1886,12 @@ class AorCtrl(AorCtrlFrame):
         self.refresh_level_context()
 
     def show_scan_frequency(self, frequency_hz):
-        # A scan cursor is a temporary DISPLAY, never a VFO cache update.
-        if self.rb_vfos.GetSelection() == 2 and getattr(self, 'pending_vfo_target', None) is not None:
-            return
-        label = (self.lb_vfa, self.lb_vfb, self.lb_vfo)[self.rb_vfos.GetSelection()]
-        label.SetLabel(display_vfo_frequency(frequency_hz))
+        # Live scan/search reception belongs in status, never in a VFO display/cache.
+        state = self.receiver_status or {}
+        channel = state.get('channel')
+        self.aor_status.SetStatusText('%s%s: %s' % (
+            'Memory scan' if channel else 'Frequency search',
+            ' ' + channel if channel else '', display_frequency(frequency_hz)))
 
     def show_now_receiving(self):
         previous = self.receiving_channel
@@ -1968,7 +2002,7 @@ class AorCtrl(AorCtrlFrame):
             # A moving RX cursor is not a new squelch-open/paused-channel event.
             self.operation_signal_open = False
         self.receiver_status = state
-        if text.startswith(('MS ', 'SM ')):
+        if text.startswith(('MS ', 'SM ', 'VS ', 'VV ')) or re.match(r'SR[A-Ta-t] RF', text):
             self.show_scan_frequency(state['frequency_hz'])
         self.afc_mode = state['mode']
         self.update_receiver_switch_ui()
@@ -2008,7 +2042,7 @@ class AorCtrl(AorCtrlFrame):
                     channel is not None or any(state.get(key) is not None and state[key] != value
                                                for key, value in station['expected'].items())):
                 self.database_station = None
-            if self.active_operation is not None and self.active_operation[0] == 'Memory Scan':
+            if self.active_operation is not None:
                 self.show_scan_frequency(state['frequency_hz'])
             if state['mode'] is None or channel and not was_open and self.active_operation is not None:
                 # One RX on an LC1 open supplies details absent from LC; no new polling.
@@ -2874,8 +2908,8 @@ class AorCtrl(AorCtrlFrame):
                     match = re.fullmatch(r'V[SV] (V[ABF]) (RF.*)', first)
                     if match is None:
                         raise ValueError('Invalid VFO search/scan status')
-                    self.set_vfo_text(match.group(1) + ' ' + match.group(2),
-                                      {'VA': 0, 'VB': 1, 'VF': 2}[match.group(1)])
+                    # These are search/scan cursors, not the identified VFO's stored state.
+                    self.validate_fields(match.group(2).split(), ('RF', 'ST', 'AU', 'MD', 'AT'))
                 elif re.match(r'SR[A-Ta-t] RF', first):
                     fields = first.split(None, 6)
                     self.validate_fields(fields[1:6], ('RF', 'ST', 'AU', 'MD', 'AT'))
@@ -3748,10 +3782,123 @@ class AorCtrl(AorCtrlFrame):
                 item.Check(bool(entry[flag]))
                 item.Enable(self.memory_flags_editable(channel))
                 menu.Bind(wx.EVT_MENU, lambda evt, flag=flag: self.toggle_memory_flag(channel, flag), id=item.GetId())
+        menu.AppendSeparator()
+        for flag, desired, label in (('select', True, 'Select all channels'),
+                                     ('select', False, 'Deselect all channels'),
+                                     ('skip', True, 'Skip all channels'),
+                                     ('skip', False, 'Clear all skips')):
+            item = menu.Append(wx.ID_ANY, label)
+            item.Enable(self.memory_bulk_flags_available())
+            menu.Bind(wx.EVT_MENU, lambda evt, flag=flag, desired=desired:
+                      self.set_memory_bank_flags(flag, desired), id=item.GetId())
         try:
             self.edit_list.memory.PopupMenu(menu)
         finally:
             menu.Destroy()
+
+    def memory_bulk_channels(self):
+        bank = self.selected_memory_bank()
+        if bank is None:
+            return []
+        return sorted(channel for channel in self.memory_rows
+                      if re.fullmatch(r'[A-Ja-j][0-9]{2}', channel) and
+                      channel[0] == bank['bank'] and int(channel[1:]) < bank['channels'])
+
+    def memory_bulk_flags_available(self):
+        if self.temporary_scan is not None or getattr(self, 'memory_channel_dialog', None) is not None:
+            return False
+        channels = self.memory_bulk_channels()
+        return bool(channels) and all(self.memory_flags_editable(channel) for channel in channels)
+
+    def set_memory_bank_flags(self, flag, desired):
+        if flag not in ('select', 'skip') or not self.memory_bulk_flags_available():
+            self.aor_status.SetStatusText('Load the bank and finish other memory/scan operations before bulk editing.')
+            return
+        channels = self.memory_bulk_channels()
+        queue = deque(channel for channel in channels if self.memory_rows[channel][flag] != desired)
+        if not queue:
+            self.aor_status.SetStatusText('No channel flags need changing.')
+            return
+        self.memory_flag_edit = {'bulk': True, 'channels': channels, 'queue': queue,
+                                 'channel': queue.popleft(), 'flag': flag, 'desired': bool(desired),
+                                 'phase': 'capture', 'restore': None, 'restored': False}
+        self.memory_flag_timer.StartOnce(10000)
+        self.update_connection_ui()
+        if self.write_serial(b'RX\r\n') != 4:
+            self.finish_memory_flag_edit('Bulk edit failed: could not capture receiver state.')
+
+    def next_bulk_memory_flag(self, prefix=b''):
+        edit = self.memory_flag_edit
+        if edit['queue']:
+            edit['channel'] = edit['queue'].popleft()
+            edit['phase'] = 'recall'
+            command = prefix + ('MR%s\r\nRX\r\n' % edit['channel']).encode('ascii')
+        else:
+            edit['phase'] = 'bulk_restore'
+            command = prefix + edit['restore'] + b'MC0\r\n'
+            if edit['flag'] == 'skip':
+                command += b'RX\r\n'
+        self.memory_flag_timer.StartOnce(10000)
+        if self.write_serial(command) != len(command):
+            self.finish_memory_flag_edit('Bulk edit failed: serial write/read-back was not completed.')
+        elif edit['phase'] == 'bulk_restore':
+            edit['restored'] = True
+            self.monitor_muted = False
+            if edit['flag'] == 'select':
+                self.read_memory_select_flags()
+
+    def on_bulk_memory_flag_status(self, text):
+        edit = self.memory_flag_edit
+        if edit['phase'] == 'capture':
+            if not text.startswith(('VA ', 'VB ', 'VF ', 'MR ')):
+                self.finish_memory_flag_edit('Stop scanning/searching before bulk editing.')
+                return
+            edit['original_status'] = text
+            edit['restore'] = ((text[:2] + '\r\n') if text.startswith(('VA ', 'VB ', 'VF ')) else
+                               ('MR%s\r\n' % text.split()[1][2:])).encode('ascii')
+            edit['phase'] = 'recall'
+            self.monitor_muted = True
+            command = ('MC1\r\nMR%s\r\nRX\r\n' % edit['channel']).encode('ascii')
+        elif edit['phase'] == 'bulk_restore':
+            # Skip was verified in M.RD; Selected is verified by the final GR list.
+            if edit['flag'] == 'skip':
+                matched = self.memory_flag_context_matches(text, edit['original_status'])
+                self.finish_memory_flag_edit('Bulk Skip saved and verified; receiver restored.' if matched else
+                                             'Bulk Skip verified, but receiver context restoration did not match.', verified=True)
+            return
+        elif text.startswith('MR ') and text.split()[1] == 'MX' + edit['channel']:
+            entry = self.memory_rows[edit['channel']]
+            fields = [field[2:] for field in text.split(None, 8)[1:]]
+            entry.update(fields=fields, skip=fields[1] == '1')
+            self.show_memory_flags(edit['channel'])
+            if edit['phase'] == 'recall':
+                command = ('%s%d\r\n' % ('GA' if edit['flag'] == 'select' else 'MP', edit['desired'])).encode('ascii')
+                if edit['flag'] == 'select':
+                    # GA needs M.RD; one complete GR after restoration verifies all tags.
+                    self.next_bulk_memory_flag(command)
+                    return
+                edit['phase'] = 'verify_skip'
+                command += b'RX\r\n'
+            elif edit['phase'] == 'verify_skip':
+                if entry['skip'] != edit['desired']:
+                    self.finish_memory_flag_edit('Bulk Skip verification failed at %s.' % edit['channel'], verified=True)
+                    return
+                self.next_bulk_memory_flag()
+                return
+            else:
+                return
+        else:
+            return
+        self.memory_flag_timer.StartOnce(10000)
+        if self.write_serial(command) != len(command):
+            self.finish_memory_flag_edit('Bulk edit failed: serial write/read-back was not completed.')
+
+    def memory_flag_context_matches(self, text, original):
+        actual, expected = text.split(None, 8), original.split(None, 8)
+        if actual and expected and actual[0] == expected[0] == 'MR':
+            # The intentionally edited MP flag is not receiver tuning/context.
+            return actual[:2] + actual[3:] == expected[:2] + expected[3:]
+        return actual == expected
 
     def toggle_memory_flag(self, channel, flag, preserving=False):
         if flag not in ('select', 'skip') or not self.memory_flags_editable(channel, preserving=preserving):
@@ -3779,7 +3926,13 @@ class AorCtrl(AorCtrlFrame):
                     entry['select'] = channel in snapshot['channels']
                     self.show_memory_flags(channel)
                 edit = self.memory_flag_edit
-                if edit is not None and edit['phase'] == 'verify_select':
+                if edit is not None and edit.get('bulk') and edit['phase'] == 'bulk_restore':
+                    matched = all(self.memory_rows[channel]['select'] == edit['desired'] for channel in edit['channels'])
+                    restored = self.memory_flag_context_matches(text, edit['original_status'])
+                    self.finish_memory_flag_edit('Bulk Selected saved and verified; receiver restored.' if matched and restored else
+                                                 'Bulk Selected verification failed: %s.' %
+                                                 ('receiver context restoration mismatch' if not restored else 'scanner returned different membership'), verified=True)
+                elif edit is not None and edit['phase'] == 'verify_select':
                     actual = edit['channel'] in snapshot['channels']
                     self.finish_memory_flag_edit('%s Selected %s' %
                                                  (edit['channel'], 'saved and verified' if actual == edit['desired'] else 'verification failed'), verified=True)
@@ -3799,6 +3952,9 @@ class AorCtrl(AorCtrlFrame):
             self.update_connection_ui()
         edit = self.memory_flag_edit
         if edit is None:
+            return
+        if edit.get('bulk'):
+            self.on_bulk_memory_flag_status(text)
             return
         if edit['phase'] == 'capture':
             if not text.startswith(('VA ', 'VB ', 'VF ', 'MR ')):
@@ -3840,6 +3996,10 @@ class AorCtrl(AorCtrlFrame):
 
     def finish_memory_flag_edit(self, message, verified=False):
         edit = self.memory_flag_edit
+        if edit is not None and edit.get('bulk') and not verified and edit['flag'] == 'select':
+            for channel in edit['channels']:
+                self.memory_rows[channel]['select'] = None
+                self.show_memory_flags(channel)
         if edit is not None and edit['phase'].startswith('verify_') and not verified:
             self.memory_rows[edit['channel']][edit['flag']] = None
             self.show_memory_flags(edit['channel'])

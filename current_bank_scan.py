@@ -1,13 +1,15 @@
 """Bounded, asynchronous preparation/restoration of a single-bank linked scan.
 
-No channel recalls or memory writes: MA proves the helper empty and GM/BM
-read-back identifies and verifies every group we temporarily change.
+No channel recalls or memory writes: GM/BM read-back identifies and verifies
+every group we temporarily change; the group contains only the target bank.
 """
 import re
+from collections import deque
 
-from aor_functions import parse_group_members, parse_operation_parameter, operation_parameter_command
+from aor_functions import (parse_group_members, parse_operation_parameter,
+                           operation_parameter_command, group_members_replacement)
 
-BANK_ORDER = 'AaBbCcDdEeFfGgHhIiJj'
+COMMAND_PACE_MS = 200
 PARAMETERS = ('XA', 'XB', 'XD', 'XM', 'XP')
 PARAMETER_PATTERN = r'X[AB][ +]?[0-9]{3}|XD(?:[0-9]\.[0-9]|[0-9]{2})|XM[0-8F]|XP[0-9]{2}'
 
@@ -44,9 +46,21 @@ class CurrentBankScan:
         self.controller = controller
         self.target = target['bank']
         self.level = getattr(controller, 'level_squelch_value', None) if level is None else level
+        profiles = getattr(controller, 'memory_bank_scan_profiles', {})
+        self.profile = dict(XA=0, XB=None, XD=20, XM='F',
+                            XP=getattr(controller, 'memory_bank_dwell', {}).get(self.target, 0))
+        self.profile.update(profiles.get(self.target, {}))
+        if self.profile['XB'] is not None:
+            self.level = self.profile['XB']
         self.ready_callback = ready
-        self.phase = 'empty'
+        self.phase = 'initial'
         self.timer = None
+        self.pace_timer = None
+        self.command_queue = deque()
+        self.current_command = None
+        self.sequence_phase = None
+        self.sequence_generation = 0
+        self.awaiting_final_group = False
         self.sending = False
         self.group = None
         self.saved = None
@@ -61,7 +75,6 @@ class CurrentBankScan:
         self.receiver_command = (('MR' + state['channel'] + '\r\n').encode('ascii')
                                  if state.get('context') == 'MR' and state.get('channel') else
                                  controller.normal_vfo_command())
-        self.candidates = [bank for bank in BANK_ORDER if bank != self.target and bank in controller.memory_banks]
 
     @property
     def busy(self):
@@ -73,15 +86,53 @@ class CurrentBankScan:
         self.timer = self.controller.scan_call_later(milliseconds, self.timeout)
 
     def send(self, command):
-        self.arm(10000 if self.phase == 'empty' else 5000)
+        self.arm()
         self.sending = True
         try:
             ok = self.controller.write_serial(command) == len(command)
         finally:
             self.sending = False
         if not ok:
-            self.fail('Serial write failed during ' + self.phase)
+            self.fail('Serial write failed for %s.' % self.command_diagnostic(command) if self.current_command is not None
+                      else 'Serial write failed during ' + self.phase)
         return ok
+
+    def cancel_sequence(self):
+        self.sequence_generation += 1
+        if self.pace_timer is not None:
+            self.pace_timer.Stop()
+        self.pace_timer = None
+        self.command_queue.clear()
+        self.current_command = None
+        self.sequence_phase = None
+        self.awaiting_final_group = False
+
+    def send_sequence(self, commands):
+        self.cancel_sequence()
+        self.command_queue.extend(commands)
+        self.sequence_phase = self.phase
+        self.send_next_command(self.sequence_generation)
+
+    def send_next_command(self, generation):
+        if generation != self.sequence_generation or self.phase != self.sequence_phase:
+            return
+        self.pace_timer = None
+        self.current_command = self.command_queue.popleft()
+        self.awaiting_final_group = not self.command_queue and self.current_command == b'GM\r\n'
+        if self.awaiting_final_group:
+            self.header = None  # Earlier group-selection echoes cannot verify the sequence.
+        if not self.send(self.current_command) or generation != self.sequence_generation:
+            return
+        if self.command_queue:
+            self.pace_timer = self.controller.scan_call_later(
+                COMMAND_PACE_MS, lambda: self.send_next_command(generation))
+
+    def command_diagnostic(self, command=None):
+        action = 'configuring' if self.phase == 'configured' else 'restoring'
+        group = self.original['group'] if self.phase == 'restore_context' else self.group
+        return '%s while %s %s Scan Group %d' % (
+            (command or self.current_command).decode('ascii').rstrip('\r\n'), action,
+            'original' if self.phase == 'restore_context' else 'temporary', group)
 
     def start(self):
         if not isinstance(self.level, int) or not 0 <= self.level <= 255:
@@ -90,29 +141,7 @@ class CurrentBankScan:
         if len(self.controller.memory_banks) != 20:
             self.fail('Complete TB metadata is required before starting Current Memory Bank.')
             return
-        self.next_empty_bank()
-
-    def next_empty_bank(self):
-        if not self.candidates:
-            self.fail('No genuinely empty helper Memory Bank was verified; scan not started, groups unchanged.')
-            return
-        self.helper = self.candidates.pop(0)
-        capacity = self.controller.memory_banks[self.helper]['channels']
-        # Even a zero-capacity bank must answer MA with explicit empty slots.
-        self.blocks = max(1, (capacity + 9) // 10)
-        self.remaining = {'%s%02d' % (self.helper, n) for n in range(self.blocks * 10)}
-        self.block = 0
-        self.phase = 'empty'
-        self.read_empty_block()
-
-    def read_empty_block(self):
-        first = self.block * 10
-        self.block_remaining = {'%s%02d' % (self.helper, n) for n in range(first, first + 10)}
-        self.controller.aor_status.SetStatusText(
-            'Preparing Memory Bank %s scan: verifying empty helper bank %s, channels %02d-%02d...' %
-            (self.target, self.helper, first, first + 9))
-        command = ('MA%s\r\n' % self.helper) if self.block == 0 else 'MA\r\n'
-        self.send(command.encode('ascii'))
+        self.query_group(None, 'original')
 
     def query_group(self, group, phase):
         self.phase, self.header, self.expected_group = phase, None, group
@@ -120,18 +149,27 @@ class CurrentBankScan:
             '%s Memory Bank %s scan: reading Scan Group %s...' %
             ('Restoring' if phase == 'restore_context' else 'Preparing',
              self.target, 'current' if group is None else group))
-        self.send((('GM%d\r\n' % group if group is not None else '') + 'GM\r\n').encode('ascii'))
+        if phase == 'restore_context':
+            self.send_sequence([('GM%d\r\n' % group).encode('ascii'), b'GM\r\n'])
+        else:
+            self.send((('GM%d\r\n' % group if group is not None else '') + 'GM\r\n').encode('ascii'))
 
     def receive(self, text):
         if self.phase == 'finished':
             return False
         if text == '?':
-            if self.phase == 'empty':
-                self.fail('Helper bank %s returned ?; emptiness cannot be verified.' % self.helper)
-            elif self.busy or self.controller.level_squelch_pending:
-                self.fail('Scanner rejected a temporary scan-group operation during ' + self.phase)
+            if self.busy or self.controller.level_squelch_pending:
+                self.fail('Scanner rejected %s.' % self.command_diagnostic() if self.current_command is not None
+                          else 'Scanner rejected a temporary scan-group operation during ' + self.phase)
             return True
         try:
+            if (self.sequence_phase == self.phase and not self.awaiting_final_group and
+                    text.startswith(('GM', 'BM'))):
+                # Setter/selection echoes may arrive while remaining commands are paced.
+                # Only the final GM report can complete configuration/restoration.
+                if text.startswith('BM'):
+                    parse_group_members(text, 'scan')
+                return True
             if self.phase == 'starting' and text.startswith('MS '):
                 fields = text.split(None, 8)[1:]
                 self.controller.validate_fields(fields, ('MX', 'MP', 'RF', 'ST', 'AU', 'MD', 'AT', 'TM'))
@@ -142,24 +180,6 @@ class CurrentBankScan:
                 self.controller.update_connection_ui()
                 self.controller.aor_status.SetStatusText('Scanning Memory Bank %s' % self.target)
                 return False  # Normal validated RX parser owns the displayed scan state.
-            if self.phase == 'empty' and text.startswith('MX'):
-                channel, fields = self.controller.parse_memory_line(text)
-                if channel in self.block_remaining:
-                    if fields is not None:
-                        # Reject at the first populated slot, without requesting
-                        # further blocks. Tail lines from this block are ignored
-                        # by the next candidate's bank-specific channel set.
-                        self.next_empty_bank()
-                    else:
-                        self.remaining.remove(channel)
-                        self.block_remaining.remove(channel)
-                        if not self.block_remaining:
-                            if self.remaining:
-                                self.block += 1
-                                self.read_empty_block()
-                            else:
-                                self.query_group(None, 'original')
-                return True
             if self.busy and text.startswith('GM'):
                 if not re.match(r'GM[0-9](?:\s|$)', text):
                     raise ValueError('Invalid group header')
@@ -201,9 +221,10 @@ class CurrentBankScan:
             else:
                 self.configure(self.probes[1])
         elif self.phase == 'configured':
-            expected = dict(self.saved['values'], XB=self.level)
-            if set(state['members']) != {self.helper, self.target} or state['values'] != expected:
+            expected = dict(self.profile, XB=self.level)
+            if tuple(state['members']) != (self.target,) or state['values'] != expected:
                 raise ValueError('Temporary group membership/settings did not verify')
+            self.cancel_sequence()
             self.controller.scan_levels[self.group] = state['values']['XB']
             self.controller.current_scan_level = state['values']['XB']
             self.controller.group_response['scan'] = self.group
@@ -215,7 +236,7 @@ class CurrentBankScan:
             else:
                 self.begin_scan()
         elif self.phase == 'level_start':
-            if set(state['members']) != {self.helper, self.target} or state['values']['XB'] != self.level:
+            if tuple(state['members']) != (self.target,) or state['values']['XB'] != self.level:
                 raise ValueError('Listening Squelch did not verify as temporary Scan Level')
             self.controller.scan_levels[self.group] = self.level
             self.controller.current_scan_level = self.level
@@ -238,8 +259,8 @@ class CurrentBankScan:
             self.controller.scan_levels[self.original['group']] = state['values']['XB']
             self.send(b'RX\r\n')
             if self.phase != 'restore_failed':
-                self.finish(self.failure + ' Original Scan Group restored and verified.' if self.failure else
-                            'Current Memory Bank stopped; original Scan Group restored and verified.')
+                self.failure = None
+                self.finish('Current Memory Bank stopped; original Scan Group restored and verified.')
 
     def configure(self, state):
         self.group, self.saved = state['group'], state
@@ -249,11 +270,17 @@ class CurrentBankScan:
         self.controller.aor_status.SetStatusText(
             'Preparing Memory Bank %s scan: configuring temporary Scan Group %d with Squelch %d...' %
             (self.target, self.group, self.level))
-        command = ('GM%d\r\nBM%%%%%s%s\r\n' % (self.group, self.helper, self.target)).encode('ascii')
-        command += operation_parameter_command('XB', self.level) + b'GM\r\n'
-        self.send(command)
+        commands = [('GM%d\r\n' % self.group).encode('ascii'),
+                    group_members_replacement('scan', self.target)]
+        values = dict(self.profile, XB=self.level)
+        commands.extend(operation_parameter_command(key, values[key]) for key in PARAMETERS)
+        commands.append(b'GM\r\n')
+        self.send_sequence(commands)
 
     def begin_scan(self, level=None):
+        profile = getattr(self.controller, 'memory_bank_scan_profiles', {}).get(self.target, self.profile)
+        if profile.get('XB') is not None:
+            level = profile['XB']
         if self.phase != 'ready':
             return
         if level is not None and self.controller.scan_levels.get(self.group) != level:
@@ -278,6 +305,9 @@ class CurrentBankScan:
             self.finish_callback = callback
         if self.phase in ('restoring', 'restore_context'):
             return
+        self.cancel_sequence()
+        if self.phase == 'restore_failed':
+            self.failure = None  # A new explicit Stop attempt has its own outcome.
         if self.timer is not None:
             self.timer.Stop()
         dialog = getattr(self.controller, 'settings_dialog', None)
@@ -292,17 +322,18 @@ class CurrentBankScan:
             self.restoration_failed('Serial port unavailable; original group could not be restored.')
             return
         self.header = None
-        command = self.receiver_command
+        commands = [self.receiver_command]
         if self.modified:
             self.phase, self.expected_group = 'restoring', self.group
-            command += ('GM%d\r\nBM%%%%%s\r\n' % (self.group, ''.join(self.saved['members']))).encode('ascii')
+            commands.append(('GM%d\r\n' % self.group).encode('ascii'))
+            commands.append(group_members_replacement('scan', self.saved['members']))
             # Preserve ALL returned settings, including valid values outside the GUI range.
-            command += ''.join(self.saved['raw'][key] + '\r\n' for key in PARAMETERS).encode('ascii')
-            command += b'GM\r\n'
+            commands.extend((self.saved['raw'][key] + '\r\n').encode('ascii') for key in PARAMETERS)
+            commands.append(b'GM\r\n')
         else:
             self.phase, self.expected_group = 'restore_context', self.original['group']
-            command += ('GM%d\r\nGM\r\n' % self.original['group']).encode('ascii')
-        self.send(command)
+            commands.extend([('GM%d\r\n' % self.original['group']).encode('ascii'), b'GM\r\n'])
+        self.send_sequence(commands)
         self.controller.update_connection_ui()
 
     def fail(self, message):
@@ -313,9 +344,12 @@ class CurrentBankScan:
         if self.phase in ('restoring', 'restore_context', 'restore_failed'):
             self.restoration_failed(message)
         else:
+            self.controller.report_scan_error(message)
             self.restore()
 
     def restoration_failed(self, message):
+        self.cancel_sequence()
+        self.failure = message
         if self.timer is not None:
             self.timer.Stop()
         self.phase = 'restore_failed'
@@ -329,6 +363,7 @@ class CurrentBankScan:
         self.fail('Temporary scan-group %s read-back timed out.' % self.phase)
 
     def finish(self, message):
+        self.cancel_sequence()
         if self.timer is not None:
             self.timer.Stop()
         self.phase = 'finished'

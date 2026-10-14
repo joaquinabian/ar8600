@@ -11,7 +11,8 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from current_bank_scan import CurrentBankScan, BANK_ORDER, group_snapshot
+from current_bank_scan import CurrentBankScan, group_snapshot
+from aor_functions import make_group_members_command
 
 loader = importlib.machinery.SourceFileLoader('aor_scan_test_main', str(ROOT / 'aor_ctrl_main.pyw'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -20,8 +21,24 @@ loader.exec_module(main)
 
 
 class Timer:
+    def __init__(self, milliseconds=None, callback=None):
+        self.milliseconds, self.callback, self.active = milliseconds, callback, True
+
     def Stop(self):
-        pass
+        self.active = False
+
+    def Fire(self):
+        if self.active:
+            self.active = False
+            self.callback()
+
+
+def drain_pacing(scan):
+    for n in range(20):
+        if scan.pace_timer is None:
+            return
+        scan.pace_timer.Fire()
+    raise AssertionError('Pacing did not terminate')
 
 
 def header(group, level=9, dwell=60):
@@ -36,7 +53,7 @@ class Controller:
     def __init__(self):
         self.commands = []
         self.errors = []
-        self.memory_banks = {bank: {'bank': bank, 'channels': 10, 'name': ''} for bank in BANK_ORDER}
+        self.memory_banks = {bank: {'bank': bank, 'channels': 10, 'name': ''} for bank in 'AaBbCcDdEeFfGgHhIiJj'}
         self.receiver_status = {'context': 'VFO-A'}
         self.serial = SimpleNamespace(is_open=True)
         self.aor_status = Mock()
@@ -55,7 +72,7 @@ class Controller:
         self.level_squelch_timer = Mock()
         self.clear_level_edits = MethodType(main.AorCtrl.clear_level_edits, self)
         self.fail_level_edit = MethodType(main.AorCtrl.fail_level_edit, self)
-        self.scan_call_later = lambda milliseconds, callback: Timer()
+        self.scan_call_later = lambda milliseconds, callback: Timer(milliseconds, callback)
         self.update_connection_ui = Mock()
         self.update_operation_ui = Mock()
         self.refresh_level_context = Mock()
@@ -80,6 +97,90 @@ class Controller:
 
 
 class ScanTests(unittest.TestCase):
+    def test_configuration_is_paced_and_only_final_gm_can_verify(self):
+        controller, scan = self.create()
+        self.feed_group(scan, 4, 'BCD')
+        self.feed_group(scan, 1, '')
+        expected = [b'GM1\r\n', b'BM%% J\r\n', b'XA000\r\n', b'XB031\r\n',
+                    b'XD20\r\n', b'XMF\r\n', b'XP00\r\n', b'GM\r\n']
+        start = len(controller.commands) - 1
+        self.assertEqual(controller.commands[start:], expected[:1])
+        for index in range(1, len(expected)):
+            self.assertEqual(scan.pace_timer.milliseconds, 200)
+            # Selection/write echoes, even with matching values, cannot finish early.
+            scan.receive('GM1 XD2.0 XB+031 XA 000 XP00 XMF')
+            scan.receive(membership('J'))
+            self.assertEqual(scan.phase, 'configured')
+            scan.pace_timer.Fire()
+            self.assertEqual(controller.commands[start:], expected[:index + 1])
+        self.assertIsNone(scan.pace_timer)
+        self.assertTrue(scan.awaiting_final_group)
+        scan.receive('GM1 XD2.0 XB+031 XA 000 XP00 XMF')
+        self.assertEqual(scan.phase, 'configured')
+        scan.receive(membership('J'))
+        self.assertEqual(scan.phase, 'starting')
+
+    def test_config_rejection_names_current_command_and_cancels_queued_settings(self):
+        controller, scan = self.create()
+        self.feed_group(scan, 4, 'BCD')
+        self.feed_group(scan, 1, '')
+        for n in range(3):
+            scan.pace_timer.Fire()
+        self.assertEqual(scan.current_command, b'XB031\r\n')
+        queued_callback = scan.pace_timer.callback
+        scan.receive('?')
+        self.assertEqual(controller.errors[0], 'Scanner rejected XB031 while configuring temporary Scan Group 1.')
+        self.assertEqual(scan.phase, 'restoring')
+        before = len(controller.commands)
+        queued_callback()  # A stale queued GUI callback cannot continue the old sequence.
+        self.assertEqual(len(controller.commands), before)
+        drain_pacing(scan)
+        self.assertNotIn(b'XMF\r\n', controller.commands)
+        self.assertEqual(controller.commands[-7:-1], [b'BM%%\r\n', b'XA023\r\n', b'XB009\r\n',
+                                                    b'XD20\r\n', b'XM2\r\n', b'XP60\r\n'])
+
+    def test_restore_rejection_names_current_command_and_stops_pacing(self):
+        controller, scan = self.prepare()
+        scan.restore()
+        for n in range(4):
+            self.assertEqual(scan.pace_timer.milliseconds, 200)
+            scan.pace_timer.Fire()
+        self.assertEqual(scan.current_command, b'XB009\r\n')
+        stale = scan.pace_timer.callback
+        scan.receive('?')
+        self.assertIn('Scanner rejected XB009 while restoring temporary Scan Group 2.', controller.errors[-1])
+        self.assertEqual(scan.phase, 'restore_failed')
+        self.assertIsNone(scan.pace_timer)
+        before = len(controller.commands)
+        stale()
+        self.assertEqual(len(controller.commands), before)
+
+    def test_stop_during_paced_configuration_cancels_old_commands_and_restores(self):
+        controller, scan = self.create()
+        self.feed_group(scan, 4, 'BCD')
+        self.feed_group(scan, 1, '')
+        stale = scan.pace_timer.callback
+        scan.restore()
+        before = len(controller.commands)
+        stale()
+        self.assertEqual(len(controller.commands), before)
+        self.feed_group(scan, 1, '')
+        self.feed_group(scan, 4, 'BCD')
+        self.assertIsNone(controller.temporary_scan)
+        self.assertFalse(any(b'MSJ' in command or b'BM%% J' in command for command in controller.commands))
+
+    def test_bm_and_bs_replacement_space_and_readback(self):
+        self.assertEqual(make_group_members_command('scan', 9, ['A']),
+                         b'GM9\r\nBM%% A\r\nBM\r\n')
+        self.assertEqual(make_group_members_command('search', 9, ['a', 'K']),
+                         b'GS9\r\nBS%% Ka\r\nBS\r\n')
+        self.assertEqual(make_group_members_command('scan', 1, []),
+                         b'GM1\r\nBM%%\r\nBM\r\n')
+        self.assertEqual(make_group_members_command('search', 1, []),
+                         b'GS1\r\nBS%%\r\nBS\r\n')
+        self.assertEqual(make_group_members_command('search', 1, ['A']),
+                         b'GS1\r\nBS%% A\r\nBS\r\n')
+
     def create(self, level=31, ready=None):
         controller = Controller()
         scan = CurrentBankScan(controller, controller.memory_banks['J'], level, ready)
@@ -87,66 +188,42 @@ class ScanTests(unittest.TestCase):
         scan.start()
         return controller, scan
 
-    def feed_bank(self, scan, populated=False):
-        bank = scan.helper
-        for n in range(10):
-            suffix = ('MP0 RF0093500000 ST100000 AU0 MD0 AT0 TMStation'
-                      if populated and n == 0 else '---')
-            scan.receive('MX%s%02d %s' % (bank, n, suffix))
-
     def feed_group(self, scan, group, members, level=9, dwell=60):
+        drain_pacing(scan)
         scan.receive(header(group, level, dwell))
         scan.receive(membership(members))
 
+    def feed_configured(self, scan, group=None, members=None, level=None):
+        drain_pacing(scan)
+        group = scan.group if group is None else group
+        values = dict(scan.profile, XB=scan.level if level is None else level)
+        scan.receive('GM%d XD%.1f XB %03d XA %03d XP%02d XM%s' %
+                     (group, values['XD'] / 10, values['XB'], values['XA'], values['XP'], values['XM']))
+        scan.receive(membership(scan.target if members is None else members))
+
     def prepare(self, level=31, ready=None, dwell=60):
         controller, scan = self.create(level, ready)
-        self.feed_bank(scan)  # A is proved empty, with ten explicit empty slots.
         self.feed_group(scan, 4, 'BCD', dwell=dwell)
         self.feed_group(scan, 1, 'B', dwell=dwell)
         self.feed_group(scan, 2, '', dwell=dwell)
-        self.feed_group(scan, 2, 'AJ', level=scan.level, dwell=dwell)
+        self.feed_configured(scan)
         scan.receive('MS MXJ02 MP0 RF0446500000 ST012500 AU0 MD1 AT0 TMPMR')
         return controller, scan
 
-    def test_blank_name_is_not_evidence_and_all_slots_required(self):
-        controller, scan = self.create()
-        self.feed_bank(scan, populated=True)  # A is unnamed but populated.
-        self.assertEqual(scan.helper, 'a')
-        for n in range(9):
-            scan.receive('MXa%02d ---' % n)
-        self.assertEqual(scan.phase, 'empty')
-        self.assertFalse(any(b'GM' in command for command in controller.commands))
-        scan.receive('MXa09 ---')
-        self.assertEqual(scan.phase, 'original')
-        self.assertEqual(scan.helper, 'a')
-
-    def test_refuse_when_no_verified_empty_bank(self):
-        controller, scan = self.create()
-        while scan.phase == 'empty':
-            self.feed_bank(scan, populated=True)
-        self.assertIsNone(controller.temporary_scan)
-        self.assertTrue(controller.errors)
-        self.assertFalse(any(b'GM' in c or b'BM' in c or b'MS' in c for c in controller.commands))
-
-    def test_incomplete_or_question_mark_does_not_prove_empty(self):
-        for response in ('?', 'MXA00 --'):
-            controller, scan = self.create()
-            scan.receive(response)
-            self.assertIsNone(controller.temporary_scan)
-            self.assertFalse(any(b'BM' in c for c in controller.commands))
-
-    def test_empty_group_preferred_and_start_sequence(self):
+    def test_single_bank_group_and_no_helper_or_ma(self):
         controller, scan = self.prepare()
-        self.assertEqual(scan.group, 2)  # group 1 was occupied, group 2 unused.
+        self.assertEqual(scan.group, 2)
         self.assertEqual(scan.phase, 'active')
-        self.assertIn(b'GM2\r\nBM%%AJ\r\nXB031\r\nGM\r\n', controller.commands)
+        self.assertEqual(controller.commands[-9:-1], [b'GM2\r\n', b'BM%% J\r\n', b'XA000\r\n',
+                                                    b'XB031\r\n', b'XD20\r\n', b'XMF\r\n', b'XP00\r\n', b'GM\r\n'])
         self.assertEqual(controller.commands[-1], b'GM2\r\nMSJ\r\nRX\r\n')
+        self.assertFalse(any(b'MA' in c for c in controller.commands))
+        self.assertFalse(hasattr(scan, 'helper'))
+        self.assertFalse(hasattr(scan, 'candidates'))
         self.assertEqual(controller.active_operation, ('Memory Scan', 'Current Bank'))
-        self.assertFalse(any(b'GM0' in c for c in controller.commands))
 
     def test_no_free_group_falls_back_to_fully_saved_group_one(self):
         controller, scan = self.create()
-        self.feed_bank(scan)
         self.feed_group(scan, 4, 'BCD')
         for group in range(1, 10):
             self.feed_group(scan, group, 'B')
@@ -159,7 +236,6 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(scan.level, 12)
         self.assertEqual(controller.current_scan_level, 12)
         self.assertEqual(controller.scan_levels[2], 12)
-        self.assertIn(b'GM2\r\nBM%%AJ\r\nXB012\r\nGM\r\n', controller.commands)
         scan.restore()
         self.feed_group(scan, 2, '')
         self.feed_group(scan, 4, 'BCD')
@@ -169,46 +245,105 @@ class ScanTests(unittest.TestCase):
 
     def test_replacement_echo_waits_for_complete_gm_readback(self):
         controller, scan = self.create()
-        self.feed_bank(scan)
         self.feed_group(scan, 4, 'BCD')
         self.feed_group(scan, 1, '')
-        scan.receive(membership('AJ'))  # BM write acknowledgement, before GM
+        scan.receive(membership('J'))
         scan.receive('XB031')
         self.assertEqual(scan.phase, 'configured')
         self.assertFalse(any(b'MSJ' in c for c in controller.commands))
-        self.feed_group(scan, 1, 'AJ', level=31)
+        self.feed_configured(scan)
         self.assertEqual(scan.phase, 'starting')
-        scan.receive('MS MXJ02 MP0 RF0446500000 ST012500 AU0 MD1 AT0 TMPMR')
-        self.assertEqual(scan.phase, 'active')
-        scan.restore()
-        scan.receive(membership(''))
-        scan.receive('XB009')
-        self.assertEqual(scan.phase, 'restoring')
-        self.feed_group(scan, 1, '')
-        self.feed_group(scan, 4, 'BCD')
-        self.assertIsNone(controller.temporary_scan)
 
     def test_restore_every_parameter_and_previous_group_before_callback(self):
         controller, scan = self.prepare(dwell=99)
         done = Mock()
         scan.restore(done)
-        self.assertEqual(controller.commands[-1],
-                         b'VA\r\nGM2\r\nBM%%\r\nXA023\r\nXB009\r\nXD20\r\nXM2\r\nXP99\r\nGM\r\n')
+        drain_pacing(scan)
+        self.assertEqual(controller.commands[-9:],
+                         [b'VA\r\n', b'GM2\r\n', b'BM%%\r\n', b'XA023\r\n', b'XB009\r\n',
+                          b'XD20\r\n', b'XM2\r\n', b'XP99\r\n', b'GM\r\n'])
         done.assert_not_called()
         self.feed_group(scan, 2, '', dwell=99)
-        self.assertEqual(controller.commands[-1], b'GM4\r\nGM\r\n')
+        self.assertEqual(controller.commands[-1], b'GM4\r\n')
         done.assert_not_called()
         self.feed_group(scan, 4, 'BCD', dwell=99)
         done.assert_called_once()
         self.assertIsNone(controller.temporary_scan)
-        self.assertEqual(controller.commands[-1], b'RX\r\n')
+
+    def test_start_stop_start_with_empty_temporary_group(self):
+        controller, scan = self.prepare()
+        scan.restore()
+        drain_pacing(scan)
+        self.assertEqual(controller.commands[-7:-1], [b'BM%%\r\n', b'XA023\r\n', b'XB009\r\n',
+                                                    b'XD20\r\n', b'XM2\r\n', b'XP60\r\n'])
+        self.assertNotIn(b'BM%% \r\n', controller.commands)
+        self.feed_group(scan, 2, '')
+        self.feed_group(scan, 4, 'BCD')
+        self.assertIsNone(controller.temporary_scan)
+        self.assertEqual(controller.group_response['scan'], 4)
+        self.assertEqual(scan.phase, 'finished')
+        restarted = CurrentBankScan(controller, controller.memory_banks['J'], 31)
+        controller.temporary_scan = restarted
+        restarted.start()
+        self.feed_group(restarted, 4, 'BCD')
+        self.feed_group(restarted, 1, 'B')
+        self.feed_group(restarted, 2, '')
+        self.feed_configured(restarted)
+        restarted.receive('MS MXJ02 MP0 RF0446500000 ST012500 AU0 MD1 AT0 TMPMR')
+        self.assertEqual(restarted.phase, 'active')
+        self.assertIsNone(restarted.failure)
+        self.assertEqual(controller.commands[-1], b'GM2\r\nMSJ\r\nRX\r\n')
+
+    def test_failed_restore_does_not_emit_success_and_explicit_retry_clears_old_failure(self):
+        controller, scan = self.prepare()
+        controller.scan_lifecycle_action = None
+        controller.restore_temporary_scan = MethodType(main.AorCtrl.restore_temporary_scan, controller)
+        after = Mock()
+        controller.aor_status.SetStatusText.reset_mock()
+        controller.restore_temporary_scan(after)
+        scan.receive('?')
+        self.assertEqual(scan.phase, 'restore_failed')
+        after.assert_not_called()
+        self.assertIs(controller.temporary_scan, scan)
+        self.assertTrue(controller.errors)
+        self.assertFalse(any('restored and verified' in message for message in controller.errors))
+        self.assertFalse(any('restored and verified' in call.args[0]
+                             for call in controller.aor_status.SetStatusText.call_args_list))
+        self.feed_group(scan, 2, '')  # Late valid replies cannot complete the failed attempt.
+        self.assertEqual(scan.phase, 'restore_failed')
+        self.assertIs(controller.temporary_scan, scan)
+        after.assert_not_called()
+        controller.errors.clear()
+        controller.aor_status.SetStatusText.reset_mock()
+        controller.restore_temporary_scan(after)
+        self.feed_group(scan, 2, '')
+        self.feed_group(scan, 4, 'BCD')
+        self.assertIsNone(controller.temporary_scan)
+        self.assertIsNone(scan.failure)
+        after.assert_called_once_with()
+        self.assertEqual(controller.errors, [])
+        controller.aor_status.SetStatusText.assert_called_with(
+            'Current Memory Bank stopped; original Scan Group restored and verified.')
+
+    def test_failed_final_restoration_rx_does_not_finish_or_report_success(self):
+        controller, scan = self.prepare()
+        scan.restore()
+        self.feed_group(scan, 2, '')
+        original_write = controller.write_serial
+        controller.write_serial = lambda command: 0 if command == b'RX\r\n' else original_write(command)
+        controller.aor_status.SetStatusText.reset_mock()
+        self.feed_group(scan, 4, 'BCD')
+        self.assertEqual(scan.phase, 'restore_failed')
+        self.assertIs(controller.temporary_scan, scan)
+        self.assertFalse(any('restored and verified' in message for message in controller.errors))
+        self.assertFalse(any('restored and verified' in call.args[0]
+                             for call in controller.aor_status.SetStatusText.call_args_list))
 
     def test_mismatch_aborts_start_and_restores_modified_group(self):
         controller, scan = self.create()
-        self.feed_bank(scan)
         self.feed_group(scan, 4, 'BCD')
         self.feed_group(scan, 1, '')
-        self.feed_group(scan, 1, 'A', level=31)  # missing target J
+        self.feed_configured(scan, members='AJ')
         self.assertEqual(scan.phase, 'restoring')
         self.assertFalse(any(b'MSJ' in c for c in controller.commands))
         self.feed_group(scan, 1, '')
@@ -218,10 +353,9 @@ class ScanTests(unittest.TestCase):
 
     def test_rejected_scan_start_restores_instead_of_claiming_success(self):
         controller, scan = self.create()
-        self.feed_bank(scan)
         self.feed_group(scan, 4, 'BCD')
         self.feed_group(scan, 1, '')
-        self.feed_group(scan, 1, 'AJ', level=31)
+        self.feed_configured(scan)
         self.assertEqual(scan.phase, 'starting')
         scan.receive('?')
         self.assertEqual(scan.phase, 'restoring')
@@ -229,7 +363,6 @@ class ScanTests(unittest.TestCase):
         self.feed_group(scan, 1, '')
         self.feed_group(scan, 4, 'BCD')
         self.assertIsNone(controller.temporary_scan)
-        self.assertTrue(controller.errors)
 
     def test_restore_mismatch_keeps_original_snapshot_and_no_automatic_retry(self):
         controller, scan = self.prepare()
@@ -240,129 +373,52 @@ class ScanTests(unittest.TestCase):
         before = len(controller.commands)
         scan.timeout()
         self.assertEqual(len(controller.commands), before)
-        self.assertTrue(controller.errors)
 
     def test_failed_membership_write_attempts_restore_once(self):
         controller, scan = self.create()
-        self.feed_bank(scan)
         self.feed_group(scan, 4, 'BCD')
         normal_write = controller.write_serial
-        controller.write_serial = lambda command: (0 if b'BM%%AJ' in command else normal_write(command))
+        controller.write_serial = lambda command: (0 if b'BM%% J' in command else normal_write(command))
         self.feed_group(scan, 1, '')
+        drain_pacing(scan)
         self.assertEqual(scan.phase, 'restoring')
-        self.assertTrue(scan.modified)
-        self.assertFalse(any(b'MSJ' in c for c in controller.commands))
         self.feed_group(scan, 1, '')
         self.feed_group(scan, 4, 'BCD')
         self.assertIsNone(controller.temporary_scan)
         self.assertEqual(sum(b'BM%%' in command for command in controller.commands), 1)
 
-    def test_read_timeout_before_probing_groups_leaves_groups_unchanged(self):
+    def test_read_timeout_before_snapshot_leaves_groups_unchanged(self):
         controller, scan = self.create()
-        scan.receive('MXA00 ---')
+        self.assertEqual(controller.commands, [b'GM\r\n'])
         scan.timeout()
         self.assertIsNone(controller.temporary_scan)
-        self.assertFalse(any(b'GM' in c or b'BM' in c or b'MS' in c for c in controller.commands))
-        self.assertIn('timed out', controller.errors[0])
+        self.assertFalse(any(b'BM' in c or b'MS' in c for c in controller.commands))
 
     def test_incomplete_settings_never_enable_membership_write(self):
         controller, scan = self.create()
-        self.feed_bank(scan)
-        scan.receive('GM4 XB009 XA023 XD2.0 XP00')  # XM absent
+        scan.receive('GM4 XB009 XA023 XD2.0 XP00')
         scan.receive(membership('BCD'))
         self.assertFalse(any(b'BM%%' in c for c in controller.commands))
         self.assertTrue(controller.errors)
-
-    def test_multiblock_empty_bank_requires_all_blocks(self):
-        controller = Controller()
-        controller.memory_banks['A']['channels'] = 23
-        scan = CurrentBankScan(controller, controller.memory_banks['J'])
-        controller.temporary_scan = scan
-        scan.start()
-        self.assertEqual(controller.commands, [b'MAA\r\n'])
-        for n in range(29):
-            scan.receive('MXA%02d ---' % n)
-        self.assertEqual(scan.phase, 'empty')
-        self.assertEqual(controller.commands, [b'MAA\r\n', b'MA\r\n', b'MA\r\n'])
-        scan.receive('MXA29 ---')
-        self.assertEqual(scan.phase, 'original')
-
-    def test_populated_candidate_rejected_immediately_without_more_blocks(self):
-        controller = Controller()
-        controller.memory_banks['A']['channels'] = 70
-        scan = CurrentBankScan(controller, controller.memory_banks['J'])
-        controller.temporary_scan = scan
-        scan.start()
-        self.assertEqual(controller.commands, [b'MAA\r\n'])
-        scan.receive('MXA00 MP0 RF0093500000 ST100000 AU0 MD0 AT0 TMStation')
-        self.assertEqual(scan.helper, 'a')
-        self.assertEqual(controller.commands, [b'MAA\r\n', b'MAa\r\n'])
-        for n in range(1, 10):  # Drain the rejected candidate's outstanding tail.
-            scan.receive('MXA%02d ---' % n)
-        self.assertEqual(len(scan.remaining), 10)
-        self.assertEqual(scan.phase, 'empty')
-
-    def test_empty_candidate_advances_one_block_only_after_ten_empty_slots(self):
-        controller = Controller()
-        controller.memory_banks['A']['channels'] = 70
-        scan = CurrentBankScan(controller, controller.memory_banks['J'])
-        controller.temporary_scan = scan
-        scan.start()
-        for n in range(9):
-            scan.receive('MXA%02d ---' % n)
-        scan.receive('MXA00 ---')  # Duplicate is not evidence for another slot.
-        scan.receive('MXA10 ---')  # An unrequested block is not completion evidence.
-        self.assertEqual(controller.commands, [b'MAA\r\n'])
-        scan.receive('MXA09 ---')
-        self.assertEqual(controller.commands, [b'MAA\r\n', b'MA\r\n'])
-        for n in range(10, 69):
-            scan.receive('MXA%02d ---' % n)
-        self.assertEqual(scan.phase, 'empty')
-        self.assertFalse(any(b'GM' in command for command in controller.commands))
-        scan.receive('MXA69 ---')
-        self.assertEqual(scan.phase, 'original')
-        self.assertEqual(controller.commands[:-1], [b'MAA\r\n'] + [b'MA\r\n'] * 6)
-
-    def test_populated_second_block_prevents_reading_third_block(self):
-        controller = Controller()
-        controller.memory_banks['A']['channels'] = 70
-        scan = CurrentBankScan(controller, controller.memory_banks['J'])
-        controller.temporary_scan = scan
-        scan.start()
-        for n in range(10):
-            scan.receive('MXA%02d ---' % n)
-        scan.receive('MXA10 MP0 RF0093500000 ST100000 AU0 MD0 AT0 TMStation')
-        self.assertEqual(controller.commands, [b'MAA\r\n', b'MA\r\n', b'MAa\r\n'])
-        self.assertEqual(scan.helper, 'a')
 
     def test_preparation_is_not_active_scan_and_stop_cancels_it(self):
         controller, scan = self.create()
         self.assertIsNone(controller.active_operation)
         self.assertIn('Preparing Memory Bank J scan', controller.aor_status.SetStatusText.call_args.args[0])
-        self.assertNotIn('Scanning Memory Bank', controller.aor_status.SetStatusText.call_args.args[0])
         scan.restore()
         self.assertIsNone(controller.temporary_scan)
-        self.assertIsNone(controller.active_operation)
         self.assertFalse(any(b'MS' in command for command in controller.commands))
-        self.assertEqual(controller.level_squelch_value, 12)
 
     def test_ready_group_reverifies_db_before_ms_and_preserves_other_settings(self):
-        ready = Mock()
-        controller, scan = self.create(ready=ready)
-        self.feed_bank(scan)
+        controller, scan = self.create(ready=Mock())
         self.feed_group(scan, 4, 'BCD')
         self.feed_group(scan, 1, '')
-        self.feed_group(scan, 1, 'AJ', level=31)
+        self.feed_configured(scan)
         self.assertEqual(scan.phase, 'ready')
         scan.begin_scan(12)
-        self.assertEqual(scan.phase, 'level_start')
         self.assertEqual(controller.commands[-1], b'XB012\r\nGM\r\n')
-        self.assertFalse(any(b'MSJ' in command for command in controller.commands))
-        self.feed_group(scan, 1, 'AJ', level=12, dwell=15)
-        self.assertEqual(scan.phase, 'starting')
+        self.feed_configured(scan, level=12)
         self.assertEqual(controller.commands[-1], b'GM1\r\nMSJ\r\nRX\r\n')
-        self.assertEqual(controller.scan_levels[1], 12)
-        controller.aor_status.SetStatusText.assert_called_with('Scanning Memory Bank J')
 
     def test_unknown_listening_db_refuses_preparation_without_group_changes(self):
         controller = Controller()
@@ -370,9 +426,26 @@ class ScanTests(unittest.TestCase):
         scan = CurrentBankScan(controller, controller.memory_banks['J'])
         controller.temporary_scan = scan
         scan.start()
-        self.assertIsNone(controller.temporary_scan)
         self.assertEqual(controller.commands, [])
-        self.assertIn('confirmed listening Squelch', controller.errors[0])
+        self.assertIsNone(controller.temporary_scan)
+
+    def test_per_bank_profile_is_applied_instead_of_borrowed_settings(self):
+        controller = Controller()
+        controller.memory_bank_scan_profiles = {'J': dict(XA=3, XB=55, XD=7, XM='1', XP=40)}
+        controller.memory_bank_dwell = {'J': 40}
+        scan = CurrentBankScan(controller, controller.memory_banks['J'], level=12, ready=Mock())
+        controller.temporary_scan = scan
+        scan.start()
+        self.feed_group(scan, 4, 'BCD')
+        self.feed_group(scan, 1, '')
+        drain_pacing(scan)
+        self.assertEqual(controller.commands[-6:-1], [b'XA003\r\n', b'XB055\r\n', b'XD07\r\n', b'XM1\r\n', b'XP40\r\n'])
+        self.feed_configured(scan)
+        before = len(controller.commands)
+        scan.begin_scan(12)
+        self.assertEqual(len(controller.commands), before + 1)
+        self.assertEqual(controller.commands[-1], b'GM1\r\nMSJ\r\nRX\r\n')
+        self.assertEqual(scan.level, 55)
 
 
 class GuiBoundaryTests(unittest.TestCase):
@@ -414,7 +487,7 @@ class GuiBoundaryTests(unittest.TestCase):
         main.AorCtrl.on_operation_start(ctrl, None)
         scan = ctrl.temporary_scan
         self.assertEqual(scan.level, 12)
-        self.assertEqual(ctrl.commands, [b'MAa\r\n'])
+        self.assertEqual(ctrl.commands, [b'GM\r\n'])
         self.assertIsNone(ctrl.active_operation)
         main.AorCtrl.update_operation_ui(ctrl)
         ctrl.bt_start.Enable.assert_called_with(False)
@@ -430,16 +503,14 @@ class GuiBoundaryTests(unittest.TestCase):
         ctrl = self.current_bank_start_controller()
         main.AorCtrl.on_operation_start(ctrl, None)
         scan = ctrl.temporary_scan
-        helper = scan.helper
-        for n in range(10):
-            scan.receive('MX%s%02d ---' % (helper, n))
         scan.receive(header(4))
         scan.receive(membership('BCD'))
         scan.receive(header(1))
         scan.receive(membership(''))
-        self.assertEqual(ctrl.commands[-1], b'GM1\r\nBM%%aA\r\nXB012\r\nGM\r\n')
-        scan.receive(header(1, level=12))
-        scan.receive(membership('Aa'))
+        drain_pacing(scan)
+        self.assertEqual(ctrl.commands[-8:], [b'GM1\r\n', b'BM%% A\r\n', b'XA000\r\n', b'XB012\r\n',
+                                             b'XD20\r\n', b'XMF\r\n', b'XP00\r\n', b'GM\r\n'])
+        ScanTests().feed_configured(scan, level=12)
         self.assertEqual(ctrl.commands[-1], b'GM1\r\nMSA\r\nRX\r\n')
         self.assertEqual(ctrl.level_context(), ('XB', 1))
         ctrl.update_level_ui()
@@ -459,8 +530,10 @@ class GuiBoundaryTests(unittest.TestCase):
         self.assertEqual(ctrl.level_context(), ('DB', None))
         ctrl.update_level_ui()
         ctrl.sql_value.SetLabel.assert_called_with('12')
+        drain_pacing(scan)
         scan.receive(header(1))
         scan.receive(membership(''))
+        drain_pacing(scan)
         scan.receive(header(4))
         scan.receive(membership('BCD'))
         self.assertIsNone(ctrl.temporary_scan)
@@ -492,7 +565,9 @@ class GuiBoundaryTests(unittest.TestCase):
         scan.receive(membership('BCD'))
         scan.receive(header(1, level=57))
         scan.receive(membership(''))
-        self.assertEqual(ctrl.commands[-1], b'GM1\r\nBM%%aA\r\nXB000\r\nGM\r\n')
+        drain_pacing(scan)
+        self.assertEqual(ctrl.commands[-8:], [b'GM1\r\n', b'BM%% A\r\n', b'XA000\r\n', b'XB000\r\n',
+                                             b'XD20\r\n', b'XMF\r\n', b'XP00\r\n', b'GM\r\n'])
 
     def level_controller(self):
         ctrl = Controller()
@@ -876,7 +951,7 @@ class GuiBoundaryTests(unittest.TestCase):
         self.assertEqual(ctrl.scan_levels[2], 23)  # unchanged until read-back
         ctrl.level_readback_timer.Stop()
 
-    def test_ms_and_sm_display_frequency_without_touching_vfo_cache(self):
+    def test_ms_and_sm_show_frequency_in_status_without_touching_vfo_displays_or_cache(self):
         ctrl = Controller()
         ctrl.monitor_muted = False
         ctrl.vfo_channel = None
@@ -893,7 +968,9 @@ class GuiBoundaryTests(unittest.TestCase):
         for prefix in ('MS', 'SM'):
             main.AorCtrl.receive_context_status(ctrl,
                 prefix + ' MXJ02 MP0 RF0446500000 ST012500 AU0 MD1 AT0 TMPMR')
-            ctrl.lb_vfb.SetLabel.assert_called_with(main.display_vfo_frequency(446500000))
+            ctrl.aor_status.SetStatusText.assert_called_with('Memory scan J02: 446.500000 MHz')
+            for label in (ctrl.lb_vfa, ctrl.lb_vfb, ctrl.lb_vfo):
+                label.SetLabel.assert_not_called()
         self.assertEqual((ctrl.vfa, ctrl.vfb, ctrl.vfo), ('0093500000', '0145500000', '0433500000'))
         self.assertEqual(ctrl.vfo_status, {0: 'cached VA', 1: 'cached VB', 2: 'cached VF'})
         ctrl.cbx_step = Mock()

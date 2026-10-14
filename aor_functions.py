@@ -443,6 +443,13 @@ def parse_group_members(text, kind):
     return tuple(bank for bank in banks if bank in members)
 
 
+def group_members_replacement(kind, members):
+    """Explicit replacement: a separator only when there are members."""
+    link = 'BM' if kind == 'scan' else 'BS'
+    joined = ''.join(members)
+    return (link + '%%' + (' ' + joined if joined else '') + '\r\n').encode('ascii')
+
+
 def make_group_members_command(kind, group, members):
     if kind not in ('scan', 'search') or not 1 <= group <= 9:
         raise ValueError('Group 0 is fixed LINK OFF; edit groups 1-9 only')
@@ -451,4 +458,5 @@ def make_group_members_command(kind, group, members):
         raise ValueError('Invalid group banks')
     select, link = ('GM', 'BM') if kind == 'scan' else ('GS', 'BS')
     ordered = ''.join(bank for bank in banks if bank in members)
-    return ('%s%d\r\n%s%%%%%s\r\n%s\r\n' % (select, group, link, ordered, link)).encode('ascii')
+    return (('%s%d\r\n' % (select, group)).encode('ascii') +
+            group_members_replacement(kind, ordered) + (link + '\r\n').encode('ascii'))
