@@ -156,9 +156,6 @@ class AorCtrlFrame(wx.Frame):
         self.range_mode.SetSelection(0)
         self.bank_source_panel = wx.Panel(self.operation_panel)
         self.search_bank_choice = wx.Choice(self.bank_source_panel)
-        for bank in 'ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst':
-            self.search_bank_choice.Append(bank, bank)
-        self.search_bank_choice.SetSelection(0)
         self.bt_newsearchbank = wx.Button(self.bank_source_panel, label="Create Stored Range...")
         self.bt_editsearchbank = wx.Button(self.bank_source_panel, label="Edit Stored Range...")
         self.search_source_panel = wx.Panel(self.operation_panel)

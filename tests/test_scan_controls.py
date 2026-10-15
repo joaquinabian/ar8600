@@ -444,6 +444,91 @@ class ScanControlLayoutTests(unittest.TestCase):
 
 
 class GuiActionTests(unittest.TestCase):
+    def test_idle_stored_range_settings_are_local_and_keep_db_unchanged(self):
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.operation_choice.SetSelection(1)
+            frame.source_choice.SetItems(['Manual Range', 'Stored Range', 'Linked Ranges'])
+            frame.source_choice.SetSelection(1)
+            frame.level_squelch_value = 255
+            frame.serial.write.reset_mock()
+            frame.open_operation_settings(None)
+            dialog = frame.settings_dialog
+            self.assertIsInstance(dialog, main.StoredRangeSettingsDialog)
+            self.assertIsNone(frame.temporary_scan)
+            self.assertEqual(frame.level_context(), ('DB', None))
+            self.assertEqual(dialog.values, dict(SA=0, SB=None, SD=20, SP=0))
+            dialog.controls['SB'].SetSelection(dialog.options['SB'].index(42))
+            dialog.controls['SP'].SetSelection(dialog.options['SP'].index(10))
+            dialog.on_changed(None)
+            dialog.on_save(None)
+            self.assertEqual(frame.stored_range_profiles['A'], dict(SA=0, SB=42, SD=20, SP=10))
+            frame.serial.write.assert_not_called()
+            self.assertIsNone(frame.active_operation)
+            self.assertEqual(frame.level_squelch_value, 255)
+            dialog.controls['SB'].SetSelection(0)
+            dialog.on_changed(None)
+            dialog.on_save(None)
+            self.assertIsNone(frame.stored_range_profiles['A']['SB'])
+        finally:
+            if frame.settings_dialog is not None:
+                frame.settings_dialog.Destroy()
+                frame.settings_dialog = None
+            self.close_search_test(frame)
+
+    def test_active_stored_range_settings_use_live_sb_and_save_session_override(self):
+        from stored_range_search import StoredRangeSearch
+        import test_stored_range_search as search_tests
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.operation_choice.SetSelection(1)
+            frame.source_choice.SetItems(['Manual Range', 'Stored Range', 'Linked Ranges'])
+            frame.source_choice.SetSelection(1)
+            frame.level_squelch_value = 255
+            # Drive the production state machine with an offline clock and mocked serial writes.
+            fake = search_tests.controller()
+            frame.scan_call_later = fake.scan_call_later
+            frame.on_start_search_bank(None, bank='A')
+            scan = frame.temporary_scan
+            self.assertIsInstance(scan, StoredRangeSearch)
+            search_tests.feed(scan, 0, '', level=0, voice=0, delay='2.0', dwell=0)
+            search_tests.feed(scan, 1, '')
+            search_tests.activate(frame, scan)
+            self.assertEqual(scan.phase, 'active')
+            self.assertEqual(frame.level_context(), ('SB', 1))
+            frame.serial.write.reset_mock()
+            frame.open_operation_settings(None)
+            dialog = frame.settings_dialog
+            self.assertNotIsInstance(dialog, main.StoredRangeSettingsDialog)
+            self.assertEqual((dialog.family, dialog.group), ('S', 1))
+            self.assertEqual(frame.serial.write.call_args.args[0], b'GS\r\n')
+            frame.set_group_response('GS1 SD2.0 SB 255 SA 000 SP00 AS0')
+            frame.set_group_response(search_tests.bs('A'))
+            dialog.controls['SB'].SetSelection(dialog.options['SB'].index(44))
+            dialog.controls['SA'].SetSelection(dialog.options['SA'].index(2))
+            dialog.on_changed(None)
+            frame.serial.write.reset_mock()
+            dialog.on_save(None)
+            self.assertEqual([call.args[0] for call in frame.serial.write.call_args_list],
+                             [b'SB044\r\nSA002\r\n', b'GS\r\n'])
+            frame.set_group_response('GS1 SD2.0 SB 044 SA 002 SP00 AS0')
+            frame.set_group_response(search_tests.bs('A'))
+            self.assertEqual(frame.stored_range_profiles['A'], dict(SA=2, SB=44, SD=20, SP=0))
+            self.assertEqual(frame.sql.GetValue(), 44)
+            self.assertEqual(frame.level_squelch_value, 255)
+            self.assertEqual(scan.saved['values']['SB'], 7)
+            self.assertEqual(scan.phase, 'active')
+        finally:
+            if frame.settings_dialog is not None:
+                frame.settings_dialog.Destroy()
+                frame.settings_dialog = None
+            if frame.temporary_scan is not None:
+                frame.temporary_scan.cancel_sequence()
+                frame.temporary_scan.timer.Stop()
+            frame.temporary_scan = None
+            self.close_search_test(frame)
     @classmethod
     def setUpClass(cls):
         cls.app = wx.GetApp() or wx.App(False)
@@ -575,6 +660,222 @@ class GuiActionTests(unittest.TestCase):
         frame.alive.set()
         frame.serial.write = Mock(side_effect=len)
         return frame
+
+    def seed_search_banks(self, frame):
+        frame.current_list_view = lambda: 'LOG VIEW'
+        for line in ('SRA SL0001500000 SU0001700000 ST009000 AU0 MD2 AT0 TTMW',
+                     'SRB ---',
+                     'SRC SL0118000000 SU0137000000 ST012500 AU0 MD2 AT0 TTC',
+                     'SRa ---'):
+            frame.set_search_banks(line)
+
+    def close_search_test(self, frame):
+        if frame.search_bank_dialog is not None:
+            frame.search_bank_dialog.Destroy()
+            frame.search_bank_dialog = None
+        frame.alive.clear()
+        frame.serial.is_open = False
+
+    def test_stored_range_selector_contains_only_known_populated_banks_and_preserves_identity(self):
+        frame = self.connected_frame()
+        try:
+            self.assertEqual(frame.search_bank_choice.GetCount(), 0)
+            self.seed_search_banks(frame)
+            self.assertEqual(frame.search_bank_choice.GetItems(), ['MW', 'Unnamed range'])
+            self.assertEqual([frame.search_bank_choice.GetClientData(n) for n in range(2)], ['A', 'C'])
+            frame.search_bank_choice.SetSelection(1)
+            frame.set_search_banks('SRD SL0001500000 SU0001700000 ST009000 AU0 MD2 AT0 TTMW')
+            frame.set_search_banks('SRC SL0118000000 SU0137000000 ST012500 AU0 MD2 AT0 TTAIR')
+            self.assertEqual(frame.search_bank_choice.GetItems(), ['MW', 'AIR', 'MW'])
+            index = frame.search_bank_choice.GetSelection()
+            self.assertEqual(frame.search_bank_choice.GetClientData(index), 'C')
+            frame.update_search_bank_choices()
+            self.assertEqual(frame.search_bank_choice.GetClientData(frame.search_bank_choice.GetSelection()), 'C')
+        finally:
+            self.close_search_test(frame)
+
+    def test_duplicate_named_ranges_start_correct_internal_bank_and_preserve_selection(self):
+        import test_stored_range_search as search_tests
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.set_search_banks('SRD SL0001500000 SU0001700000 ST009000 AU0 MD2 AT0 TTMW')
+            frame.operation_choice.SetSelection(1)
+            frame.source_choice.SetItems(['Manual Range', 'Stored Range', 'Linked Ranges'])
+            frame.source_choice.SetSelection(1)
+            frame.level_squelch_value = 255
+            frame.scan_call_later = search_tests.controller().scan_call_later
+            for bank in ('A', 'D'):
+                index = next(n for n in range(frame.search_bank_choice.GetCount())
+                             if frame.search_bank_choice.GetClientData(n) == bank)
+                frame.search_bank_choice.SetSelection(index)
+                self.assertEqual(frame.search_bank_choice.GetStringSelection(), 'MW')
+                frame.active_operation = None
+                frame.serial.write.reset_mock()
+                frame.on_operation_start(None)
+                scan = frame.temporary_scan
+                self.assertEqual(scan.target, bank)
+                search_tests.feed(scan, 0, '', level=0, voice=0, delay='2.0', dwell=0)
+                search_tests.feed(scan, 1, '')
+                scan_tests.drain_pacing(scan)
+                scan.receive('GS1 SD2.0 SB 255 SA 000 SP00 AS0')
+                scan.receive(search_tests.bs(bank))
+                scan_tests.drain_pacing(scan)
+                self.assertEqual([call.args[0] for call in frame.serial.write.call_args_list][-3:],
+                                 [b'GS1\r\n', ('SS%s\r\n' % bank).encode('ascii'), b'RX\r\n'])
+                scan.cancel_sequence()
+                scan.timer.Stop()
+                frame.temporary_scan = None
+            frame.update_search_bank_choices()
+            self.assertEqual(frame.search_bank_choice.GetClientData(frame.search_bank_choice.GetSelection()), 'D')
+            self.assertEqual(frame.search_bank_choice.GetStringSelection(), 'MW')
+        finally:
+            self.close_search_test(frame)
+
+    def test_named_list_rows_edit_correct_fixed_bank_without_parsing_the_visible_name(self):
+        frame = self.connected_frame()
+        try:
+            frame.current_list_view = lambda: 'SEARCH BANKS'
+            frame.prepare_list((('Stored Range', 85), ('Lower', 125), ('Upper', 125), ('Step', 100),
+                                ('Auto', 45), ('Mode', 55), ('Att', 40), ('Name', 130)))
+            for bank in ('A', 'D'):
+                frame.set_search_banks('SR%s SL0001500000 SU0001700000 ST009000 AU0 MD2 AT0 TTMW' % bank)
+                self.assertEqual(frame.edit_list.list.GetItemText(frame.search_bank_rows[bank]), 'MW')
+            row = frame.search_bank_rows['D']
+            frame.edit_list.list.Select(row)
+            self.assertEqual(frame.selected_search_bank(), 'D')
+            def choose_edit(menu):
+                item = menu.GetMenuItems()[0]
+                menu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, item.GetId()))
+            with patch.object(frame.edit_list.list, 'PopupMenu', side_effect=choose_edit):
+                frame.open_menu(SimpleNamespace(GetIndex=lambda: row))
+            dialog = frame.search_bank_dialog
+            self.assertEqual(dialog.GetTitle(), 'Edit Stored Range - MW')
+            self.assertEqual(dialog.bank.GetItems(), ['MW'])
+            self.assertEqual(dialog.selected_bank(), 'D')
+            self.assertFalse(dialog.bank.IsEnabled())
+            self.assertNotIn('[D]', dialog.GetTitle())
+            frame.set_search_banks('SRD SL0001500000 SU0001700000 ST009000 AU0 MD2 AT0 TTMW')
+            dialog.name.SetValue('MW UPDATED')
+            dialog.on_save(None)
+            self.assertTrue(frame.serial.write.call_args.args[0].startswith(b'SED '))
+            self.assertTrue(frame.serial.write.call_args.args[0].endswith(b'\r\nSRD\r\n'))
+        finally:
+            self.close_search_test(frame)
+
+    def test_create_dialog_offers_empty_slots_only_and_no_overwrite_on_changed_state(self):
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.open_search_bank(create=True)
+            dialog = frame.search_bank_dialog
+            self.assertTrue(dialog.creating)
+            self.assertEqual(dialog.bank.GetItems(), ['B', 'a'])
+            self.assertEqual(frame.serial.write.call_args.args[0], b'SRB\r\n')
+            frame.set_search_banks('SRB ---')
+            dialog.bank.SetStringSelection('a')
+            dialog.on_bank(None)
+            self.assertEqual(frame.serial.write.call_args.args[0], b'SRa\r\n')
+            frame.set_search_banks('SRa ---')
+            dialog.lower.SetValue('5')
+            dialog.upper.SetValue('6')
+            dialog.name.SetValue('Test')
+            frame.search_banks['a'] = dict(bank='a', empty=False)  # Occupied after the dialog opened.
+            frame.serial.write.reset_mock()
+            dialog.on_save(None)
+            frame.serial.write.assert_not_called()
+            self.assertFalse(dialog.save.IsEnabled())
+            self.assertIn('Slot state changed', dialog.message.GetLabel())
+        finally:
+            self.close_search_test(frame)
+
+    def test_create_refuses_when_no_confirmed_empty_slots_exist(self):
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.search_banks = {bank: entry for bank, entry in frame.search_banks.items() if not entry['empty']}
+            frame.open_search_bank(create=True)
+            self.assertIsNone(frame.search_bank_dialog)
+            self.assertEqual(frame.aor_status.GetStatusText(), 'No empty Stored Range slots are available.')
+            frame.search_banks.clear()  # Unknown slots must not be offered as empty.
+            frame.open_search_bank(create=True)
+            self.assertIsNone(frame.search_bank_dialog)
+        finally:
+            self.close_search_test(frame)
+
+    def test_edit_is_fixed_to_populated_bank_and_never_becomes_create(self):
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.open_search_bank(bank='B')
+            self.assertIsNone(frame.search_bank_dialog)
+            frame.operation_choice.SetSelection(1)
+            frame.source_choice.SetItems(['Manual Range', 'Stored Range', 'Linked Ranges'])
+            frame.source_choice.SetSelection(1)
+            frame.search_bank_choice.SetSelection(0)
+            frame.open_search_bank()  # Operation selector uses the internal client-data ID.
+            dialog = frame.search_bank_dialog
+            self.assertFalse(dialog.creating)
+            self.assertEqual(dialog.bank.GetItems(), ['MW'])
+            self.assertFalse(dialog.bank.IsEnabled())
+            self.assertEqual(dialog.GetTitle(), 'Edit Stored Range - MW')
+            self.assertEqual(dialog.selected_bank(), 'A')
+            self.assertNotIn('[A]', dialog.GetTitle())
+            frame.set_search_banks('SRA SL0001500000 SU0001700000 ST009000 AU0 MD2 AT0 TTMW')
+            self.assertTrue(dialog.save.IsEnabled())
+            frame.set_search_banks('SRA ---')
+            dialog.show_bank(frame.search_banks['A'])
+            self.assertFalse(dialog.save.IsEnabled())
+            self.assertFalse(dialog.creating)
+        finally:
+            self.close_search_test(frame)
+
+    def test_unknown_stored_ranges_have_no_placeholder_selection_and_start_is_safe(self):
+        frame = self.connected_frame()
+        try:
+            frame.operation_choice.SetSelection(1)
+            frame.source_choice.SetItems(['Manual Range', 'Stored Range', 'Linked Ranges'])
+            frame.source_choice.SetSelection(1)
+            self.assertEqual(frame.search_bank_choice.GetSelection(), wx.NOT_FOUND)
+            frame.on_operation_start(None)
+            frame.serial.write.assert_not_called()
+            self.assertIsNone(frame.active_operation)
+            frame.on_search_source_changed(None)
+            frame.serial.write.assert_not_called()
+        finally:
+            self.close_search_test(frame)
+
+    def test_create_readback_moves_slot_to_populated_selector_and_updates_visible_list(self):
+        frame = self.connected_frame()
+        try:
+            self.seed_search_banks(frame)
+            frame.current_list_view = lambda: 'SEARCH BANKS'
+            frame.prepare_list((('Bank', 60), ('Lower', 120), ('Upper', 120), ('Step', 90),
+                                ('Auto', 45), ('Mode', 55), ('Att', 45), ('Name', 140)))
+            frame.open_search_bank(create=True)
+            dialog = frame.search_bank_dialog
+            frame.set_search_banks('SRB ---')
+            dialog.lower.SetValue('5')
+            dialog.upper.SetValue('6')
+            dialog.name.SetValue('TEST RANGE')
+            frame.serial.write.reset_mock()
+            dialog.on_save(None)
+            self.assertEqual(frame.serial.write.call_args.args[0],
+                             b'SEB SL0005000000 SU0006000000 AU1 TTTEST RANGE\r\nSRB\r\n')
+            frame.set_search_banks('SRB SL0005000000 SU0006000000 ST005000 AU1 MD2 AT0 TTTEST RANGE')
+            self.assertFalse(frame.search_banks['B']['empty'])
+            self.assertNotIn('B', frame.search_bank_slots(True))
+            self.assertEqual(frame.search_bank_choice.GetStringSelection(), 'TEST RANGE')
+            self.assertEqual(frame.search_bank_choice.GetClientData(frame.search_bank_choice.GetSelection()), 'B')
+            row = frame.search_bank_rows['B']
+            self.assertEqual(frame.edit_list.list.GetItemText(row, 7), 'TEST RANGE')
+            self.assertEqual(frame.edit_list.list.GetFirstSelected(), row)
+            self.assertFalse(dialog.creating)
+            self.assertEqual(dialog.bank.GetItems(), ['TEST RANGE'])
+            self.assertEqual(dialog.selected_bank(), 'B')
+            self.assertFalse(dialog.bank.IsEnabled())
+        finally:
+            self.close_search_test(frame)
 
     def test_shared_group_master_checkbox_changes_proposal_only_for_both_group_kinds(self):
         frame = self.connected_frame()

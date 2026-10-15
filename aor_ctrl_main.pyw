@@ -28,6 +28,7 @@ from aor_functions import (search_parameters, make_search_bank_command, parse_se
 from aor_functions import receiver_frequency_hz, search_step_hz
 from aor_memory_csv import read_csv, export_record, COLUMNS as MEMORY_CSV_COLUMNS, BankImport
 from current_bank_scan import CurrentBankScan
+from stored_range_search import StoredRangeSearch, DEFAULT_PROFILE as STORED_RANGE_DEFAULT_PROFILE
 from command_console import CommandConsole
 from keyboard_focus import MainKeyboardFocus
 
@@ -752,11 +753,17 @@ class MemoryChannelDialog(wx.Dialog):
 
 
 class SearchBankDialog(wx.Dialog):
-    def __init__(self, controller, bank):
-        super().__init__(controller, title='Create / Edit Stored Range (Search Bank)')
-        self.controller = controller
-        self.bank = wx.Choice(self, choices=list('ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst'))
-        self.bank.SetStringSelection(bank)
+    def __init__(self, controller, bank, create=False):
+        title = ('Create Stored Range (Search Bank %s)' % bank if create else
+                 'Edit Stored Range - ' + controller.search_bank_label(bank))
+        super().__init__(controller, title=title)
+        self.controller, self.creating = controller, create
+        self.bank = wx.Choice(self)
+        for slot in controller.search_bank_slots(True) if create else [bank]:
+            self.bank.Append(slot if create else controller.search_bank_label(slot), slot)
+            if slot == bank:
+                self.bank.SetSelection(self.bank.GetCount() - 1)
+        self.bank.Enable(create)
         self.lower = wx.TextCtrl(self)
         self.upper = wx.TextCtrl(self)
         self.step = wx.TextCtrl(self, value='100')
@@ -766,13 +773,17 @@ class SearchBankDialog(wx.Dialog):
         self.name.SetMaxLength(12)
         grid = wx.FlexGridSizer(0, 2, 6, 8)
         for label, control, tip in (
-                ('Stored Range', self.bank, 'AR8600 Search Bank to create or edit; A-T or a-t.'),
+                ('Search Bank slot' if create else 'Stored Range', self.bank,
+                 'Choose a confirmed empty slot.' if create else 'This stored range is fixed while editing.'),
                 ('Lower MHz', self.lower, 'Lower limit of this stored frequency range.'),
                 ('Upper MHz', self.upper, 'Upper limit, greater than Lower.'),
                 ('Step kHz', self.step, 'Manual tuning step; Auto follows the scanner bandplan.'),
                 ('Mode / Auto', self.mode, 'Choose modulation or the scanner automatic mode/step.'),
                 ('Name', self.name, 'Up to 12 printable ASCII characters identifying this Search Bank.')):
-            grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            caption = wx.StaticText(self, label=label)
+            if control is self.bank:
+                self.bank_caption = caption
+            grid.Add(caption, 0, wx.ALIGN_CENTER_VERTICAL)
             grid.Add(control, 1, wx.EXPAND)
             control.SetToolTip(tip)
         self.message = wx.StaticText(self, label='Reading scanner values. Existing attenuation is retained.')
@@ -788,14 +799,32 @@ class SearchBankDialog(wx.Dialog):
         self.save.Bind(wx.EVT_BUTTON, self.on_save)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
+    def selected_bank(self):
+        index = self.bank.GetSelection()
+        return self.bank.GetClientData(index) if index != wx.NOT_FOUND else None
+
     def on_bank(self, event):
         self.save.Disable()
         self.message.SetLabel('Reading scanner values...')
-        self.controller.edit_bank_pending = self.bank.GetStringSelection()
+        bank = self.selected_bank()
+        if not bank:
+            return
+        self.controller.edit_bank_pending = bank
         self.controller.write_serial(('SR%s\r\n' % self.controller.edit_bank_pending).encode('ascii'))
 
-    def show_bank(self, entry):
-        if self.bank.GetStringSelection() != entry['bank']:
+    def show_bank(self, entry, written=False):
+        if self.selected_bank() != entry['bank']:
+            return
+        if self.creating and not entry['empty']:
+            if not written:
+                self.save.Disable()
+                self.message.SetLabel('This slot is no longer empty. Choose another empty Stored Range slot.')
+                return
+            self.creating = False
+            self.bank_caption.SetLabel('Stored Range')
+        elif not self.creating and entry['empty']:
+            self.save.Disable()
+            self.message.SetLabel('This Stored Range is empty. Close Edit and use Create Stored Range.')
             return
         if entry['empty']:
             self.lower.ChangeValue('')
@@ -804,28 +833,56 @@ class SearchBankDialog(wx.Dialog):
             self.mode.SetSelection(0)
             self.name.ChangeValue('')
         else:
+            self.bank.Clear()
+            self.bank.Append(self.controller.search_bank_label(entry['bank']), entry['bank'])
+            self.bank.SetSelection(0)
+            self.SetTitle('Edit Stored Range - ' + self.controller.search_bank_label(entry['bank']))
             self.lower.ChangeValue('%.6f' % (entry['lower_hz'] / 1000000))
             self.upper.ChangeValue('%.6f' % (entry['upper_hz'] / 1000000))
             self.step.ChangeValue(format(entry['step_khz'], 'f'))
             self.mode.SetSelection(0 if entry['auto'] else MD_TO_GUI_MODE[entry['mode']] + 1)
             self.name.ChangeValue(entry['name'])
         self.save.Enable(self.controller.connected)
+        self.bank.Enable(self.creating)
         self.message.SetLabel('Scanner values received. Attenuation is retained when saving.')
+
+    def refresh_empty_choices(self):
+        if not self.creating:
+            return
+        bank = self.selected_bank()
+        choices = self.controller.search_bank_slots(True)
+        self.bank.Clear()
+        for slot in choices:
+            self.bank.Append(slot, slot)
+        if bank in choices:
+            self.bank.SetSelection(choices.index(bank))
+        else:
+            self.bank.SetSelection(wx.NOT_FOUND)
+            self.save.Disable()
+            self.message.SetLabel('Choose an empty Stored Range slot.' if choices else
+                                  'No empty Stored Range slots are available.')
 
     def on_save(self, event):
         if not self.controller.connected or self.controller.bank_write_pending is not None:
             return
+        bank = self.selected_bank()
+        entry = self.controller.search_banks.get(bank)
+        if entry is None or entry.get('empty') is not self.creating:
+            self.save.Disable()
+            self.message.SetLabel('Slot state changed; refresh before saving. No range was written.')
+            return
         selection = self.mode.GetSelection()
         code = None if selection == 0 else GUI_MODE_TO_MD[selection - 1]
         try:
-            command = make_search_bank_command(self.bank.GetStringSelection(), self.lower.GetValue(),
+            command = make_search_bank_command(self.selected_bank(), self.lower.GetValue(),
                                                self.upper.GetValue(), self.step.GetValue(), code, self.name.GetValue())
         except ValueError as error:
             self.message.SetLabel(str(error))
             self.Fit()
             return
-        bank = self.bank.GetStringSelection()
+        bank = self.selected_bank()
         self.controller.bank_write_pending = bank
+        self.bank.Disable()
         self.save.Disable()
         self.message.SetLabel('Write requested; waiting for scanner read-back...')
         self.controller.write_serial(command + ('SR%s\r\n' % bank).encode('ascii'))
@@ -934,6 +991,10 @@ class OperationSettingsDialog(wx.Dialog):
                                    'Applies to %s group %s%s' %
                                    ('Linked Memory Banks' if self.family == 'X' else 'Linked Ranges',
                                     self.group, ' - fixed, read-only' if self.group == 0 else ''))
+        scan = self.controller.temporary_scan
+        if self.family == 'S' and getattr(scan, 'kind', None) == 'search' and self.group == scan.group:
+            self.context_label.SetLabel('Applies to Stored Range %s (temporary Search Group %d)' %
+                                       (self.controller.search_bank_label(scan.target), self.group))
         if not complete:
             return
         self.timer.Stop()
@@ -951,6 +1012,12 @@ class OperationSettingsDialog(wx.Dialog):
                     profile[key] = self.values[key]
                 if 'XB' in self.changed_settings:
                     profile['XB'] = self.values['XB']
+            if matched and self.family == 'S' and getattr(scan, 'kind', None) == 'search' and self.group == scan.group:
+                profile = self.controller.stored_range_profiles.setdefault(scan.target, dict(scan.profile))
+                for key in ('SA', 'SD', 'SP'):
+                    profile[key] = self.values[key]
+                if 'SB' in self.changed_settings:
+                    profile['SB'] = self.values['SB']
             self.message.SetLabel('Settings saved and verified.' if matched else
                                   'Verification failed; controls show scanner-returned values.')
             self.expected = None
@@ -1010,6 +1077,54 @@ class OperationSettingsDialog(wx.Dialog):
         self.Destroy()
 
 
+class StoredRangeSettingsDialog(OperationSettingsDialog):
+    """Idle Stored Range settings are a local profile, never a group query/write."""
+    def __init__(self, controller, bank):
+        self.profile_bank = bank
+        super().__init__(controller, 'S', None)
+        self.options['SB'].insert(0, None)
+        self.controls['SB'].Insert('Follow current Squelch at Start', 0)
+        self.controls['SB'].SetMinSize((230, -1))
+        self.save.SetLabel('Save profile')
+        self.save.SetToolTip('Save these session settings; Start applies them to a temporary Search Group.')
+        self.refresh.SetLabel('Reload profile')
+        self.SetTitle('Stored Range Settings - ' + controller.search_bank_label(bank))
+        self.Fit()
+
+    def read(self, event=None):
+        self.timer.Stop()
+        self.values.clear()
+        self.expected = None
+        self.context_confirmed = True
+        profile = dict(STORED_RANGE_DEFAULT_PROFILE)
+        profile.update(self.controller.stored_range_profiles.get(self.profile_bank, {}))
+        for key, value in profile.items():
+            OperationSettingsDialog.accept(self, key, value)
+
+    def accept(self, key, value):
+        pass  # Unrelated scanner replies must not overwrite this local profile.
+
+    def accept_context(self, kind, group):
+        pass
+
+    def update(self):
+        super().update()
+        self.context_label.SetLabel('Session profile for ' + self.controller.search_bank_label(self.profile_bank))
+        self.message.SetLabel('Applied when this Stored Range starts; no scanner context is changed here.')
+        self.message.Wrap(360)
+
+    def on_save(self, event):
+        if not self.save.IsEnabled():
+            return
+        if self.controller.active_operation is not None or self.controller.temporary_scan is not None:
+            self.message.SetLabel('Operation context changed; reopen Settings before saving.')
+            self.save.Disable()
+            return
+        self.controller.stored_range_profiles[self.profile_bank] = self.proposed()
+        self.read()
+        self.message.SetLabel('Session profile saved. Start applies it to this Stored Range.')
+
+
 class AorCtrl(AorCtrlFrame):
     """Simple terminal program for wxPython"""
 
@@ -1052,6 +1167,8 @@ class AorCtrl(AorCtrlFrame):
         self.receiver_switch_pending = set()
         self.afc_mode = None
         self.search_banks = {}
+        self.stored_range_profiles = {}
+        self.search_levels = {}
         self.search_bank_rows = {}
         self.search_bank_dialog = None
         self.edit_bank_pending = None
@@ -1490,7 +1607,10 @@ class AorCtrl(AorCtrlFrame):
             self.pending_memory_channels.clear()
             self.prepare_list((('Stored Range', 85), ('Lower', 125), ('Upper', 125), ('Step', 100),
                                ('Auto', 45), ('Mode', 55), ('ATT', 40), ('Name', 130)))
-        bank = self.search_bank_choice.GetClientData(self.search_bank_choice.GetSelection())
+        index = self.search_bank_choice.GetSelection()
+        if index == wx.NOT_FOUND:
+            return
+        bank = self.search_bank_choice.GetClientData(index)
         self.write_serial(('SR%s\r\n' % bank).encode('ascii'))
         self.update_connection_ui()
 
@@ -1519,13 +1639,13 @@ class AorCtrl(AorCtrlFrame):
         elif source == 'Range':
             started = self.on_vfo_start(event)
         elif source == 'Search Bank':
-            bank = self.search_bank_choice.GetClientData(self.search_bank_choice.GetSelection())
+            bank = self.selected_search_bank()
             started = self.on_start_search_bank(event, bank=bank)
         else:
             started = self.on_group_search(event)
         if started:
             self.active_operation = (operation, source)
-            if operation == 'Memory Scan':
+            if operation == 'Memory Scan' or source == 'Search Group':
                 self.refresh_level_context()
             self.operation_signal_open = False
             self.show_now_receiving()
@@ -1675,6 +1795,8 @@ class AorCtrl(AorCtrlFrame):
             return ('X', group)
         if source == 'Range':
             return ('D', None)
+        if source == 'Search Bank' and getattr(scan, 'kind', None) == 'search':
+            return ('S', scan.group)
         group = self.group_response['search'] if self.active_operation is not None else int(self.cbx_search.GetValue()) if source == 'Search Group' else None
         return ('S', group)
 
@@ -1692,6 +1814,16 @@ class AorCtrl(AorCtrlFrame):
                 self.memory_bank_transfer is not None or not self.operation_settings_available()):
             return
         operation, source = self.active_operation or self.operation_selection()
+        if operation == 'Frequency Search' and source == 'Search Bank' and self.active_operation is None:
+            bank = self.selected_search_bank()
+            if bank not in self.search_bank_slots(False):
+                self.aor_status.SetStatusText('Choose a populated Stored Range for local settings.')
+                return
+            self.settings_dialog = StoredRangeSettingsDialog(self, bank)
+            self.settings_dialog.Show()
+            self.settings_dialog.read()
+            self.update_connection_ui()
+            return
         family, group = self.operation_settings_context()
         if operation == 'Memory Scan' and self.level_vfo_context:
             self.level_vfo_context = False
@@ -1712,6 +1844,10 @@ class AorCtrl(AorCtrlFrame):
         key, value = parse_operation_parameter(text)
         if key == 'DB':
             self.level_squelch_value = value
+        elif key == 'SB':
+            group = self.group_response['search']
+            if group is not None:
+                self.search_levels[group] = value
         elif key == 'XB':
             group = self.group_response['scan']
             if group is not None:
@@ -1719,7 +1855,7 @@ class AorCtrl(AorCtrlFrame):
                 if self.temporary_scan is not None and self.temporary_scan.group == group:
                     self.current_scan_level = value
         context = self.level_context()
-        if key == context[0] and (key == 'DB' or self.group_response['scan'] == context[1]):
+        if key == context[0] and (key == 'DB' or self.group_response['search' if key == 'SB' else 'scan'] == context[1]):
             flight = self.level_in_flight
             self.level_squelch_pending = False
             self.level_in_flight = None
@@ -1783,7 +1919,7 @@ class AorCtrl(AorCtrlFrame):
                 # on the next connection; report the unverified restoration.
                 self.scan_recovery = self.temporary_scan
                 self.temporary_scan = None
-                self.report_scan_error('Scan Group restoration was NOT verified; original state held only in this session for reconnect recovery.')
+                self.report_scan_error('Temporary group restoration was NOT verified; original state held only in this session for reconnect recovery.')
             if self.temporary_scan is None and callback is not None:
                 callback()
         # One deferred close/disconnect/source action, never several concurrent restores.
@@ -1798,7 +1934,15 @@ class AorCtrl(AorCtrlFrame):
         scan.restore(restored)
 
     def level_context(self):
-        operation, source = self.operation_selection()
+        operation, source = self.active_operation or self.operation_selection()
+        scan = self.temporary_scan
+        if getattr(scan, 'kind', None) == 'search':
+            if scan.phase in ('configured', 'starting', 'active') and scan.group is not None:
+                return ('SB', scan.group)
+            return ('DB', None)
+        if self.active_operation is not None and operation == 'Frequency Search' and source == 'Search Group':
+            return ('SB', int(self.cbx_search.GetValue()))
+
         if getattr(self, 'level_vfo_context', False) or operation != 'Memory Scan':
             return ('DB', None)
         if source == 'Current Bank':
@@ -1815,11 +1959,11 @@ class AorCtrl(AorCtrlFrame):
 
     def displayed_level(self):
         key, group = self.level_context()
-        if key == 'XB' and group is None:
+        if key in ('XB', 'SB') and group is None:
             return None  # No scanner-confirmed group exists yet.
-        if key == 'XB' and group is not None and self.group_response['scan'] != group:
+        if key in ('XB', 'SB') and group is not None and self.group_response['search' if key == 'SB' else 'scan'] != group:
             return None
-        return self.level_squelch_value if key == 'DB' else self.scan_levels.get(group)
+        return self.level_squelch_value if key == 'DB' else (self.search_levels if key == 'SB' else self.scan_levels).get(group)
 
     def update_level_ui(self):
         key, group = self.level_context()
@@ -1838,8 +1982,8 @@ class AorCtrl(AorCtrlFrame):
                         self.memory_inventory is None and self.memory_bank_transfer is None and
                         not synchronizing and not scan_busy and
                         confirmed is not None and
-                        not (key == 'XB' and self.group_loading['scan'] is not None) and
-                        not (key == 'XB' and group == 0))
+                        not (key in ('XB', 'SB') and self.group_loading['search' if key == 'SB' else 'scan'] is not None) and
+                        not (key in ('XB', 'SB') and group == 0))
         keyboard = getattr(self, 'keyboard_focus', None)
         if keyboard is None:
             self.sql.Enable(enabled)
@@ -1863,6 +2007,17 @@ class AorCtrl(AorCtrlFrame):
             self.update_level_ui()
             if self.write_serial(b'DB\r\n') != 4:
                 self.fail_level_edit('Squelch query failed; value was not verified.')
+            else:
+                self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
+        elif key == 'SB':
+            if group is None or group == 0 or self.temporary_scan is not None and self.temporary_scan.busy:
+                self.update_level_ui()
+                return
+            self.level_squelch_pending = True
+            self.update_level_ui()
+            command = b'SB\r\n' if self.group_response['search'] == group else b'GS\r\n'
+            if self.write_serial(command) != len(command):
+                self.fail_level_edit('Search Squelch query failed; value was not verified.')
             else:
                 self.level_readback_timer = self.scan_call_later(5000, self.on_level_readback_timeout)
         elif group is not None and self.temporary_scan is not None:
@@ -2218,12 +2373,12 @@ class AorCtrl(AorCtrlFrame):
             self.update_operation_ui()
             return
         key, group = self.level_context()
-        if key == 'XB' and group is None:
+        if key in ('XB', 'SB') and group is None:
             # Do not accept an edit until a real group value has been read.
             self.update_level_ui()
             self.update_operation_ui()
             return
-        if key == 'XB' and (group == 0 or self.temporary_scan is not None and self.temporary_scan.busy):
+        if key in ('XB', 'SB') and (group == 0 or self.temporary_scan is not None and self.temporary_scan.busy):
             return
         if self.displayed_level() is None:
             self.aor_status.SetStatusText('Wait for the current squelch read-back.')
@@ -2288,6 +2443,7 @@ class AorCtrl(AorCtrlFrame):
         self.clear_level_edits()
         self.level_squelch_value = None
         self.scan_levels.clear()
+        self.search_levels.clear()
         self.receiver_switches = {'NL': None, 'AF': None}
         self.receiver_switch_pending.clear()
         self.afc_mode = None
@@ -2492,13 +2648,13 @@ class AorCtrl(AorCtrlFrame):
             self.open_memory_flag_menu(event.GetIndex())
             return
         if view == 'SEARCH BANKS':
-            bank = self.edit_list.list.GetItemText(event.GetIndex())
+            bank = self.search_bank_for_row(event.GetIndex())
             entry = self.search_banks.get(bank)
             if entry is None:
                 return
             menu = wx.Menu()
             edit = menu.Append(wx.ID_ANY, 'Edit Stored Range...')
-            edit.Enable(self.connected and self.serial.is_open)
+            edit.Enable(self.connected and self.serial.is_open and not entry['empty'])
             menu.Bind(wx.EVT_MENU, lambda evt: self.open_search_bank(bank=bank), id=edit.GetId())
             self.edit_list.list.PopupMenu(menu)
             menu.Destroy()
@@ -2719,9 +2875,7 @@ class AorCtrl(AorCtrlFrame):
         if self.current_list_view() == 'SEARCH BANKS':
             row = self.edit_list.list.GetFirstSelected()
             if row != wx.NOT_FOUND:
-                bank = self.edit_list.list.GetItemText(row)
-                if re.fullmatch(r'[A-Ta-t]', bank):
-                    return bank
+                return self.search_bank_for_row(row)
 
     def choose_start_bank(self, kind):
         group = int((self.cbx_scan if kind == 'scan' else self.cbx_search).GetValue())
@@ -2755,30 +2909,68 @@ class AorCtrl(AorCtrlFrame):
                 command = ('GS%s\r\nSS%s\r\nRX\r\n' % (self.cbx_search.GetValue(), bank)).encode('ascii')
                 return self.write_serial(command) == len(command)
 
+    def search_bank_label(self, bank):
+        name = self.search_banks.get(bank, {}).get('name', '').strip()
+        return name if name and name.casefold() != bank.casefold() else 'Unnamed range'
+
+    def search_bank_for_row(self, row):
+        return next((bank for bank, index in self.search_bank_rows.items() if index == row), None)
+
+    def search_bank_slots(self, empty):
+        return [bank for bank in 'ABCDEFGHIJKLMNOPQRSTabcdefghijklmnopqrst'
+                if self.search_banks.get(bank, {}).get('empty') is empty]
+
     def open_search_bank(self, create=False, bank=None):
         if not self.connected:
             return
         if self.search_bank_dialog is not None:
             self.search_bank_dialog.Raise()
             return
-        bank = bank or (None if create else self.selected_search_bank())
-        if bank is None and not create:
-            self.aor_status.SetStatusText('Choose STORED RANGES and select a row to edit.')
-            return
-        if bank is None:
-            bank = next((b for b, entry in self.search_banks.items() if entry['empty']), 'A')
-        self.search_bank_dialog = SearchBankDialog(self, bank)
+        if create:
+            available = self.search_bank_slots(True)
+            if not available:
+                self.aor_status.SetStatusText('No empty Stored Range slots are available.')
+                return
+            if bank is None:
+                bank = available[0]
+            if bank not in available:
+                self.aor_status.SetStatusText('Choose a confirmed empty Stored Range slot to create a range.')
+                return
+        else:
+            bank = bank or self.selected_search_bank()
+            if bank not in self.search_bank_slots(False):
+                self.aor_status.SetStatusText('Choose a populated Stored Range to edit.')
+                return
+        self.search_bank_dialog = SearchBankDialog(self, bank, create=create)
         self.search_bank_dialog.Show()
         self.search_bank_dialog.on_bank(None)
 
     def on_start_search_bank(self, event, bank=None):
         bank = bank or self.selected_search_bank()
         entry = self.search_banks.get(bank)
-        if self.connected and self.serial.is_open and entry is not None and not entry['empty']:
-            command = ('SS%s\r\nRX\r\n' % bank).encode('ascii')
-            return self.write_serial(command) == len(command)
-        else:
-            self.aor_status.SetStatusText('Choose STORED RANGES and select a populated row to start.')
+        if not self.connected or not self.serial.is_open or entry is None or entry['empty']:
+            self.aor_status.SetStatusText('Choose a populated Stored Range to start.')
+            return False
+        if self.temporary_scan is not None or self.active_operation is not None:
+            return False
+        if (self.filling_banks or self.memory_select_read is not None or self.memory_flag_edit is not None or
+                self.memory_channel_pending is not None or self.memory_inventory is not None or
+                self.memory_bank_transfer is not None or self.settings_dialog is not None or
+                any(self.group_loading.values()) or any(self.group_dialogs.values()) or
+                self.bandscope is not None and self.bandscope.pauses_lm):
+            self.aor_status.SetStatusText('Finish the current scanner read/edit before starting Stored Range.')
+            return False
+        level = self.level_squelch_value
+        override = self.stored_range_profiles.get(bank, {}).get('SB')
+        if override is None and (not isinstance(level, int) or self.level_squelch_pending or self.level_squelch_requested is not None):
+            self.aor_status.SetStatusText('Wait for confirmed listening Squelch (DB) before starting Stored Range.')
+            return False
+        self.clear_level_edits()
+        self.level_vfo_context = False
+        self.temporary_scan = StoredRangeSearch(self, entry, level)
+        self.temporary_scan.start()
+        self.update_connection_ui()
+        return False  # The asynchronous state machine starts the operation after verification.
 
     def on_select_mode(self, evt):
         """Set mode on RX
@@ -2999,13 +3191,15 @@ class AorCtrl(AorCtrlFrame):
             # During an active scan, allow normal receiver controls and live XB.
             commands = [command for command in data.split(b'\r\n') if command]
             settings = self.settings_dialog
-            settings_commands = (not scan.busy and settings is not None and settings.family == 'X' and
+            family = 'S' if getattr(scan, 'kind', None) == 'search' else 'X'
+            prefix = b'GS' if family == 'S' else b'GM'
+            settings_commands = (not scan.busy and settings is not None and settings.family == family and
                                  settings.group == scan.group and all(
-                                     command in (b'GM', ('GM%d' % scan.group).encode('ascii')) or
-                                     re.fullmatch(rb'X[AB][0-9]{3}|XD[0-9]{2}|XM[0-8F]|XP[0-9]{2}', command)
+                                     command in (prefix, prefix + str(scan.group).encode('ascii')) or
+                                     re.fullmatch((rb'S[AB][0-9]{3}|SD(?:[0-9]{2}|FF)|SP[0-9]{2}' if family == 'S' else rb'X[AB][0-9]{3}|XD[0-9]{2}|XM[0-8F]|XP[0-9]{2}'), command)
                                      for command in commands))
             if not settings_commands and (scan.busy and any(command != b'LM' for command in commands) or
-                    any(command.startswith((b'GM', b'BM', b'MA')) for command in commands) and
+                    any(command.startswith((b'GM', b'BM', b'GS', b'BS', b'MA')) for command in commands) and
                     not (scan.phase == 'ready' and self.settings_dialog is not None)):
                 self.aor_status.SetStatusText('Wait for temporary scan-group restoration before changing scanner context.')
                 return
@@ -4247,48 +4441,52 @@ class AorCtrl(AorCtrlFrame):
         if not self.filling_banks:
             self.read_memory_select_flags()
 
-    def update_search_bank_choices(self):
+    def update_search_bank_choices(self, preferred_bank=None):
         choice = self.search_bank_choice
         selected = choice.GetSelection()
-        selected_bank = choice.GetClientData(selected) if selected != wx.NOT_FOUND else None
-        names = {}
-        counts = {}
-        for bank, entry in self.search_banks.items():
-            name = entry.get('name', '').strip()
-            if name and name != bank:
-                names[bank] = name
-                counts[name] = counts.get(name, 0) + 1
+        selected_bank = preferred_bank or (choice.GetClientData(selected) if selected != wx.NOT_FOUND else None)
+        choice.Clear()
         selected_index = wx.NOT_FOUND
-        for index in range(choice.GetCount()):
-            bank = choice.GetClientData(index)
-            name = names.get(bank)
-            label = bank if name is None else (name + ' [%s]' % bank if counts[name] > 1 else name)
-            choice.SetString(index, label)
+        for bank in self.search_bank_slots(False):
+            label = self.search_bank_label(bank)
+            index = choice.Append(label, bank)
             if bank == selected_bank:
                 selected_index = index
+        if selected_bank is None and choice.GetCount():
+            selected_index = 0
         choice.SetSelection(selected_index)
 
     def set_search_banks(self, item):
         entry = parse_search_bank_response(item)
         bank = entry['bank']
+        written = bank == self.bank_write_pending
         self.search_banks[bank] = entry
-        self.update_search_bank_choices()
+        self.update_search_bank_choices(bank if written and not entry['empty'] else None)
         if self.current_list_view() == 'SEARCH BANKS':
             if bank not in self.search_bank_rows:
                 self.search_bank_rows[bank] = self.edit_list.list.InsertItem(self.edit_list.list.GetItemCount(), bank)
             if entry['empty']:
-                values = (bank, '---', '---', '---', '---', '---', '---', '')
+                values = ('Empty slot', '---', '---', '---', '---', '---', '---', '')
             else:
-                values = (bank, display_frequency(entry['lower_hz']), display_frequency(entry['upper_hz']),
+                values = (self.search_bank_label(bank), display_frequency(entry['lower_hz']), display_frequency(entry['upper_hz']),
                           display_step(entry['step_khz'] * 1000), str(int(entry['auto'])),
                           self.cbx_mode.GetString(MD_TO_GUI_MODE[entry['mode']]), entry['attenuation'] or '---', entry['name'])
             self.edit_list.list.fill_line(self.search_bank_rows[bank], values)
+            if written and not entry['empty']:
+                row = self.search_bank_rows[bank]
+                self.edit_list.list.Select(row)
+                self.edit_list.list.Focus(row)
+                self.edit_list.list.EnsureVisible(row)
         if bank in (self.edit_bank_pending, self.bank_write_pending):
             self.edit_bank_pending = None
             self.bank_write_pending = None
             if self.search_bank_dialog is not None:
-                self.search_bank_dialog.show_bank(entry)
-            self.aor_status.SetStatusText('Search Bank %s read back from scanner' % bank)
+                self.search_bank_dialog.show_bank(entry, written=written)
+            self.aor_status.SetStatusText('Stored Range %s read back from scanner' %
+                                        (self.search_bank_label(bank) if not entry['empty'] else 'slot'))
+
+        if self.search_bank_dialog is not None:
+            self.search_bank_dialog.refresh_empty_choices()
 
     def set_vfo_text(self, text, vfx, active=True):
         data = text.split()[1:]

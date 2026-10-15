@@ -118,7 +118,8 @@ class CurrentBankScan:
             return
         self.pace_timer = None
         self.current_command = self.command_queue.popleft()
-        self.awaiting_final_group = not self.command_queue and self.current_command == b'GM\r\n'
+        self.awaiting_final_group = (not self.command_queue and
+                                     self.current_command == getattr(self, 'verification_command', b'GM\r\n'))
         if self.awaiting_final_group:
             self.header = None  # Earlier group-selection echoes cannot verify the sequence.
         if not self.send(self.current_command) or generation != self.sequence_generation:
