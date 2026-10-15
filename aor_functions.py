@@ -1,14 +1,58 @@
 __author__ = 'joaquin'
 
 import re
+from collections import deque
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 
 BANDSCOPE_SPANS = {1: 10000000, 2: 5000000, 3: 2000000, 4: 1000000,
                    5: 500000, 6: 200000, 7: 100000}
 BANDSCOPE_SPAN_LABELS = ('10 MHz', '5 MHz', '2 MHz', '1 MHz', '500 kHz', '200 kHz', '100 kHz')
+BANDSCOPE_AVERAGE_WINDOWS = (1, 2, 5, 10, 20, 50, 100)
 BANDSCOPE_MIN_FREQUENCY_HZ = 100000
 BANDSCOPE_MAX_FREQUENCY_HZ = 2040000000
+
+
+@dataclass(frozen=True)
+class BandscopeRunConfig:
+    mode: str
+    span_code: int
+    centre_hz: int | None
+    marker_hz: int | None
+    threshold: int
+    average_window: int
+    average_scale: str
+
+
+class BandscopeReceiverState:
+    """Only validated receiver read-backs belong here; GUI edits are separate."""
+    GEOMETRY = (('centre_hz', 'CF%010d'), ('span_code', 'SW%d'), ('marker_hz', 'MF%010d'))
+
+    def __init__(self):
+        self.known = {}
+
+    def invalidate(self, *fields):
+        for field in fields or tuple(self.known):
+            self.known.pop(field, None)
+
+    def confirm(self, status):
+        for field in ('centre_hz', 'span_code', 'marker_hz', 'peak_hold'):
+            if field in status:
+                self.known[field] = status[field]
+
+    def changes(self, desired):
+        return b''.join(((pattern % desired[field]) + '\r\n').encode('ascii')
+                        for field, pattern in self.GEOMETRY
+                        if desired.get(field) is not None and self.known.get(field) != desired[field])
+
+    def writing(self, data):
+        # A write is not confirmation, including writes from other GUI paths.
+        for line in data.split(b'\r\n'):
+            for prefix, field in ((b'CF', 'centre_hz'), (b'SW', 'span_code'),
+                                  (b'MF', 'marker_hz'), (b'PH', 'peak_hold')):
+                if line.startswith(prefix) and len(line) > len(prefix):
+                    self.invalidate(field)
 
 
 def bandscope_resolution(span_code):
@@ -62,6 +106,176 @@ def parse_ds_block(text):
     if not 31 <= index <= 1023 or index % 32 != 31:
         raise ValueError('Invalid DS block index')
     return index, tuple(int(value, 16) for value in match.group(2) + match.group(3))
+
+
+class BandscopeStatistic:
+    """Per-bin activity over complete DS sweeps; 0/1 never enter denominators."""
+    def __init__(self, threshold=2):
+        self.set_threshold(threshold)
+
+    def clear(self):
+        self.active = []
+        self.valid = []
+        self.sweeps = 0
+        self.geometry = None
+
+    def set_threshold(self, threshold):
+        if type(threshold) is not int or not 2 <= threshold <= 15:
+            raise ValueError('Statistic threshold must be 2..15')
+        self.threshold = threshold
+        self.clear()
+
+    def add_sweep(self, samples, status):
+        # Validate everything before mutating counters, including geometry.
+        if (len(samples) not in (128, 1024) or
+                any(type(level) is not int or not 0 <= level <= 15 for level in samples)):
+            raise ValueError('Statistic requires a complete valid DS sweep')
+        span = status['span_code']
+        if span not in BANDSCOPE_SPANS or (len(samples) == 128 and span not in (6, 7)):
+            raise ValueError('DS sample count does not match bandscope span')
+        geometry = (status['centre_hz'], span, len(samples))
+        if geometry != self.geometry:
+            self.clear()
+            self.geometry = geometry
+            self.active = [0] * len(samples)
+            self.valid = [0] * len(samples)
+        for index, level in enumerate(samples):
+            if level >= 2:
+                self.valid[index] += 1
+                if level >= self.threshold:
+                    self.active[index] += 1
+        self.sweeps += 1
+        return self.percentages()
+
+    def percentages(self):
+        if len(self.active) != len(self.valid):
+            raise ValueError('Statistic active/valid bin counts differ')
+        result = []
+        for index, (active, valid) in enumerate(zip(self.active, self.valid)):
+            if (type(active) is not int or type(valid) is not int or
+                    not 0 <= active <= valid <= self.sweeps):
+                raise ValueError('Invalid Statistic counters in bin %d: active=%r, valid=%r, sweeps=%r' %
+                                 (index, active, valid, self.sweeps))
+            percentage = 100 * active / valid if valid else None
+            if percentage is not None and not 0.0 <= percentage <= 100.0:
+                raise ValueError('Statistic activity outside 0..100 in bin %d' % index)
+            result.append(percentage)
+        return tuple(result)
+
+
+class BandscopeAverage:
+    """Rolling per-bin raw means, with invalid 0/1 measurements excluded."""
+    def __init__(self, window=10):
+        self.set_window(window)
+
+    def clear(self):
+        self.history = deque()
+        self.sums = []
+        self.valid = []
+        self.geometry = None
+        self.values = self.relative_values = ()
+
+    def set_window(self, window):
+        if type(window) is not int or window not in BANDSCOPE_AVERAGE_WINDOWS:
+            raise ValueError('Invalid Spectrum Average window')
+        self.window = window
+        self.clear()
+
+    def add_sweep(self, samples, status):
+        if (len(samples) not in (128, 1024) or
+                any(type(level) is not int or not 0 <= level <= 15 for level in samples)):
+            raise ValueError('Spectrum Average requires a complete valid DS sweep')
+        span = status['span_code']
+        if span not in BANDSCOPE_SPANS or (len(samples) == 128 and span not in (6, 7)):
+            raise ValueError('DS sample count does not match bandscope span')
+        geometry = (status['centre_hz'], span, len(samples))
+        if geometry != self.geometry:
+            self.clear()
+            self.geometry = geometry
+            self.sums = [0] * len(samples)
+            self.valid = [0] * len(samples)
+        if len(self.history) == self.window:
+            for index, level in enumerate(self.history.popleft()):
+                if level >= 2:
+                    self.sums[index] -= level
+                    self.valid[index] -= 1
+        samples = tuple(samples)
+        self.history.append(samples)
+        for index, level in enumerate(samples):
+            if level >= 2:
+                self.sums[index] += level
+                self.valid[index] += 1
+        self.values = tuple(total / count if count else None
+                            for total, count in zip(self.sums, self.valid))
+        maximum = max((value for value in self.values if value is not None), default=None)
+        self.relative_values = tuple(100 * (value / maximum) if value is not None else None
+                                     for value in self.values)
+        return self.values
+
+    def averages(self, relative=False):
+        # Both representations are cached at sweep completion, never recomputed on paint/zoom.
+        return self.relative_values if relative else self.values
+
+
+class BandscopeView:
+    """Display-only bounds and transforms, independent of scanner/trace state."""
+    def __init__(self):
+        self.geometry = None
+        self.statistic = False
+        self.frequency_low, self.frequency_high = 0, 1
+        self.y_low, self.y_high = 0, 15
+
+    def reset_y(self, statistic):
+        self.statistic = bool(statistic)
+        self.y_low, self.y_high = 0, 100 if statistic else 15
+
+    def reset(self, status, statistic):
+        self.reset_y(statistic)
+        self.geometry = None if status is None else (status['centre_hz'], status['span_hz'])
+        if status is not None:
+            self.frequency_low = status['centre_hz'] - status['span_hz'] / 2
+            self.frequency_high = status['centre_hz'] + status['span_hz'] / 2
+
+    def sync(self, status, statistic):
+        geometry = None if status is None else (status['centre_hz'], status['span_hz'])
+        if geometry != self.geometry or bool(statistic) != self.statistic:
+            self.reset(status, statistic)
+
+    def x_at(self, frequency, rect):
+        left, top, right, bottom = rect
+        return left + round((frequency - self.frequency_low) * (right - left) /
+                            (self.frequency_high - self.frequency_low))
+
+    def y_at(self, value, rect):
+        left, top, right, bottom = rect
+        return bottom - round((value - self.y_low) * (bottom - top) / (self.y_high - self.y_low))
+
+    def data_at(self, point, rect):
+        left, top, right, bottom = rect
+        x, y = point
+        return (self.frequency_low + (x - left) * (self.frequency_high - self.frequency_low) / (right - left),
+                self.y_low + (bottom - y) * (self.y_high - self.y_low) / (bottom - top))
+
+    def zoom(self, start, end, rect):
+        left, top, right, bottom = rect
+        if right <= left or bottom <= top:
+            return False
+        points = [(max(left, min(right, x)), max(top, min(bottom, y))) for x, y in (start, end)]
+        if abs(points[0][0] - points[1][0]) < 5 or abs(points[0][1] - points[1][1]) < 5:
+            return False
+        first, second = (self.data_at(point, rect) for point in points)
+        frequency_low, frequency_high = sorted((first[0], second[0]))
+        y_low, y_high = sorted((first[1], second[1]))
+        if frequency_low >= frequency_high or y_low >= y_high:
+            return False  # Extremely deep zoom must not collapse floating-point bounds.
+        self.frequency_low, self.frequency_high = frequency_low, frequency_high
+        self.y_low, self.y_high = y_low, y_high
+        return True
+
+    def y_ticks(self):
+        if not self.statistic and (self.y_low, self.y_high) == (0, 15):
+            return (0, 2, 5, 10, 15)
+        return tuple(self.y_low + n * (self.y_high - self.y_low) / 4 for n in range(5))
 
 
 class BandscopeSweep:

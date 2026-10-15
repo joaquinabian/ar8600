@@ -12,14 +12,16 @@ import time
 from collections import deque
 from datetime import datetime
 from decimal import Decimal
+from dataclasses import replace
 from aor_control_frame import AorCtrlFrame
 from aor_functions import (do_nothing, display_frequency, display_vfo_frequency, display_step,
                            protocol_frequency_hz, protocol_step_hz, parse_level_squelch_response,
                            parse_lm_response, parse_lc_response,
                            parse_select_scan_response, parse_pass_frequency_response,
                            make_pass_frequency_command, format_activity_row,
-                           parse_bandscope_status, BandscopeSweep, bandscope_frequency,
-                           BANDSCOPE_SPAN_LABELS, bandscope_centre_command, bandscope_marker_frequency)
+                           parse_bandscope_status, BandscopeSweep, BandscopeStatistic, BandscopeAverage,
+                           BANDSCOPE_AVERAGE_WINDOWS, BandscopeRunConfig, BandscopeReceiverState, BandscopeView, bandscope_frequency,
+                           BANDSCOPE_SPAN_LABELS, BANDSCOPE_SPANS, bandscope_centre_command, bandscope_marker_frequency)
 from aor_functions import (search_parameters, make_search_bank_command, parse_search_bank_response,
                            parse_group_members, make_group_members_command,
                            parse_operation_parameter, operation_parameter_command,
@@ -66,10 +68,18 @@ class SerialRxEvent(wx.PyCommandEvent):
 
 class BandscopeWindow(wx.Frame):
     """A single in-flight sweep, delivered by the application's existing reader."""
+    SWEEP_MODES = ('Single', 'Loop', 'Peak Hold', 'Statistic', 'Average')
+
     def __init__(self, controller):
         super().__init__(controller, title='AR8600 BAND SCOPE', size=(800, 430))
         self.controller = controller
         self.status = None
+        self.receiver_state = BandscopeReceiverState()
+        self.local_geometry = None
+        self.local_marker_hz = None
+        self.pending_centre_hz = None
+        self.requested_geometry = None
+        self.geometry_reconciled = False
         self.samples = None
         self.trace_status = None
         self.sweep_status = None
@@ -85,20 +95,35 @@ class BandscopeWindow(wx.Frame):
         self.stop_requested = False
         self.pending_tune = None
         self.setting_command = b''
+        self.expected_entry_geometry = None
+        self.run_config = None
         self.peak_value = None
         self.peak_pending = False
+        self.statistic = BandscopeStatistic()
+        self.statistic_generation = 0
+        self.sweep_statistic_generation = None
+        self.spectrum = BandscopeAverage()
+        self.spectrum_generation = 0
+        self.sweep_spectrum_generation = None
+        self.sweep_mode = 'Single'
+        self.run_config = None
+        self.last_run_config = None
+        self.peak_target = None
+        self.peak_continuation = None
+        self.peak_restore_query = True
+        self.view = BandscopeView()
+        self.drag_start = self.drag_end = None
+        self.drag_moved = False
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
         buttons = wx.BoxSizer(wx.HORIZONTAL)
         self.start_button = wx.Button(panel, label='Start')
         self.stop_button = wx.Button(panel, label='Stop')
-        self.loop_checkbox = wx.CheckBox(panel, label='Loop')
-        self.peak_checkbox = wx.CheckBox(panel, label='Peak Hold')
-        for button in (self.start_button, self.stop_button, self.loop_checkbox, self.peak_checkbox):
+        for button in (self.start_button, self.stop_button):
             buttons.Add(button, 0, wx.ALL, 5)
         buttons.Add(wx.StaticText(panel, label='Span:'), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 10)
         self.span_choice = wx.Choice(panel, choices=BANDSCOPE_SPAN_LABELS)
-        self.span_choice.SetSelection(wx.NOT_FOUND)
+        self.span_choice.SetSelection(0)
         self.span_choice.Disable()
         buttons.Add(self.span_choice, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         sizer.Add(buttons)
@@ -113,15 +138,37 @@ class BandscopeWindow(wx.Frame):
         centre_controls.Add(self.centre_button, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         centre_controls.Add(self.tune_button, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         sizer.Add(centre_controls)
+        self.mode_radio = wx.RadioBox(panel, label='Sweep mode', choices=self.SWEEP_MODES,
+                                     majorDimension=1, style=wx.RA_SPECIFY_ROWS)
+        self.mode_radio.SetSelection(0)
+        sizer.Add(self.mode_radio, 0, wx.EXPAND | wx.ALL, 5)
+        parameters = wx.BoxSizer(wx.HORIZONTAL)
+        self.threshold = wx.SpinCtrl(panel, min=2, max=15, initial=2, size=(65, -1))
+        self.average_window = wx.Choice(panel, choices=[str(value) for value in BANDSCOPE_AVERAGE_WINDOWS])
+        self.average_window.SetSelection(BANDSCOPE_AVERAGE_WINDOWS.index(10))
+        self.spectrum_scale = wx.Choice(panel, choices=['Relative %', 'Raw'])
+        self.spectrum_scale.SetSelection(0)
+        self.clear_button = wx.Button(panel, label='Clear')
+        for control in (wx.StaticText(panel, label='Threshold:'), self.threshold,
+                        wx.StaticText(panel, label='Average window:'),
+                        self.average_window, wx.StaticText(panel, label='Scale:'),
+                        self.spectrum_scale, self.clear_button):
+            parameters.Add(control, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        sizer.Add(parameters)
         self.info = wx.StaticText(panel, label='Centre: ---    Span: ---    Marker: ---')
         sizer.Add(self.info, 0, wx.ALL, 5)
         self.plot = wx.Panel(panel)
         self.plot.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.plot.Bind(wx.EVT_PAINT, self.on_paint)
         self.plot.Bind(wx.EVT_SIZE, self.on_plot_size)
-        self.plot.Bind(wx.EVT_LEFT_DOWN, self.on_marker_click)
+        self.plot.Bind(wx.EVT_LEFT_DOWN, self.on_plot_left_down)
+        self.plot.Bind(wx.EVT_LEFT_UP, self.on_plot_left_up)
+        self.plot.Bind(wx.EVT_LEFT_DCLICK, self.on_plot_double_click)
+        self.plot.Bind(wx.EVT_MOTION, self.on_plot_motion)
+        self.plot.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self.on_plot_capture_lost)
+        self.plot.Bind(wx.EVT_RIGHT_UP, self.on_plot_menu)
         sizer.Add(self.plot, 1, wx.EXPAND | wx.ALL, 5)
-        self.message = wx.StaticText(panel, label='Start reads one sweep. Check Loop for continuous sweeps; Stop restores receiver audio.')
+        self.message = wx.StaticText(panel, label='Choose a Sweep mode, then Start. Stop restores receiver audio.')
         sizer.Add(self.message, 0, wx.ALL, 5)
         panel.SetSizer(sizer)
         self.timer = wx.Timer(self)
@@ -129,21 +176,28 @@ class BandscopeWindow(wx.Frame):
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
         self.tune_button.Bind(wx.EVT_BUTTON, self.on_tune_marker)
-        self.peak_checkbox.Bind(wx.EVT_CHECKBOX, self.on_peak_hold)
+        self.mode_radio.Bind(wx.EVT_RADIOBOX, self.on_sweep_mode)
+        self.threshold.Bind(wx.EVT_SPINCTRL, self.on_threshold)
+        self.threshold.Bind(wx.EVT_TEXT, self.on_threshold)
+        self.clear_button.Bind(wx.EVT_BUTTON, self.on_clear)
+        self.average_window.Bind(wx.EVT_CHOICE, self.on_average_window)
+        self.spectrum_scale.Bind(wx.EVT_CHOICE, self.on_spectrum_scale)
         self.span_choice.Bind(wx.EVT_CHOICE, self.on_span)
         self.centre_button.Bind(wx.EVT_BUTTON, self.on_centre)
-        self.centre_input.Bind(wx.EVT_TEXT_ENTER, self.on_centre)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         for control, tip in (
-                (self.start_button, 'Read one sweep, then restore audio; Loop repeats until Stop.'),
+                (self.start_button, 'Start acquisition using the selected Sweep mode.'),
                 (self.stop_button, 'Finish any pending sweep and restore the previous receiver state/audio.'),
-                (self.loop_checkbox, 'Keep analyser mode active and repeat completed sweeps until Stop.'),
-                (self.peak_checkbox, 'Enable scanner bandscope peak hold; read back the PH state.'),
+                (self.mode_radio, 'Normal: raw sweep; Peak Hold: scanner maxima; Statistic: occupancy; Average: rolling mean.'),
+                (self.threshold, 'Minimum valid raw level counted as active (2-15), applied at the next Start.'),
+                (self.clear_button, 'Clear the active accumulated display without changing or stopping the receiver.'),
+                (self.average_window, 'Rolling window for the next Start; changing it does not alter a running acquisition.'),
+                (self.spectrum_scale, 'Show raw averages or percentages of the full-spectrum maximum; not calibrated power.'),
                 (self.tune_button, 'Finish any pending sweep, restore audio, tune the active VFO to MF, then read RX.'),
-                (self.span_choice, 'Set the bandscope width and clear the previous trace.'),
+                (self.span_choice, 'Choose the bandscope width for the next Start.'),
                 (self.centre_input, 'Enter the bandscope centre frequency in MHz.'),
-                (self.centre_button, 'Set the bandscope centre; Start reads a new trace.'),
-                (self.plot, 'Click to move the bandscope marker without tuning the receiver.')):
+                (self.centre_button, 'Accept the centre locally, or apply it after the current sweep when running.'),
+                (self.plot, 'Double-click to move the local marker; drag to zoom X/Y; right-click to Reset Zoom.')):
             control.SetToolTip(tip)
         self.set_controls_enabled(True)
 
@@ -156,22 +210,67 @@ class BandscopeWindow(wx.Frame):
                 and self.controller.memory_inventory is None and self.controller.memory_bank_transfer is None)
 
     def send(self, data):
+        self.receiver_state.writing(data)
         if self.controller.write_serial(data) == len(data):
             return True
         self.disconnect()
         self.message.SetLabel('Bandscope command failed; see serial diagnostics.')
         return False
 
+    def capture_run_config(self):
+        mode = self.mode_radio.GetSelection()
+        span = self.span_choice.GetSelection()
+        window = self.average_window.GetSelection()
+        scale = self.spectrum_scale.GetSelection()
+        if (not 0 <= mode < len(self.SWEEP_MODES) or
+                not 0 <= span < len(BANDSCOPE_SPAN_LABELS) or
+                not 0 <= window < len(BANDSCOPE_AVERAGE_WINDOWS) or scale not in (0, 1)):
+            raise ValueError('Choose a Sweep mode, Span, Average window and Scale before Start.')
+        text = self.centre_input.GetValue().strip()
+        centre = (int(bandscope_centre_command(text)[2:].strip()) if text else
+                  self.status['centre_hz'] if self.status is not None else None)
+        threshold = self.threshold.GetValue()
+        if not 2 <= threshold <= 15:
+            raise ValueError('Statistic threshold must be 2..15.')
+        return BandscopeRunConfig(self.SWEEP_MODES[mode], span + 1, centre,
+                                  self.status['marker_hz'] if self.status is not None else None,
+                                  threshold, BANDSCOPE_AVERAGE_WINDOWS[window],
+                                  ('Relative %', 'Raw')[scale])
+
     def on_start(self, event):
-        if self.waiting is not None:
+        if self.waiting is not None or self.running or not self.available():
             return
+        try:
+            config = self.capture_run_config()
+        except ValueError as error:
+            self.message.SetLabel(str(error))
+            return
+        previous = self.last_run_config
+        self.marker_frequency()  # Seed once from the preview, before any AM entry reset.
+        self.run_config = config
+        self.last_run_config = config
+        self.sweep_mode = config.mode
+        if config.mode == 'Statistic':
+            if self.statistic.threshold != config.threshold:
+                self.statistic.set_threshold(config.threshold)
+            if previous is None or previous.mode != config.mode:
+                self.reset_statistic()
+        if config.mode == 'Average':
+            if self.spectrum.window != config.average_window:
+                self.spectrum.set_window(config.average_window)
+            if previous is None or previous.mode != config.mode:
+                self.reset_spectrum()
         self.running = True
+        self.local_geometry = None
+        self.pending_centre_hz = None
         self.stop_requested = False
         self.close_requested = False
-        self.request_sweep()
+        self.view.reset_y(self.percentage_scale())
+        self.request_sweep(apply=True)
 
     def on_stop(self, event):
         self.running = False
+        self.pending_centre_hz = None
         self.stop_requested = True
         if self.waiting is not None:
             self.message.SetLabel('Stopping after current sweep' if self.waiting == 'data' else 'Restoring receiver')
@@ -180,31 +279,38 @@ class BandscopeWindow(wx.Frame):
             self.restore_receiver()
 
     def on_tune_marker(self, event):
-        if not self.available() or self.status is None or self.waiting == 'restore':
+        marker = self.marker_frequency()
+        if not self.available() or marker is None or self.waiting == 'restore':
             return
-        self.pending_tune = self.status['marker_hz']
+        self.pending_tune = marker
         self.on_stop(event)
 
-    def request_sweep(self):
+    def request_sweep(self, apply=False):
         command = b''
-        if not self.entered and self.status is not None:
-            # This receiver resets AM geometry on entry; retain the viewer's settings.
-            command = ('CF%010d\r\nSW%d\r\nMF%010d\r\n' %
-                       (self.status['centre_hz'], self.status['span_code'], self.status['marker_hz'])).encode('ascii')
-        self.request_status(command, sweep=True)
+        if self.run_config is not None and (apply or not self.entered):
+            config = self.run_config
+            command = self.receiver_state.changes({'centre_hz': config.centre_hz, 'span_code': config.span_code})
+        self.request_status(command, sweep=True, reconcile=apply or not self.entered)
+
+    def processing_mode(self):
+        return self.run_config.mode if self.run_config is not None else self.sweep_mode
 
     def set_controls_enabled(self, enabled):
-        self.start_button.Enable(enabled and self.available())
+        self.start_button.Enable(enabled and self.available() and not self.running)
         self.stop_button.Enable(self.available())
-        self.loop_checkbox.Enable(self.available())
-        self.peak_checkbox.Enable(enabled and self.available() and self.peak_value is not None and not self.peak_pending)
-        self.tune_button.Enable(self.available() and self.status is not None and self.waiting != 'restore')
-        settings_enabled = enabled and self.status is not None and self.available()
-        self.span_choice.Enable(settings_enabled)
-        self.centre_input.Enable(settings_enabled)
-        self.centre_button.Enable(settings_enabled)
+        statistic = self.sweep_mode == 'Statistic'
+        spectrum = self.sweep_mode == 'Average'
+        self.mode_radio.Enable(self.waiting in (None, 'data'))
+        self.threshold.Enable(statistic)
+        self.clear_button.Enable(self.accumulated_mode())
+        self.average_window.Enable(spectrum)
+        self.spectrum_scale.Enable(spectrum)
+        self.tune_button.Enable(self.available() and self.display_geometry() is not None and self.waiting != 'restore')
+        self.span_choice.Enable(True)
+        self.centre_input.Enable(True)
+        self.centre_button.Enable(self.waiting != 'restore')
 
-    def request_status(self, command=b'', sweep=False):
+    def request_status(self, command=b'', sweep=False, reconcile=True):
         if not self.available():
             self.running = False
             self.message.SetLabel('Connect to the scanner before requesting a sweep.')
@@ -213,6 +319,20 @@ class BandscopeWindow(wx.Frame):
             return
         self.stop_requested = False
         self.sweep = None
+        self.expected_entry_geometry = None
+        self.geometry_reconciled = not reconcile
+        self.requested_geometry = (dict(vars(self.run_config)) if self.run_config is not None else
+                                   dict(self.status) if self.status is not None else {})
+        # The graphical marker is local; acquisition never needs to configure MF.
+        self.requested_geometry.pop('marker_hz', None)
+        if command:
+            expected = {}
+            for line in command.decode('ascii').splitlines():
+                for prefix, key in (('CF', 'centre_hz'), ('SW', 'span_code')):
+                    if line.startswith(prefix):
+                        expected[key] = int(line[len(prefix):])
+            self.expected_entry_geometry = expected or None
+            self.requested_geometry.update(expected)
         self.setting_command = command
         self.sweep_requested = sweep
         self.waiting = 'status' if self.entered else 'receiver'
@@ -223,67 +343,250 @@ class BandscopeWindow(wx.Frame):
         self.message.SetLabel('Reading bandscope status (LM polling paused).')
         self.send(command + b'AM\r\n' if self.entered else b'RX\r\n')
 
-    def change_setting(self, command, invalidate=False):
-        if self.waiting is not None or self.status is None or not self.available():
-            return
-        if invalidate:
-            self.samples = None
-            self.trace_status = None
-            self.plot.Refresh()
-        if not self.entered:
-            command = ('CF%010d\r\nSW%d\r\nMF%010d\r\n' %
-                       (self.status['centre_hz'], self.status['span_code'], self.status['marker_hz'])).encode('ascii') + command
-        self.request_status(command, sweep=self.running)
-
     def on_span(self, event):
-        selection = self.span_choice.GetSelection()
-        if 0 <= selection < len(BANDSCOPE_SPAN_LABELS):
-            self.change_setting(('SW%d\r\n' % (selection + 1)).encode('ascii'), invalidate=True)
+        # The selected Span belongs to the next Start, not the current receiver.
+        if self.run_config is None:
+            geometry = self.display_geometry()
+            if geometry is not None:
+                self.set_local_geometry(geometry['centre_hz'])
 
-    def on_peak_hold(self, event):
-        desired = self.peak_checkbox.GetValue()
-        self.peak_checkbox.SetValue(bool(self.peak_value))
-        if self.waiting is not None or not self.available() or self.peak_value is None or self.peak_pending:
+    def display_geometry(self):
+        return self.local_geometry if self.run_config is None and self.local_geometry is not None else self.status
+
+    def marker_frequency(self):
+        if self.local_marker_hz is None:
+            geometry = self.display_geometry()
+            if geometry is not None:
+                self.local_marker_hz = geometry['marker_hz']
+        return self.local_marker_hz
+
+    def clear_geometry_data(self):
+        self.reset_statistic()
+        self.reset_spectrum()
+        self.samples = self.trace_status = None
+        self.plot.Refresh()
+
+    def show_geometry_info(self, geometry):
+        marker = self.marker_frequency()
+        self.info.SetLabel('Centre: %.6f MHz    Span: %g MHz    Marker: %.6f MHz' %
+                           (geometry['centre_hz'] / 1000000, geometry['span_hz'] / 1000000,
+                            (marker if marker is not None else geometry['marker_hz']) / 1000000))
+
+    def set_local_geometry(self, centre):
+        previous = self.display_geometry()
+        span = self.span_choice.GetSelection() + 1
+        if span not in BANDSCOPE_SPANS:
             return
-        self.peak_pending = True
-        self.change_setting(('PH%d\r\nPH\r\n' % desired).encode('ascii'))
+        geometry = dict(previous or {})
+        geometry.update(centre_hz=centre, span_code=span, span_hz=BANDSCOPE_SPANS[span])
+        # Keep the marker's absolute frequency; it is hidden if outside the new span.
+        geometry.setdefault('marker_hz', centre)
+        if previous is None or any(previous[key] != geometry[key] for key in ('centre_hz', 'span_code')):
+            self.clear_geometry_data()
+            self.view.reset(geometry, self.percentage_scale())
+        self.local_geometry = geometry
+        self.show_geometry_info(geometry)
+        self.plot.Refresh()
+
+    def apply_pending_centre(self):
+        if self.pending_centre_hz is None or not self.running or self.stop_requested:
+            return False
+        centre, self.pending_centre_hz = self.pending_centre_hz, None
+        self.run_config = replace(self.run_config, centre_hz=centre)
+        self.last_run_config = self.run_config
+        self.clear_geometry_data()
+        self.waiting = None
+        command = self.receiver_state.changes({'centre_hz': centre})
+        self.request_status(command, sweep=True)
+        return True
+
+    def sync_peak_hold(self, continuation, query=True):
+        """One PH write/read-back gate for all display modes and cleanup."""
+        target = self.processing_mode() == 'Peak Hold'
+        if self.receiver_state.known.get('peak_hold') == target and not self.peak_pending:
+            return False
+        command = ('PH%d\r\nPH\r\n' % target).encode('ascii')
+        if query:
+            self.waiting = 'mode_peak'
+            self.peak_pending = True
+            self.peak_target = target
+            self.peak_continuation = continuation
+            self.set_controls_enabled(False)
+            self.timer.StartOnce(5000)
+        self.receiver_state.writing(command)
+        if self.controller.write_serial(command) != len(command):
+            print('Bandscope Peak Hold write failed', file=sys.stderr)
+            self.message.SetLabel('Peak Hold write failed; restoring receiver.')
+            self.running = False
+            self.peak_pending = False
+            self.waiting = None
+            if query:
+                self.restore_receiver(sync_peak=False)
+                return True
+            return False
+        return query
 
     def set_peak_hold(self, text):
         if re.fullmatch(r'PH[01]', text) is None:
+            self.receiver_state.invalidate('peak_hold')
             raise ValueError('Invalid peak hold response')
         self.peak_value = text == 'PH1'
+        self.receiver_state.confirm({'peak_hold': self.peak_value})
         self.peak_pending = False
-        self.peak_checkbox.SetValue(self.peak_value)
         if self.status is not None:
             self.status['peak_hold'] = self.peak_value
+        if self.waiting == 'mode_peak':
+            self.waiting = None
+            continuation = self.peak_continuation
+            self.peak_continuation = None
+            if self.peak_value != self.peak_target:
+                self.receiver_state.invalidate('peak_hold')
+                self.running = False
+                print('Bandscope Peak Hold read-back mismatch', file=sys.stderr)
+                self.restore_receiver(sync_peak=False)
+                self.message.SetLabel('Peak Hold read-back mismatch; receiver restoration requested.')
+            elif continuation == 'restore':
+                self.restore_receiver(query=self.peak_restore_query, sync_peak=False)
+            else:
+                self.finish_bandscope_status()
+            self.peak_target = None
         self.set_controls_enabled(self.waiting is None)
 
+    def continuous(self):
+        return self.processing_mode() != 'Single'
+
+    def accumulated_mode(self):
+        return self.processing_mode() in ('Statistic', 'Average')
+
+    def percentage_scale(self):
+        return (self.processing_mode() == 'Statistic' or
+                (self.processing_mode() == 'Average' and
+                 (self.run_config.average_scale == 'Relative %' if self.run_config is not None else
+                  self.spectrum_scale.GetSelection() == 0)))
+
+    def accumulation_text(self):
+        if self.processing_mode() == 'Average':
+            count, window = len(self.spectrum.history), self.spectrum.window
+            return ('Average: latest sweep' if window == 1 else
+                    'Average: %d-sweep rolling window' % window if count == window else
+                    'Average: %d/%d sweeps' % (count, window))
+        if self.processing_mode() == 'Statistic':
+            return 'Statistic: %d sweeps, threshold %d' % (self.statistic.sweeps, self.statistic.threshold)
+        return ''
+
+    def progress_text(self):
+        return self.accumulation_text() or ('Peak Hold' if self.processing_mode() == 'Peak Hold' else
+                                          'Continuous sweep' if self.processing_mode() == 'Loop' else 'Single sweep')
+
+    def update_statistic_info(self):
+        if self.accumulated_mode():
+            self.message.SetLabel(self.accumulation_text())
+
+    def reset_statistic(self):
+        self.statistic.clear()
+        self.statistic_generation += 1
+        self.update_statistic_info()
+        self.plot.Refresh()
+
+    def on_clear(self, event):
+        if self.processing_mode() == 'Statistic':
+            self.reset_statistic()
+        elif self.processing_mode() == 'Average':
+            self.reset_spectrum()
+
+    def on_threshold(self, event):
+        if self.run_config is not None:
+            return  # Keep the running threshold; widget value is for next Start.
+        value = self.threshold.GetValue()
+        if value != self.statistic.threshold:
+            self.statistic.set_threshold(value)
+            self.reset_statistic()
+            if (self.sweep_mode == 'Statistic'):
+                self.view.reset_y(True)
+
+    def on_sweep_mode(self, event):
+        selection = self.mode_radio.GetSelection()
+        if not 0 <= selection < len(self.SWEEP_MODES):
+            return
+        mode = self.SWEEP_MODES[selection]
+        if mode == self.sweep_mode:
+            return
+        self.sweep_mode = mode
+        if self.run_config is None:
+            if mode == 'Statistic':
+                self.reset_statistic()
+            elif mode == 'Average':
+                self.reset_spectrum()
+            self.view.sync(self.display_geometry(), self.view.statistic)
+            self.view.reset_y(self.percentage_scale())
+        self.set_controls_enabled(self.waiting is None)
+        self.plot.Refresh()
+        # Passive UI state only. Start is the sole acquisition/configuration boundary.
+
+    def reset_spectrum(self):
+        self.spectrum.clear()
+        self.spectrum_generation += 1
+        self.update_statistic_info()
+        self.plot.Refresh()
+
+    def on_average_window(self, event):
+        if self.run_config is not None:
+            return
+        selection = self.average_window.GetSelection()
+        if 0 <= selection < len(BANDSCOPE_AVERAGE_WINDOWS):
+            window = BANDSCOPE_AVERAGE_WINDOWS[selection]
+            if window != self.spectrum.window:
+                self.spectrum.set_window(window)
+                self.reset_spectrum()
+
+    def on_spectrum_scale(self, event):
+        if self.run_config is not None:
+            return
+        self.view.reset_y(self.percentage_scale())
+        self.plot.Refresh()
+
     def on_centre(self, event):
-        if self.waiting is not None or not self.available():
+        if self.waiting == 'restore':
             return
         try:
             command = bandscope_centre_command(self.centre_input.GetValue().strip())
         except ValueError as error:
             self.message.SetLabel(str(error))
             return
-        self.change_setting(command, invalidate=True)
+        centre = int(command[2:].strip())
+        if self.run_config is None:
+            self.set_local_geometry(centre)
+            self.message.SetLabel('Centre set locally; Start applies the configuration to the receiver.')
+        elif self.running and not self.stop_requested:
+            if centre == self.run_config.centre_hz:
+                self.pending_centre_hz = None
+                return
+            self.pending_centre_hz = centre
+            if self.waiting is None:
+                self.timer.Stop()
+                self.apply_pending_centre()
+            else:
+                self.message.SetLabel('Centre change queued until the current response finishes.')
 
     def on_marker_click(self, event):
-        if self.waiting is not None or self.status is None or not self.available():
+        geometry = self.display_geometry()
+        if geometry is None:
             return
         width, height = self.plot.GetClientSize()
         left, top, right, bottom = 55, 20, width - 20, height - 45
         x, y = event.GetPosition()
         if right <= left or not left <= x <= right or not top <= y <= bottom:
             return
-        low = self.status['centre_hz'] - self.status['span_hz'] / 2
-        target = low + (x - left) * self.status['span_hz'] / (right - left)
+        self.view.sync(geometry, self.percentage_scale())
+        target, _ = self.view.data_at((x, y), (left, top, right, bottom))
         try:
-            frequency = bandscope_marker_frequency(self.status, target)
+            frequency = bandscope_marker_frequency(geometry, target)
         except ValueError as error:
             self.message.SetLabel(str(error))
             return
-        self.change_setting(('MF%010d\r\n' % frequency).encode('ascii'))
+        self.local_marker_hz = frequency
+        self.show_geometry_info(geometry)
+        self.plot.Refresh()
 
     def capture_receiver(self, text):
         restored = text.startswith(('VA ', 'VB ', 'VF ', 'MR MX', 'MS MX', 'SM MX', 'VS V')) or re.match(r'SR[A-Ta-t] RF', text)
@@ -293,7 +596,11 @@ class BandscopeWindow(wx.Frame):
             self.waiting = None
             self.timer.Stop()
             self.set_controls_enabled(True)
-            self.message.SetLabel('Sweep complete — receiver restored' if self.samples is not None else 'Receiver restored')
+            text = ('Single sweep complete' if self.processing_mode() == 'Single' else self.progress_text())
+            self.run_config = None
+            self.set_controls_enabled(True)
+            self.message.SetLabel((text + ' | Receiver restored') if text else
+                                  'Sweep complete — receiver restored' if self.samples is not None else 'Receiver restored')
             return
         if self.waiting != 'receiver':
             return
@@ -324,45 +631,90 @@ class BandscopeWindow(wx.Frame):
         self.entered = True
         # The first AM enters; the second obtains the documented status.
         self.peak_pending = True
-        peak_query = b'' if b'PH\r\n' in self.setting_command else b'PH\r\n'
-        self.send(b'AM\r\n' + self.setting_command + b'AM\r\n' + peak_query)
+        self.send(b'AM\r\n' + self.setting_command + b'AM\r\n')
 
     def set_status(self, text):
-        status = parse_bandscope_status(text)
+        try:
+            status = parse_bandscope_status(text)
+        except ValueError:
+            self.receiver_state.invalidate()
+            raise
+        self.receiver_state.confirm(status)
         if self.waiting == 'receiver':  # The scanner was already in analyser mode.
             self.entered = True
             self.waiting = 'status'
             self.restore_command = self.controller.normal_vfo_command()
-            self.send(b'PH\r\n')
+            if self.setting_command:
+                self.send(self.setting_command + b'AM\r\n')
+                return  # RX reported old geometry; wait for the requested restoration.
         if self.waiting != 'status':
             return
+        if self.expected_entry_geometry is not None:
+            if any(status[key] != value for key, value in self.expected_entry_geometry.items()):
+                # Entry can emit a default AM status before CF/SW/MF have been applied.
+                # Do not replace the authoritative cache/selector or launch DS on it.
+                return
+            self.expected_entry_geometry = None
+        if not self.geometry_reconciled:
+            # AM entry can reset geometry. Restore only differences actually
+            # reported by the receiver, never defaults or another GUI snapshot.
+            self.geometry_reconciled = True
+            command = self.receiver_state.changes(self.requested_geometry or {})
+            if command:
+                self.expected_entry_geometry = {key: value for key, value in
+                    (self.requested_geometry or {}).items()
+                    if key in ('centre_hz', 'span_code') and value is not None}
+                self.send(command + b'AM\r\n')
+                return
         if self.status is None or any(self.status[field] != status[field] for field in ('centre_hz', 'span_code')):
+            self.reset_statistic()
+            self.reset_spectrum()
             self.samples = None  # Never relabel an old trace with new geometry.
             self.trace_status = None
             self.plot.Refresh()
         self.status = status
+        if self.local_marker_hz is None:
+            self.local_marker_hz = status['marker_hz']
+        self.view.sync(status, self.percentage_scale())
         self.peak_value = status['peak_hold']
         self.peak_pending = False
-        self.peak_checkbox.SetValue(self.peak_value)
-        self.span_choice.SetSelection(status['span_code'] - 1)
-        self.centre_input.ChangeValue('%.6f' % (status['centre_hz'] / 1000000))
-        self.info.SetLabel('Centre: %.6f MHz    Span: %g MHz    Marker: %.6f MHz%s' %
-                           (status['centre_hz'] / 1000000, status['span_hz'] / 1000000,
-                            status['marker_hz'] / 1000000, '    Peak hold' if status['peak_hold'] else ''))
+        if (self.run_config is not None and self.run_config.centre_hz is None and
+                not self.centre_input.GetValue().strip()):
+            self.centre_input.ChangeValue('%.6f' % (status['centre_hz'] / 1000000))
+        if self.run_config is not None and (self.run_config.centre_hz is None or self.run_config.marker_hz is None):
+            self.run_config = replace(self.run_config,
+                                      centre_hz=self.run_config.centre_hz if self.run_config.centre_hz is not None else status['centre_hz'],
+                                      marker_hz=self.run_config.marker_hz if self.run_config.marker_hz is not None else status['marker_hz'])
+            self.last_run_config = self.run_config
+        self.show_geometry_info(status)
         self.plot.Refresh()
+        if self.run_config is not None and not self.stop_requested and self.sync_peak_hold('status'):
+            return
+        self.finish_bandscope_status()
+
+    def finish_bandscope_status(self):
         if not self.sweep_requested or self.stop_requested:
             self.waiting = None
             self.timer.Stop()
             self.restore_receiver()
-            return
+        else:
+            if not self.apply_pending_centre():
+                self.begin_sweep()
+
+    def begin_sweep(self):
+        status = self.status
+        self.sweep_statistic_generation = (self.statistic_generation
+                                           if (self.processing_mode() == 'Statistic') else None)
+        self.sweep_spectrum_generation = (self.spectrum_generation
+                                          if (self.processing_mode() == 'Average') else None)
         # Real narrow-span dumps contain 128 points; retain manual-format support.
         self.sweep = BandscopeSweep((128, 1024) if status['span_code'] in (6, 7) else (1024,))
         self.sweep_status = status.copy()
         self.waiting = 'data'
+        self.set_controls_enabled(False)
         self.started_at = time.monotonic()
         self.timer.StartOnce(75000)
-        self.message.SetLabel('Continuous sweep — receiver audio unavailable' if self.loop_checkbox.IsChecked()
-                              else 'Sweeping — receiver audio unavailable')
+        self.message.SetLabel(self.progress_text() + ' | Sweeping — receiver audio unavailable')
         self.send(b'DS\r\n')
 
     def add_ds_line(self, text):
@@ -375,15 +727,24 @@ class BandscopeWindow(wx.Frame):
             self.message.SetLabel('Invalid sweep: %s' % error)
             self.running = False
             samples = None
-        if samples is not None:
+        if samples is not None and self.pending_centre_hz is None:
             self.samples = samples
             self.trace_status = self.sweep_status
+            if ((self.processing_mode() == 'Statistic') and
+                    self.sweep_statistic_generation == self.statistic_generation):
+                self.statistic.add_sweep(samples, self.sweep_status)
+                self.update_statistic_info()
+            if ((self.processing_mode() == 'Average') and
+                    self.sweep_spectrum_generation == self.spectrum_generation):
+                self.spectrum.add_sweep(samples, self.sweep_status)
+                self.update_statistic_info()
             self.last_duration = time.monotonic() - self.started_at
             self.message.SetLabel('%d samples received in %.2f s. 0: unmeasured; 1: outside specification; 2-F: raw level.' %
                                   (len(samples), self.last_duration))
             self.plot.Refresh()
         elif not self.sweep.failed:
             self.message.SetLabel('Stopping after current sweep' if self.stop_requested else
+                                  (self.accumulation_text() + ' | ' if self.accumulated_mode() else '') +
                                   'Sweeping — receiver audio unavailable (%d samples)' % (len(self.sweep.blocks) * 32))
         if self.sweep.finished:
             if self.sweep.failed:
@@ -391,8 +752,11 @@ class BandscopeWindow(wx.Frame):
             self.waiting = None
             self.timer.Stop()
             self.set_controls_enabled(True)
-            if self.running and self.loop_checkbox.IsChecked() and not self.stop_requested:
-                self.message.SetLabel('Continuous sweep')
+            if self.apply_pending_centre():
+                return
+            if (self.running and not self.stop_requested and
+                    self.continuous()):
+                self.message.SetLabel(self.progress_text())
                 self.timer.StartOnce(500)
             else:
                 self.running = False
@@ -401,26 +765,33 @@ class BandscopeWindow(wx.Frame):
     def on_timer(self, event):
         if self.waiting is None:
             if self.running:
-                if self.loop_checkbox.IsChecked():
-                    self.request_sweep()
-                else:
-                    self.running = False
-                    self.restore_receiver()
+                self.request_sweep()
             return
         self.running = False
+        self.pending_centre_hz = None
+        self.receiver_state.invalidate()
         if self.waiting == 'data':
             self.sweep.failed = True
             self.message.SetLabel('Sweep timed out; LM resumed. Waiting for DS end; reconnect if it never arrives.')
             # Retain the outstanding request to prevent overlap with late data.
         else:
+            peak_timeout = self.waiting == 'mode_peak'
+            if peak_timeout:
+                self.peak_pending = False
+                self.peak_continuation = None
+                print('Bandscope Peak Hold was not confirmed', file=sys.stderr)
             self.waiting = None
             self.set_controls_enabled(True)
             self.message.SetLabel('No valid bandscope status received; restoring receiver.')
-            self.restore_receiver()
+            self.restore_receiver(sync_peak=not peak_timeout)
         print('Bandscope request timed out', file=sys.stderr)
 
-    def restore_receiver(self, query=True):
+    def restore_receiver(self, query=True, sync_peak=True):
         self.timer.Stop()
+        if sync_peak and self.run_config is not None and self.controller.serial.is_open and self.entered:
+            self.peak_restore_query = query
+            if self.sync_peak_hold('restore', query=query):
+                return
         command = self.restore_command or self.controller.normal_vfo_command()
         tune = self.pending_tune
         if self.controller.serial.is_open and (self.entered or tune is not None):
@@ -440,19 +811,24 @@ class BandscopeWindow(wx.Frame):
         self.pending_tune = None
         self.entered = False
         self.restore_command = None
+        if self.waiting != 'restore':
+            self.run_config = None
         self.set_controls_enabled(self.waiting is None)
 
     def disconnect(self):
         self.running = False
+        self.pending_centre_hz = None
         self.stop_requested = True
         self.pending_tune = None
         self.timer.Stop()
         self.restore_receiver(query=False)
         self.waiting = None
         self.sweep = None
+        self.expected_entry_geometry = None
+        self.run_config = None
         self.peak_value = None
         self.peak_pending = False
-        self.peak_checkbox.SetValue(False)
+        self.receiver_state.invalidate()
         self.set_controls_enabled(True)
         self.message.SetLabel('Disconnected.')
 
@@ -465,59 +841,161 @@ class BandscopeWindow(wx.Frame):
         self.plot.Refresh()
         event.Skip()
 
+    def plot_rect(self):
+        width, height = self.plot.GetClientSize()
+        return 55, 20, width - 20, height - 45
+
+    def on_plot_left_down(self, event):
+        self.cancel_plot_gesture()
+        if self.display_geometry() is None:
+            return
+        left, top, right, bottom = self.plot_rect()
+        x, y = event.GetPosition()
+        if right > left and bottom > top and left <= x <= right and top <= y <= bottom:
+            self.drag_start = self.drag_end = (x, y)
+            self.drag_moved = False
+
+    def update_plot_drag(self, position):
+        if self.drag_start is None:
+            return
+        left, top, right, bottom = self.plot_rect()
+        x, y = position
+        self.drag_end = (max(left, min(right, x)), max(top, min(bottom, y)))
+        if max(abs(x - self.drag_start[0]), abs(y - self.drag_start[1])) >= 8:
+            self.drag_moved = True
+            if not self.plot.HasCapture():
+                self.plot.CaptureMouse()
+        self.plot.Refresh()
+
+    def on_plot_motion(self, event):
+        if self.drag_start is None:
+            return
+        if hasattr(event, 'LeftIsDown') and not event.LeftIsDown():
+            self.cancel_plot_gesture()
+            return
+        self.update_plot_drag(event.GetPosition())
+
+    def on_plot_left_up(self, event):
+        if self.drag_start is None:
+            return
+        self.update_plot_drag(event.GetPosition())
+        start, end, moved = self.drag_start, self.drag_end, self.drag_moved
+        self.cancel_plot_gesture()
+        if moved:
+            self.view.sync(self.display_geometry(), self.percentage_scale())
+            self.view.zoom(start, end, self.plot_rect())
+        # A click alone is only a gesture candidate; DCLICK owns marker movement.
+        self.plot.Refresh()
+
+    def cancel_plot_gesture(self):
+        self.drag_start = self.drag_end = None
+        self.drag_moved = False
+        if self.plot.HasCapture():
+            self.plot.ReleaseMouse()
+        self.plot.Refresh()
+
+    def on_plot_double_click(self, event):
+        self.cancel_plot_gesture()
+        self.on_marker_click(event)
+
+    def on_plot_capture_lost(self, event):
+        self.drag_start = self.drag_end = None
+        self.drag_moved = False
+        self.plot.Refresh()
+
+    def on_reset_zoom(self, event):
+        self.cancel_plot_gesture()
+        self.view.reset(self.display_geometry(), self.percentage_scale())
+        self.plot.Refresh()
+
+    def on_plot_menu(self, event):
+        self.cancel_plot_gesture()
+        menu = wx.Menu()
+        item = menu.Append(wx.ID_ANY, 'Reset Zoom')
+        menu.Bind(wx.EVT_MENU, self.on_reset_zoom, item)
+        try:
+            self.plot.PopupMenu(menu)
+        finally:
+            menu.Destroy()
+
+    def draw_trace(self, dc, rect, samples, statistic):
+        left, top, right, bottom = rect
+        # Clip strokes, including end pixels, independently of data validation.
+        with wx.DCClipper(dc, wx.Rect(left, top, right - left + 1, bottom - top + 1)):
+            dc.SetPen(wx.Pen('#1565b0', 1))
+            previous = None
+            for index, level in enumerate(samples):
+                frequency = bandscope_frequency(self.trace_status, index)
+                if (not self.view.frequency_low <= frequency <= self.view.frequency_high or
+                        level is None or (not statistic and level < 2)):
+                    previous = None
+                    continue
+                point = (self.view.x_at(frequency, rect), self.view.y_at(level, rect))
+                if previous is None:
+                    dc.DrawPoint(*point)
+                else:
+                    dc.DrawLine(*previous, *point)
+                previous = point
+
     def on_paint(self, event):
         dc = wx.AutoBufferedPaintDC(self.plot)
         dc.SetBackground(wx.Brush('white'))
         dc.Clear()
-        width, height = self.plot.GetClientSize()
-        left, top, right, bottom = 55, 20, width - 20, height - 45
+        rect = self.plot_rect()
+        left, top, right, bottom = rect
         if right <= left or bottom <= top:
             return
         dc.SetTextForeground('black')
         dc.SetPen(wx.Pen('#dddddd'))
-        for level in (0, 2, 5, 10, 15):
-            y = bottom - round(level * (bottom - top) / 15)
+        statistic = (self.processing_mode() == 'Statistic')
+        percentage = self.percentage_scale()
+        self.view.sync(self.display_geometry(), percentage)
+        for level in self.view.y_ticks():
+            y = self.view.y_at(level, rect)
             dc.DrawLine(left, y, right, y)
-            dc.DrawText('%X' % level, 25, y - 7)
-        dc.DrawText('Raw', 12, 0)
+            label = ('%X' % level if not percentage and (self.view.y_low, self.view.y_high) == (0, 15)
+                     else '%g' % level)
+            dc.DrawText(label, 10, y - 7)
+        dc.DrawText('%' if percentage else 'Raw', 12, 0)
         dc.SetPen(wx.Pen('black'))
         dc.DrawLine(left, top, left, bottom)
         dc.DrawLine(left, bottom, right, bottom)
-        if self.status is None:
+        if self.display_geometry() is None:
             dc.DrawText('No bandscope status yet', left + 15, top + 15)
             return
-        status = self.status
-        low = status['centre_hz'] - status['span_hz'] / 2
-        high = status['centre_hz'] + status['span_hz'] / 2
+        status = self.display_geometry()
+        low, high = self.view.frequency_low, self.view.frequency_high
         def x_at(frequency):
-            return left + round((frequency - low) * (right - left) / (high - low))
+            return self.view.x_at(frequency, rect)
         for n in range(5):
             frequency = low + n * (high - low) / 4
             x = x_at(frequency)
-            label = '%.3f' % (frequency / 1000000)
+            label = ('%.6f' if high - low < 10000 else '%.3f') % (frequency / 1000000)
             dc.DrawText(label, x - dc.GetTextExtent(label)[0] // 2, bottom + 6)
         dc.DrawText('Frequency (MHz)', left + (right - left) // 2 - 50, bottom + 24)
         dc.SetPen(wx.Pen('#aa3333', 1, wx.PENSTYLE_SHORT_DASH))
-        marker_x = x_at(status['marker_hz'])
-        if low <= status['marker_hz'] <= high:
+        marker = self.marker_frequency()
+        marker_x = x_at(marker)
+        if low <= marker <= high:
             dc.DrawLine(marker_x, top, marker_x, bottom)
-            label = '%.3f MHz' % (status['marker_hz'] / 1000000)
+            label = '%.3f MHz' % (marker / 1000000)
             dc.DrawText(label, min(marker_x + 4, right - dc.GetTextExtent(label)[0]), top)
-        if self.samples is None:
-            return
-        dc.SetPen(wx.Pen('#1565b0', 1))
-        previous = None
-        for index, level in enumerate(self.samples):
-            frequency = bandscope_frequency(self.trace_status, index)
-            if not low <= frequency <= high or level < 2:
-                previous = None  # 0/1 are validity codes, not measured signal levels.
-                continue
-            point = (x_at(frequency), bottom - round(level * (bottom - top) / 15))
-            if previous is None:
-                dc.DrawPoint(*point)
-            else:
-                dc.DrawLine(*previous, *point)
-            previous = point
+        try:
+            samples = (self.spectrum.averages(self.percentage_scale())
+                       if (self.processing_mode() == 'Average') else
+                       self.statistic.percentages() if statistic else self.samples)
+        except ValueError as error:
+            print('Bandscope Statistic data error: %s' % error, file=sys.stderr)
+            self.message.SetLabel(str(error))
+            samples = None
+        if samples and self.trace_status is not None:
+            self.draw_trace(dc, rect, samples, percentage)
+        if self.drag_start is not None and self.drag_moved:
+            x1, y1 = self.drag_start
+            x2, y2 = self.drag_end
+            dc.SetPen(wx.Pen('#1565b0', 1, wx.PENSTYLE_SHORT_DASH))
+            dc.SetBrush(wx.TRANSPARENT_BRUSH)
+            dc.DrawRectangle(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
 
 
 class GroupDialog(wx.Dialog):
@@ -1175,6 +1653,7 @@ class AorCtrl(AorCtrlFrame):
         self.bank_write_pending = None
         self.groups = {'scan': {}, 'search': {}}
         self.group_loading = {'scan': None, 'search': None}
+        self.pending_group_start = None
         self.group_response = {'scan': None, 'search': None}
         self.group_dialogs = {'scan': None, 'search': None}
         self.search_restore_command = None
@@ -1453,8 +1932,6 @@ class AorCtrl(AorCtrlFrame):
         self.bandscope.close_requested = False
         self.bandscope.Show()
         self.bandscope.Raise()
-        if self.bandscope.waiting is None and self.bandscope.available():
-            self.bandscope.request_status()
 
     def update_receiver_switch_ui(self):
         ready = self.connected and self.serial.is_open and self.alive.is_set() and self.memory_inventory is None and self.memory_bank_transfer is None
@@ -1547,19 +2024,18 @@ class AorCtrl(AorCtrlFrame):
         self.on_source_changed(event)
 
     def on_source_changed(self, event):
-        self.discard_pending_vfo_target()
-        if self.temporary_scan is not None:
-            self.restore_temporary_scan(lambda: self.on_source_changed(None))
+        self.pending_group_start = None
+        if self.temporary_scan is not None or self.active_operation is not None:
+            self.update_operation_ui()
             return
+        self.discard_pending_vfo_target()
         self.level_vfo_context = False
-        self.refresh_level_context()
+        self.refresh_level_context(query=False)
         self.update_operation_ui()
         if not self.connected or not self.serial.is_open or self.active_operation is not None:
             return
         operation, source = self.operation_selection()
-        if source == 'Search Group':
-            self.request_group('search')
-        elif source == 'Search Bank':
+        if source == 'Search Bank':
             self.select_list_view('SEARCH BANKS')
             self.on_select_list(None)
         elif source == 'Select Scan':
@@ -1585,7 +2061,6 @@ class AorCtrl(AorCtrlFrame):
 
     def on_memory_source_changed(self, event):
         if self.temporary_scan is not None:
-            self.restore_temporary_scan(lambda: self.on_memory_source_changed(None))
             return
         metadata = self.operation_memory_bank()
         if metadata is None:
@@ -1618,6 +2093,17 @@ class AorCtrl(AorCtrlFrame):
         if not self.connected or not self.serial.is_open or self.active_operation is not None or self.memory_channel_pending is not None:
             return
         operation, source = self.operation_selection()
+        if source in ('Scan Group', 'Search Group'):
+            kind = 'scan' if source == 'Scan Group' else 'search'
+            control = self.cbx_scan if kind == 'scan' else self.cbx_search
+            group = int(control.GetValue())
+            if self.group_loading[kind] is not None:
+                self.aor_status.SetStatusText('Wait for group configuration before starting.')
+                return
+            if group not in self.groups[kind] or self.group_response[kind] != group:
+                self.pending_group_start = (operation, source, kind, group)
+                self.request_group(kind)
+                return
         listening_level = self.level_squelch_value
         if operation == 'Memory Scan' and source == 'Current Bank' and (
                 listening_level is None or self.level_squelch_pending or self.level_squelch_requested is not None):
@@ -1758,6 +2244,7 @@ class AorCtrl(AorCtrlFrame):
         self.update_operation_ui()
 
     def on_operation_stop(self, event):
+        self.pending_group_start = None
         if getattr(self, 'pending_vfo_applying', False):
             return
         if self.temporary_scan is not None:
@@ -2436,6 +2923,7 @@ class AorCtrl(AorCtrlFrame):
             self.bandscope.disconnect()
         self.stop_monitoring()
         self.connected = False
+        self.pending_group_start = None
         self.active_operation = None
         self.filling_banks = False
         self.pending_memory_channels.clear()
@@ -2614,8 +3102,8 @@ class AorCtrl(AorCtrlFrame):
         self.Bind(wx.EVT_RADIOBOX, self.on_select_vfo, self.rb_vfos)
         self.Bind(wx.EVT_BUTTON, self.on_operation_start, self.bt_start)
         self.Bind(wx.EVT_BUTTON, self.on_operation_stop, self.bt_stop)
-        self.cbx_scan.Bind(wx.EVT_COMBOBOX, lambda evt: self.request_group('scan'))
-        self.cbx_search.Bind(wx.EVT_COMBOBOX, lambda evt: self.request_group('search'))
+        self.cbx_scan.Bind(wx.EVT_COMBOBOX, self.on_group_choice_changed)
+        self.cbx_search.Bind(wx.EVT_COMBOBOX, self.on_group_choice_changed)
         self.bt_scgrp.Bind(wx.EVT_BUTTON, lambda evt: self.open_group('scan'))
         self.bt_search.Bind(wx.EVT_BUTTON, lambda evt: self.open_group('search'))
         self.operation_choice.Bind(wx.EVT_CHOICE, self.on_operation_changed)
@@ -2809,6 +3297,13 @@ class AorCtrl(AorCtrlFrame):
     def select_list_view(self, key):
         self.cbx_lists.SetStringSelection(LIST_LABELS[key])
 
+    def on_group_choice_changed(self, event):
+        # A proposed group is applied by Start, or read explicitly by Edit Group.
+        # Do not select GM/GS (or restore another running group) from a choice event.
+        self.pending_group_start = None
+        self.refresh_level_context(query=False)
+        self.update_operation_ui()
+
     def request_group(self, kind):
         if not self.connected or not self.serial.is_open or self.group_loading[kind] is not None:
             return
@@ -2853,6 +3348,11 @@ class AorCtrl(AorCtrlFrame):
         if dialog is not None and dialog.group == group:
             dialog.show_members(members)
         self.update_connection_ui()
+        pending = getattr(self, 'pending_group_start', None)
+        if pending is not None and pending[2:] == (kind, group):
+            self.pending_group_start = None
+            if self.active_operation is None and self.operation_selection() == pending[:2]:
+                self.on_operation_start(None)
 
     def open_group(self, kind):
         if not self.connected:
@@ -3068,6 +3568,8 @@ class AorCtrl(AorCtrlFrame):
                     received_valid = True
                     continue
                 if self.bandscope is not None:
+                    if first == '?':
+                        self.bandscope.receiver_state.invalidate()
                     self.bandscope.capture_receiver(first)
                 temporary_context = self.monitor_muted
                 background = False
@@ -3214,6 +3716,9 @@ class AorCtrl(AorCtrlFrame):
             self.aor_status.SetStatusText('Inventory export is read-only; wait for it to finish before changing scanner settings.')
             return
         try:
+            scope = getattr(self, 'bandscope', None)
+            if scope is not None:
+                scope.receiver_state.writing(data)
             written = self.serial.write(data)
             if written:
                 for command in data[:written].decode('ascii', errors='backslashreplace').split('\r\n'):
@@ -3375,6 +3880,7 @@ class AorCtrl(AorCtrlFrame):
         self.memory_banks.clear()
         self.initial_bank_load_pending = True
         self.group_loading = {'scan': None, 'search': None}
+        self.pending_group_start = None
         self.group_response = {'scan': None, 'search': None}
         self.listening_vfo = 2
         self.rb_vfos.SetSelection(2)

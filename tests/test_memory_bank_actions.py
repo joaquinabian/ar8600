@@ -37,6 +37,59 @@ def bulk_controller():
     return ctrl
 
 
+class PassiveGroupChoiceTests(unittest.TestCase):
+    def test_group_choice_does_not_select_scanner_group_or_send_queries(self):
+        ctrl = SimpleNamespace(refresh_level_context=Mock(), update_operation_ui=Mock(),
+                               write_serial=Mock(), request_group=Mock())
+        main.AorCtrl.on_group_choice_changed(ctrl, None)
+        ctrl.refresh_level_context.assert_called_once_with(query=False)
+        ctrl.update_operation_ui.assert_called_once()
+        ctrl.write_serial.assert_not_called()
+        ctrl.request_group.assert_not_called()
+
+    def test_source_selection_does_not_restore_or_query_group(self):
+        ctrl = Controller()
+        ctrl.connected = True
+        ctrl.discard_pending_vfo_target = Mock()
+        ctrl.request_group = Mock()
+        ctrl.refresh_level_context = Mock()
+        ctrl.restore_temporary_scan = Mock()
+        ctrl.operation_selection = lambda: ('Frequency Search', 'Search Group')
+        main.AorCtrl.on_source_changed(ctrl, None)
+        ctrl.request_group.assert_not_called()
+        ctrl.refresh_level_context.assert_called_once_with(query=False)
+        ctrl.temporary_scan = SimpleNamespace(phase='active')
+        main.AorCtrl.on_source_changed(ctrl, None)
+        main.AorCtrl.on_memory_source_changed(ctrl, None)
+        ctrl.restore_temporary_scan.assert_not_called()
+        self.assertEqual(ctrl.commands, [])
+
+    def test_explicit_start_reads_selected_group_then_continues_after_membership(self):
+        for kind, operation, source, group in (('scan', 'Memory Scan', 'Scan Group', 2),
+                                               ('search', 'Frequency Search', 'Search Group', 3)):
+            ctrl = SimpleNamespace(connected=True, serial=SimpleNamespace(is_open=True),
+                                   active_operation=None, memory_channel_pending=None,
+                                   operation_selection=lambda: (operation, source),
+                                   cbx_scan=Mock(), cbx_search=Mock(), aor_status=Mock(),
+                                   group_loading={'scan': None, 'search': None},
+                                   group_response={'scan': None, 'search': None},
+                                   groups={'scan': {}, 'search': {}}, request_group=Mock())
+            control = ctrl.cbx_scan if kind == 'scan' else ctrl.cbx_search
+            control.GetValue.return_value = str(group)
+            main.AorCtrl.on_operation_start(ctrl, None)
+            ctrl.request_group.assert_called_once_with(kind)
+            self.assertEqual(ctrl.pending_group_start, (operation, source, kind, group))
+            ctrl.group_response[kind] = ctrl.group_loading[kind] = group
+            ctrl.settings_dialog = None
+            ctrl.group_dialogs = {'scan': None, 'search': None}
+            ctrl.update_connection_ui = Mock()
+            ctrl.on_operation_start = Mock()
+            line = membership('A') if kind == 'scan' else 'BS A' + '-' * 39
+            main.AorCtrl.set_group_response(ctrl, line)
+            ctrl.on_operation_start.assert_called_once_with(None)
+            self.assertIsNone(ctrl.pending_group_start)
+
+
 class BulkFlagsTests(unittest.TestCase):
     def test_selected_capture_and_restore_once_then_verify_complete_gr(self):
         ctrl = bulk_controller()

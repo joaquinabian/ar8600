@@ -25,6 +25,13 @@ def send_command(controller, command):
         raise ValueError('Connect to the AR8600 before sending a command.')
     # Deliberately do not access serial.write directly: import/export and
     # temporary scan-group protection remain authoritative.
+    # Unknown/raw actions may change or reset analyser settings outside its
+    # state machine. Read-only queries do not invalidate confirmed settings.
+    scope = getattr(controller, 'bandscope', None)
+    if scope is not None and command not in (
+            'RX', 'LM', 'PH', 'CF', 'SW', 'MF', 'DA', 'DB', 'GM', 'BM', 'GS', 'BS',
+            'NL', 'AF', 'XA', 'XB', 'XD', 'XM', 'XP', 'SA', 'SB', 'SD', 'SP'):
+        scope.receiver_state.invalidate()
     if controller.write_serial(data) != len(data):
         raise ValueError('Command was not fully sent; see application status/serial diagnostics.')
 
